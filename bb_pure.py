@@ -39,6 +39,7 @@ class BBSignal:
     contracts: int                  # rounded position size
     seconds_to_expiry: float
     reason: str                     # diagnostic for logs / DB
+    conviction_tier: int = 1        # 1=clean, 2=high, 3=extreme
 
 
 def evaluate(
@@ -73,6 +74,19 @@ def evaluate(
     kelly_frac = float(config.get("kelly_fraction", 0.25))
     kelly_max = float(config.get("kelly_max_frac", 0.15))
     max_contracts = int(config.get("max_contracts", 200))
+
+    # Conviction-tier sizing thresholds (2026-05-01 per user)
+    # Tier 2 / 3 raise the kelly_max ceiling when both edge AND fair-side
+    # extremity exceed thresholds. Rationale: when the model says
+    # YES is 95% likely (fair=95c) AND market is mispricing by 30pp+,
+    # the standard Kelly cap is leaving size on the table. Liquidity is
+    # the real ceiling, not Kelly fraction.
+    t2_min_edge = float(config.get("kelly_tier2_min_edge_pp", 25.0))
+    t2_min_extreme = float(config.get("kelly_tier2_min_fair_extreme", 85.0))
+    t2_kelly_max = float(config.get("kelly_tier2_max_frac", 0.30))
+    t3_min_edge = float(config.get("kelly_tier3_min_edge_pp", 40.0))
+    t3_min_extreme = float(config.get("kelly_tier3_min_fair_extreme", 95.0))
+    t3_kelly_max = float(config.get("kelly_tier3_max_frac", 0.50))
 
     # ── Time gate ─────────────────────────────────────────────────────
     if seconds_to_expiry < min_time:
@@ -121,7 +135,25 @@ def evaluate(
         # Shouldn't happen if mispricing is on the right side, but guard
         return None
     fractional_kelly = full_kelly * kelly_frac
-    fractional_kelly = max(0.0, min(fractional_kelly, kelly_max))
+
+    # ── Conviction-tier resolution ─────────────────────────────────────
+    # `fair_extremity` = how far from 50/50 the model's fair price is.
+    # Tier 2: edge >= 25pp AND fair >= 85c (or fair <= 15c on NO side)
+    # Tier 3: edge >= 40pp AND fair >= 95c (or fair <= 5c on NO side)
+    # Side already chose the cheap side; fair_extremity uses the
+    # higher of (fair_yes, 100 - fair_yes).
+    fair_extremity = max(float(fair_yes_cents), 100.0 - float(fair_yes_cents))
+    abs_edge = abs(edge_yes_pp)
+    if abs_edge >= t3_min_edge and fair_extremity >= t3_min_extreme:
+        conviction_tier = 3
+        active_kelly_max = t3_kelly_max
+    elif abs_edge >= t2_min_edge and fair_extremity >= t2_min_extreme:
+        conviction_tier = 2
+        active_kelly_max = t2_kelly_max
+    else:
+        conviction_tier = 1
+        active_kelly_max = kelly_max
+    fractional_kelly = max(0.0, min(fractional_kelly, active_kelly_max))
 
     # ── Contract count ────────────────────────────────────────────────
     if balance_dollars <= 0:
@@ -144,6 +176,7 @@ def evaluate(
             f"edge={abs(edge_yes_pp):.1f}pp fair={fair_yes_cents}c "
             f"market={market_mid_cents}c side={side} entry={entry_cents}c "
             f"p_win={win_p:.3f} kelly={fractional_kelly:.4f} "
-            f"contracts={contracts}"
+            f"contracts={contracts} tier={conviction_tier}"
         ),
+        conviction_tier=conviction_tier,
     )

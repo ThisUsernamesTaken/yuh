@@ -651,6 +651,10 @@ class PolymarketCopyEngine:
         # are never used. {ticker: {ts, side, entry_cents,
         # fair_yes_cents, edge_pp}}
         self._recent_bb_pure_placements: dict = {}
+        # 2026-05-01: count of BB_PURE FIREs in the current window. Reset
+        # on new window. Capped by BB_PURE_MAX_FIRES_PER_WINDOW so the
+        # engine can't third-trade itself into gambling territory.
+        self._bb_pure_fires_this_window: int = 0
 
         # Daily loss tracking (circuit breaker)
         self._daily_pnl: float = 0.0           # Running P&L for current UTC day
@@ -5269,6 +5273,7 @@ class PolymarketCopyEngine:
                 self._trend_trades_this_window = 0
                 self._ta_trades_this_window = 0
                 self._entered_tickers_this_window = set()  # 2026-04-22 per-window lock
+                self._bb_pure_fires_this_window = 0  # 2026-05-01 per-window fire cap
                 self._cap_logged_this_window = False
                 self._range_skip_logged = False
                 self._range_skip_key = None
@@ -8814,7 +8819,7 @@ class PolymarketCopyEngine:
         bal_dollars = float(_LIVE_BALANCE_DOLLARS or 0.0)
         if bal_dollars <= 0:
             return None
-        # Build config
+        # Build config (with conviction-tier knobs, 2026-05-01)
         config = {
             "min_edge_pp":           float(_uc("BB_PURE_MIN_EDGE_PP", 8.0)),
             "max_entry_cents":       int(_uc("BB_PURE_MAX_ENTRY_CENTS", 70)),
@@ -8823,6 +8828,14 @@ class PolymarketCopyEngine:
             "kelly_fraction":        float(_uc("BB_PURE_KELLY_FRACTION", 0.25)),
             "kelly_max_frac":        float(_uc("BB_PURE_KELLY_MAX_FRAC", 0.15)),
             "max_contracts":         int(_get_sizing_cap()),
+            # Tier 2 (high conviction): edge ≥ 25pp AND fair_extremity ≥ 85c
+            "kelly_tier2_min_edge_pp":      float(_uc("BB_PURE_KELLY_TIER2_MIN_EDGE_PP", 25.0)),
+            "kelly_tier2_min_fair_extreme": float(_uc("BB_PURE_KELLY_TIER2_MIN_FAIR_EXTREME", 85.0)),
+            "kelly_tier2_max_frac":         float(_uc("BB_PURE_KELLY_TIER2_MAX_FRAC", 0.30)),
+            # Tier 3 (extreme conviction): edge ≥ 40pp AND fair_extremity ≥ 95c
+            "kelly_tier3_min_edge_pp":      float(_uc("BB_PURE_KELLY_TIER3_MIN_EDGE_PP", 40.0)),
+            "kelly_tier3_min_fair_extreme": float(_uc("BB_PURE_KELLY_TIER3_MIN_FAIR_EXTREME", 95.0)),
+            "kelly_tier3_max_frac":         float(_uc("BB_PURE_KELLY_TIER3_MAX_FRAC", 0.50)),
         }
         try:
             sig = bb_evaluate(
@@ -8882,6 +8895,20 @@ class PolymarketCopyEngine:
             logger.info(
                 "BB_PURE SKIP: %s already entered this window",
                 ticker[-15:],
+            )
+            return
+        # 2026-05-01 per-window fire counter (user directive: 2 fires
+        # per session is profitable, 3+ becomes gambling). The
+        # _entered_tickers_this_window check above limits to 1 fire
+        # per ticker, but BB_PURE often sees TWO tickers per window
+        # (the expiring one + the next one). This counts ALL BB_PURE
+        # fires across all tickers within a window.
+        max_fires = int(_uc("BB_PURE_MAX_FIRES_PER_WINDOW", 2))
+        cur_fires = int(getattr(self, "_bb_pure_fires_this_window", 0))
+        if cur_fires >= max_fires:
+            logger.warning(
+                "BB_PURE SKIP: per-window fire cap reached (%d/%d) — %s",
+                cur_fires, max_fires, ticker[-15:],
             )
             return
         # NB: The lock is acquired AFTER all gates pass but BEFORE
@@ -8975,15 +9002,27 @@ class PolymarketCopyEngine:
                 "fair_yes_cents": int(sig.fair_yes_cents),
                 "edge_pp": float(sig.edge_pp),
                 "market_mid_cents": int(sig.market_mid_cents),
+                "conviction_tier": int(getattr(sig, "conviction_tier", 1)),
             }
+        except Exception:
+            pass
+        # 2026-05-01: increment per-window fire counter so subsequent
+        # signals in the same window are rate-limited.
+        try:
+            self._bb_pure_fires_this_window = int(
+                getattr(self, "_bb_pure_fires_this_window", 0)
+            ) + 1
         except Exception:
             pass
         logger.warning(
             "BB_PURE FIRE: %s %s %dx @ %dc ($%.2f) | edge=%.1fpp "
-            "fair=%dc market=%dc kelly=%.4f",
+            "fair=%dc market=%dc kelly=%.4f tier=%d (fires=%d/%d)",
             sig.side.upper(), ticker[-15:], contracts, entry_px,
             cost_dollars, sig.edge_pp, sig.fair_yes_cents,
             sig.market_mid_cents, sig.kelly_fraction,
+            int(getattr(sig, "conviction_tier", 1)),
+            int(getattr(self, "_bb_pure_fires_this_window", 0)),
+            int(_uc("BB_PURE_MAX_FIRES_PER_WINDOW", 2)),
         )
 
         try:
@@ -9046,6 +9085,7 @@ class PolymarketCopyEngine:
             "_bb_pure_fair_yes_cents_at_entry": sig.fair_yes_cents,
             "_bb_pure_market_mid_at_entry": sig.market_mid_cents,
             "_bb_pure_edge_pp_at_entry": sig.edge_pp,
+            "_bb_pure_conviction_tier": int(getattr(sig, "conviction_tier", 1)),
         }
         try:
             self._entered_tickers_this_window.add(ticker)
@@ -9083,7 +9123,18 @@ class PolymarketCopyEngine:
                 fair_for_side = 100 - int(sig.fair_yes_cents)
             tp_inside_fair = int(_uc("BB_PURE_TP_INSIDE_FAIR_C", 1))
             tp_min_delta = int(_uc("BB_PURE_TP_MIN_CENTS", 4))
-            tp_max_delta = int(_uc("BB_PURE_TP_MAX_CENTS", 30))
+            # 2026-05-01: tier-aware TP cap. With larger position size
+            # (Tier 2/3) we don't need to be greedy on per-contract gain;
+            # the absolute dollar profit is already large. Tighter TP =
+            # higher fill probability = more sessions where the trade
+            # actually closes profitably instead of riding to expiry.
+            _tier_for_tp = int(getattr(sig, "conviction_tier", 1))
+            if _tier_for_tp >= 3:
+                tp_max_delta = int(_uc("BB_PURE_TP_MAX_CENTS_TIER3", 12))
+            elif _tier_for_tp == 2:
+                tp_max_delta = int(_uc("BB_PURE_TP_MAX_CENTS_TIER2", 20))
+            else:
+                tp_max_delta = int(_uc("BB_PURE_TP_MAX_CENTS", 30))
             # Target = fair − in-fair concession (sells slightly inside
             # fair to improve fill probability).
             preflight_px = fair_for_side - tp_inside_fair
@@ -13477,7 +13528,14 @@ class PolymarketCopyEngine:
             )
             bb_inside = int(_uc("BB_PURE_TP_INSIDE_FAIR_C", 1))
             bb_min = int(_uc("BB_PURE_TP_MIN_CENTS", 4))
-            bb_max = int(_uc("BB_PURE_TP_MAX_CENTS", 30))
+            # Tier-aware cap matches the preflight TP for symmetry.
+            _bb_tier = int(pos.get("_bb_pure_conviction_tier", 1) or 1)
+            if _bb_tier >= 3:
+                bb_max = int(_uc("BB_PURE_TP_MAX_CENTS_TIER3", 12))
+            elif _bb_tier == 2:
+                bb_max = int(_uc("BB_PURE_TP_MAX_CENTS_TIER2", 20))
+            else:
+                bb_max = int(_uc("BB_PURE_TP_MAX_CENTS", 30))
             tp_target = fair_for_side - bb_inside
             tp_target = max(entry + bb_min, tp_target)
             tp_target = min(entry + bb_max, tp_target)

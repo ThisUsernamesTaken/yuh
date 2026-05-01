@@ -474,6 +474,26 @@ BB_PURE_TP_MIN_CENTS             = 4      # Floor — never TP tighter than this
 BB_PURE_TP_MAX_CENTS             = 30     # Cap — never TP wider than this
                                           # (defensive against extreme edges)
 
+# Conviction-tier sizing (2026-05-01 per user). When edge AND fair-side
+# extremity both clear thresholds, raise Kelly cap. The hard ceiling is
+# liquidity (visible book depth) — the engine's per-window contract cap
+# still applies. Tighter TP cap on bigger size: with size already large
+# we don't need to be greedy on per-contract gain; tighter TP raises
+# fill probability so trades close in-window instead of riding to expiry.
+BB_PURE_KELLY_TIER2_MIN_EDGE_PP      = 25.0  # Tier 2 edge floor
+BB_PURE_KELLY_TIER2_MIN_FAIR_EXTREME = 85.0  # Tier 2 fair-extremity floor
+BB_PURE_KELLY_TIER2_MAX_FRAC         = 0.30  # Tier 2 Kelly cap (2x base)
+BB_PURE_KELLY_TIER3_MIN_EDGE_PP      = 40.0  # Tier 3 edge floor
+BB_PURE_KELLY_TIER3_MIN_FAIR_EXTREME = 95.0  # Tier 3 fair-extremity floor
+BB_PURE_KELLY_TIER3_MAX_FRAC         = 0.50  # Tier 3 Kelly cap (3.3x base)
+BB_PURE_TP_MAX_CENTS_TIER2           = 20    # Tier 2 TP cap (tighter)
+BB_PURE_TP_MAX_CENTS_TIER3           = 12    # Tier 3 TP cap (tightest)
+
+# Per-window fire cap (2026-05-01). Live observation: 1-2 BB_PURE fires
+# per window has been profitable; the third fire crosses into gamble
+# territory because of cumulative edge decay and accumulating risk.
+BB_PURE_MAX_FIRES_PER_WINDOW         = 2
+
 # ── Post-close residual sweep (Claude 2026-04-29 per user) ────────────────
 # After every TA_FORCED / LATE_DOMINANT / SR_FADE close, poll Kalshi
 # positions every POST_CLOSE_RESIDUAL_POLL_S seconds for

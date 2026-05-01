@@ -111,10 +111,52 @@ def test_size_scales_with_edge_magnitude():
 
 
 def test_kelly_capped_at_max_frac():
-    """Even with monster edge, kelly_fraction stays under the ceiling."""
+    """Even with monster edge, kelly_fraction stays under the ACTIVE ceiling.
+
+    With conviction tiers enabled (2026-05-01), an 80pp edge with fair=90c
+    qualifies for Tier 2, raising the active cap from 0.15 to 0.30 (and
+    Tier 3 to 0.50 on extreme cases). The test verifies the cap is
+    respected for whichever tier was selected.
+    """
     sig = _eval(market=10, fair=90)  # 80pp mispricing — full Kelly is huge
     assert sig is not None
+    # Tier-aware cap: pick the cap that matches the resolved tier
+    if sig.conviction_tier == 3:
+        active_cap = DEFAULT_CONFIG.get("kelly_tier3_max_frac", 0.50)
+    elif sig.conviction_tier == 2:
+        active_cap = DEFAULT_CONFIG.get("kelly_tier2_max_frac", 0.30)
+    else:
+        active_cap = DEFAULT_CONFIG["kelly_max_frac"]
+    assert sig.kelly_fraction <= active_cap + 1e-9
+
+
+def test_tier1_clean_kelly_cap():
+    """Edge below Tier 2 thresholds → Tier 1, capped at kelly_max_frac."""
+    # 20pp edge, fair=70c (below the 25pp/85c Tier 2 floor)
+    sig = _eval(market=50, fair=70)
+    assert sig is not None
+    assert sig.conviction_tier == 1
     assert sig.kelly_fraction <= DEFAULT_CONFIG["kelly_max_frac"] + 1e-9
+
+
+def test_tier2_high_conviction_raises_cap():
+    """Edge ≥ 25pp AND fair ≥ 85c → Tier 2, cap 0.30."""
+    # 30pp edge, fair=90c (qualifies Tier 2)
+    sig = _eval(market=60, fair=90)
+    assert sig is not None
+    assert sig.conviction_tier == 2
+    # Tier 2 cap should let kelly_fraction exceed 0.15 if math allows
+    # (caller can verify cap was actually used)
+    assert sig.kelly_fraction <= 0.30 + 1e-9
+
+
+def test_tier3_extreme_conviction_raises_cap_further():
+    """Edge ≥ 40pp AND fair ≥ 95c → Tier 3, cap 0.50."""
+    # 50pp edge, fair=95c (qualifies Tier 3)
+    sig = _eval(market=45, fair=95)
+    assert sig is not None
+    assert sig.conviction_tier == 3
+    assert sig.kelly_fraction <= 0.50 + 1e-9
 
 
 def test_negative_kelly_returns_none():
