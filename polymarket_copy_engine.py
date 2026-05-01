@@ -18803,7 +18803,16 @@ class PolymarketCopyEngine:
             # Floor only moves UP, never down — bid noise can't trigger it.
             # If bid crosses below floor → market sell (exit at floor).
             # ═══════════════════════════════════════════════════════════════
-            if count > 0 and bid > 0 and not pos.get("_profit_trail_exited", False):
+            # 2026-05-01: TRAIL disabled for BB_PURE positions. Trail
+            # logic locks in profit on retracement, but BB_PURE's exit
+            # thesis is FVG-close (preflight TP at fair − 1c). Trail
+            # exited a 57x YES @ 42c trade at 45c (-$0.26 net after
+            # fees) when the preflight TP was waiting at fair=86c
+            # (potential +$24). Same gate as SCALP DCA.
+            _trail_strat = pos.get("strategy_name", "")
+            if (count > 0 and bid > 0
+                    and not pos.get("_profit_trail_exited", False)
+                    and _trail_strat != "BB_PURE"):
                 _trail_armed = pos.get("_trail_armed", False)
                 _trail_floor = pos.get("_trail_floor", 0)
                 _profit_now = bid - entry
