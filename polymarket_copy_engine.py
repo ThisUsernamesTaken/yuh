@@ -9037,14 +9037,39 @@ class PolymarketCopyEngine:
         # loss. User intervention 2026-04-30 PM was triggered by exactly
         # this: BB_PURE entries with no visible sell on the Kalshi UI.
         #
-        # Mirrors PROTECTIVE_TP_OFFSET_C (default 5c) so when protective
-        # mode runs its first manage cycle it sees an existing order at
-        # the price it would have placed itself, debounces, and doesn't
-        # churn. If bid later drops below entry, protective mode will
-        # cancel this and place an SL order — that flow is unchanged.
+        # 2026-05-01 v2: TP target = fair value for our side, minus a small
+        # in-fair concession (BB_PURE_TP_INSIDE_FAIR_C, default 1c) for
+        # fillability. This is the "FVG-close" target — when market mid
+        # reaches fair, the trade thesis is fully played out. Static 5c
+        # offsets undersized big-edge winners (40pp signal capped at +5c
+        # leaves 35c on the table). Wider TPs do mean lower fill rate per
+        # trade, but expected value is materially higher.
+        #
+        # Floors/caps (BB_PURE_TP_MIN_CENTS, BB_PURE_TP_MAX_CENTS) bound
+        # the target so a tiny edge still gets a sensible TP and an
+        # extreme edge doesn't park the order at an unfilled extreme.
         try:
-            tp_offset = int(_uc("PROTECTIVE_TP_OFFSET_C", 5))
-            preflight_px = max(entry_px + 1, min(99, entry_px + tp_offset))
+            # Fair value for OUR side (we sell our side, so price target
+            # is our side's fair). For YES position: fair_yes_cents. For
+            # NO position: 100 - fair_yes_cents (NO and YES sum to 100).
+            if sig.side == "yes":
+                fair_for_side = int(sig.fair_yes_cents)
+            else:
+                fair_for_side = 100 - int(sig.fair_yes_cents)
+            tp_inside_fair = int(_uc("BB_PURE_TP_INSIDE_FAIR_C", 1))
+            tp_min_delta = int(_uc("BB_PURE_TP_MIN_CENTS", 4))
+            tp_max_delta = int(_uc("BB_PURE_TP_MAX_CENTS", 30))
+            # Target = fair − in-fair concession (sells slightly inside
+            # fair to improve fill probability).
+            preflight_px = fair_for_side - tp_inside_fair
+            # Apply floor/cap relative to entry so we don't TP too tight
+            # (tiny edge) or too wide (extreme edge — order may never fill).
+            preflight_px = max(entry_px + tp_min_delta, preflight_px)
+            preflight_px = min(entry_px + tp_max_delta, preflight_px)
+            # Exchange bounds.
+            preflight_px = max(1, min(99, preflight_px))
+            tp_delta = preflight_px - entry_px
+
             preflight_order = await self._client.place_order(
                 ticker=ticker, side=sig.side,
                 price=preflight_px, count=filled,
@@ -9061,10 +9086,10 @@ class PolymarketCopyEngine:
             self._open_position["tp_order_ids"] = [pre_oid] if pre_oid else []
             self._open_position["tp_price"] = preflight_px
             logger.warning(
-                "BB_PURE PREFLIGHT-TP: %s %dct sell @ %dc (entry=%dc, +%dc) "
-                "order=%s — position covered immediately",
-                sig.side.upper(), filled, preflight_px, entry_px, tp_offset,
-                pre_oid[:12],
+                "BB_PURE PREFLIGHT-TP: %s %dct sell @ %dc (entry=%dc, +%dc, "
+                "fair=%dc, edge=%.1fpp) order=%s — FVG-close target",
+                sig.side.upper(), filled, preflight_px, entry_px, tp_delta,
+                fair_for_side, sig.edge_pp, pre_oid[:12],
             )
         except Exception as e:
             logger.error(

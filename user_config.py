@@ -459,6 +459,21 @@ BB_PURE_TP_EDGE_PP               = 5.0    # TP when fair value crosses
 BB_PURE_SL_EDGE_PP               = 8.0    # SL when fair value drops below
                                           # entry_implied_pp - this
 
+# Preflight TP — placed at fill time, anchored to FVG closing (2026-05-01)
+# Target = fair value for our side − BB_PURE_TP_INSIDE_FAIR_C, bounded by
+# [entry+MIN_CENTS, entry+MAX_CENTS].
+#   - Big edge (e.g. 40pp): TP wide, captures most of the implied move
+#   - Small edge (e.g. 8pp): TP tight, takes certain wins early
+# Sized to philosophy: when market reaches fair, the BB_PURE thesis is
+# fully played out. Wider TPs lower per-trade fill rate but raise expected
+# value (proven on 2026-04-30 PM session — flat 5c TPs left $30+ on the
+# table per high-edge entry).
+BB_PURE_TP_INSIDE_FAIR_C         = 1      # Sell this many cents inside fair
+                                          # for fill probability (0 = at fair)
+BB_PURE_TP_MIN_CENTS             = 4      # Floor — never TP tighter than this
+BB_PURE_TP_MAX_CENTS             = 30     # Cap — never TP wider than this
+                                          # (defensive against extreme edges)
+
 # ── Post-close residual sweep (Claude 2026-04-29 per user) ────────────────
 # After every TA_FORCED / LATE_DOMINANT / SR_FADE close, poll Kalshi
 # positions every POST_CLOSE_RESIDUAL_POLL_S seconds for
