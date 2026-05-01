@@ -518,6 +518,19 @@ BB_PURE_HARD_MIN_TIME_S              = 60.0  # Hard final-minute lockout
 PRE_EXPIRY_CONSOLIDATE_S             = 90.0  # Take ownership at this
                                               # remaining-seconds threshold
 
+# Entry-timing filter (2026-05-01): reject BB_PURE entries when the
+# buy side is at an extreme of the recent mid range. The model's fair
+# value lags BTC moves — when YES has just spiked, fair hasn't caught
+# up yet, and the engine sees "huge edge" because mid is at a local
+# high. Today's -$252 loss on -1330-30: bought YES @ 66c at top of
+# range, BTC reversed, YES collapsed to 8c.
+BB_PURE_RANGE_LOOKBACK_S             = 180.0  # Scan last 3 min of mids
+BB_PURE_RANGE_BLOCK_PCT              = 0.80   # Block buys above this
+                                              # percentile of recent range
+                                              # (0.80 = top 20% blocked)
+BB_PURE_RANGE_MIN_SAMPLES            = 10     # Need at least N mids in
+                                              # the lookback to gate
+
 # ── Post-close residual sweep (Claude 2026-04-29 per user) ────────────────
 # After every TA_FORCED / LATE_DOMINANT / SR_FADE close, poll Kalshi
 # positions every POST_CLOSE_RESIDUAL_POLL_S seconds for

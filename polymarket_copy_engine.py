@@ -8865,6 +8865,58 @@ class PolymarketCopyEngine:
             return None
         if sig is None:
             return None
+
+        # 2026-05-01 ENTRY-TIMING FILTER (range position):
+        # Live observed -1330-30 trade today: BB_PURE bought YES @ 66c
+        # at the LOCAL HIGH of the recent range. BTC immediately moved
+        # against us; YES collapsed to 8c in 10 min for a -$252 loss.
+        # The model's "fair=94c" lagged behind the move that had just
+        # happened. Reject entries when our buy side is in the top X%
+        # of the last N seconds of mids — the model is chasing.
+        try:
+            tape = getattr(self, "_kalshi_tape", None)
+            range_lookback = float(_uc("BB_PURE_RANGE_LOOKBACK_S", 180.0))
+            block_pct = float(_uc("BB_PURE_RANGE_BLOCK_PCT", 0.80))
+            min_samples = int(_uc("BB_PURE_RANGE_MIN_SAMPLES", 10))
+            if tape is not None and range_lookback > 0:
+                # Scan the per-ticker mid deque (tape._mids[ticker]) for
+                # the last N seconds of samples.
+                _now_ms = int(time.time() * 1000)
+                _cutoff_ms = _now_ms - int(range_lookback * 1000)
+                _mids_dq = tape._mids.get(ticker)
+                if _mids_dq:
+                    _recent = [m for (ts, m) in _mids_dq if ts >= _cutoff_ms]
+                    if len(_recent) >= min_samples:
+                        _hi = max(_recent)
+                        _lo = min(_recent)
+                        if _hi > _lo:
+                            _range_pos = (
+                                (market_mid_cents - _lo) / (_hi - _lo)
+                            )
+                        else:
+                            _range_pos = 0.5
+                        # YES buy at top-of-range = chasing
+                        if sig.side == "yes" and _range_pos >= block_pct:
+                            logger.warning(
+                                "BB_PURE RANGE-BLOCK: YES at %.0f%% of "
+                                "last %.0fs range [%dc..%dc] mid=%dc — "
+                                "skipping (top-of-trend chase)",
+                                _range_pos * 100, range_lookback,
+                                _lo, _hi, market_mid_cents,
+                            )
+                            return None
+                        # NO buy = YES at bottom-of-range
+                        if sig.side == "no" and _range_pos <= (1.0 - block_pct):
+                            logger.warning(
+                                "BB_PURE RANGE-BLOCK: NO buy with YES at "
+                                "%.0f%% of last %.0fs range [%dc..%dc] "
+                                "mid=%dc — skipping (bottom-of-trend chase)",
+                                _range_pos * 100, range_lookback,
+                                _lo, _hi, market_mid_cents,
+                            )
+                            return None
+        except Exception as _re:
+            logger.debug("BB_PURE range-block check failed: %s", _re)
         # Log the signal so we can correlate with outcomes via gate_decisions
         try:
             if self._signal_logger:
