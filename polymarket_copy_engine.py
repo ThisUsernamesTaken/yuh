@@ -18828,6 +18828,27 @@ class PolymarketCopyEngine:
                             )
                         pos["_trail_fired"] = True
                         pos["_profit_trail_exited"] = True
+                        # 2026-05-01 INSTRUMENTATION: pre-fire Kalshi truth.
+                        # Live observed at 10:03:53 PT today: TRAIL fired
+                        # against a phantom 407 YES position (Kalshi was
+                        # already flat, engine state stale). Detection lets
+                        # us measure orphan-fire rate vs real-fire rate
+                        # before deciding to gate or formalize the path.
+                        _trail_pre_kalshi_ct = -1
+                        try:
+                            _pos_pre = await self._client.get_positions()
+                            for _p in _pos_pre or []:
+                                if _p.get("ticker") == pos["ticker"]:
+                                    _trail_pre_kalshi_ct = abs(int(float(
+                                        _p.get("position_fp", "0") or 0)))
+                                    break
+                            else:
+                                _trail_pre_kalshi_ct = 0
+                        except Exception:
+                            pass
+                        _trail_orphan = (
+                            _trail_pre_kalshi_ct == 0 and int(count) > 0
+                        )
                         try:
                             await self._cancel_tp_order()
                         except Exception:
@@ -18854,10 +18875,24 @@ class PolymarketCopyEngine:
                             if _sold > 0:
                                 _realized = (bid - entry) * _sold / 100.0
                                 logger.warning(
-                                    "CopyEngine TRAIL FIRED: %dx @ ~%dc (entry=%dc floor=%dc hwm=%dc) | $%+.2f",
+                                    "CopyEngine TRAIL FIRED: %dx @ ~%dc (entry=%dc "
+                                    "floor=%dc hwm=%dc) | $%+.2f | engine_ct=%d "
+                                    "kalshi_pre=%d kalshi_post=%d orphan=%s",
                                     _sold, bid, entry, _trail_floor, hwm, _realized,
+                                    int(count), _trail_pre_kalshi_ct,
+                                    _actual_remaining_trl,
+                                    "YES" if _trail_orphan else "no",
                                 )
-                                self._record_daily_pnl(_realized)
+                                # 2026-05-01: _record_daily_pnl is missing
+                                # from the engine. Wrap defensively.
+                                try:
+                                    if hasattr(self, "_record_daily_pnl"):
+                                        self._record_daily_pnl(_realized)
+                                except Exception as _rdp_err:
+                                    logger.debug(
+                                        "trail _record_daily_pnl skipped: %s",
+                                        _rdp_err,
+                                    )
                                 pos["count"] = _actual_remaining_trl
                                 if pos["count"] <= 0:
                                     await self._record_trade_outcome(
