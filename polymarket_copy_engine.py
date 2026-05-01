@@ -9026,6 +9026,53 @@ class PolymarketCopyEngine:
             self._entered_tickers_this_window.add(ticker)
         except Exception:
             pass
+
+        # ── PREFLIGHT TP (2026-05-01) ──────────────────────────────────────
+        # Place a resting limit-sell IMMEDIATELY after fill so the position
+        # is never naked. Without this, _maintain_protective_order waits for
+        # get_positions() truth to reflect count > 0, which can lag 30-180s
+        # after fill (observed 2026-04-30 PM: 9-minute divergence between
+        # engine state and Kalshi truth). During that window the position
+        # has no exit order — if the window expires inside the gap, full
+        # loss. User intervention 2026-04-30 PM was triggered by exactly
+        # this: BB_PURE entries with no visible sell on the Kalshi UI.
+        #
+        # Mirrors PROTECTIVE_TP_OFFSET_C (default 5c) so when protective
+        # mode runs its first manage cycle it sees an existing order at
+        # the price it would have placed itself, debounces, and doesn't
+        # churn. If bid later drops below entry, protective mode will
+        # cancel this and place an SL order — that flow is unchanged.
+        try:
+            tp_offset = int(_uc("PROTECTIVE_TP_OFFSET_C", 5))
+            preflight_px = max(entry_px + 1, min(99, entry_px + tp_offset))
+            preflight_order = await self._client.place_order(
+                ticker=ticker, side=sig.side,
+                price=preflight_px, count=filled,
+                action="sell", post_only=True,
+            )
+            pre_oid = getattr(preflight_order, "order_id", None) or ""
+            self._open_position["_protective_order_id"] = pre_oid
+            self._open_position["_protective_order_px"] = preflight_px
+            self._open_position["_protective_order_count"] = filled
+            self._open_position["_protective_order_state"] = "tp"
+            self._open_position["_protective_last_replan_ts"] = time.time()
+            self._open_position["_protective_active"] = True
+            self._open_position["tp_order_id"] = pre_oid
+            self._open_position["tp_order_ids"] = [pre_oid] if pre_oid else []
+            self._open_position["tp_price"] = preflight_px
+            logger.warning(
+                "BB_PURE PREFLIGHT-TP: %s %dct sell @ %dc (entry=%dc, +%dc) "
+                "order=%s — position covered immediately",
+                sig.side.upper(), filled, preflight_px, entry_px, tp_offset,
+                pre_oid[:12],
+            )
+        except Exception as e:
+            logger.error(
+                "BB_PURE PREFLIGHT-TP FAILED: %s — position is exposed until "
+                "_maintain_protective_order takes over on next manage cycle",
+                e,
+            )
+
         logger.warning(
             "BB_PURE FILL: %s %s %dx @ %dc ($%.2f) order=%s — protective "
             "mode will manage exit",
