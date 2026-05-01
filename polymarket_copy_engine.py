@@ -13425,11 +13425,43 @@ class PolymarketCopyEngine:
         if bid <= 0:
             return False
 
-        tp_offset = int(_uc("PROTECTIVE_TP_OFFSET_C", 5))
+        # 2026-05-01 STRATEGY-AWARE TARGETS:
+        # The legacy static `entry + PROTECTIVE_TP_OFFSET_C` target was
+        # designed for TA_FORCED scalps. For BB_PURE positions, the
+        # preflight-TP places at FVG-close (fair − BB_PURE_TP_INSIDE_FAIR_C,
+        # bounded by [+MIN_CENTS, +MAX_CENTS]). When the static target
+        # disagrees with the preflight target, this loop churns: cancels
+        # the wide preflight, places a tight 5c order, that order fills
+        # too early, then a follow-up replan can stack a SECOND sell that
+        # fills again → oversell into opposite-side short. Witnessed live
+        # 2026-05-01 07:30 PT on -26MAY011045-45 (443x NO @ 54 → 2 sells
+        # → 443 YES short → manual unwind required).
+        #
+        # When strategy is BB_PURE, mirror the preflight math here so the
+        # maintain loop AGREES with the preflight target and doesn't replan
+        # unnecessarily.
         sl_offset = int(_uc("PROTECTIVE_SL_OFFSET_C", 8))
+        strat = (pos.get("strategy_name") or "").upper()
+        if strat == "BB_PURE":
+            fair_yes_at_entry = int(
+                pos.get("_bb_pure_fair_yes_cents_at_entry") or 0
+            )
+            fair_for_side = (
+                fair_yes_at_entry if side == "yes"
+                else (100 - fair_yes_at_entry)
+            )
+            bb_inside = int(_uc("BB_PURE_TP_INSIDE_FAIR_C", 1))
+            bb_min = int(_uc("BB_PURE_TP_MIN_CENTS", 4))
+            bb_max = int(_uc("BB_PURE_TP_MAX_CENTS", 30))
+            tp_target = fair_for_side - bb_inside
+            tp_target = max(entry + bb_min, tp_target)
+            tp_target = min(entry + bb_max, tp_target)
+            tp_target = max(1, min(99, tp_target))
+        else:
+            tp_offset = int(_uc("PROTECTIVE_TP_OFFSET_C", 5))
+            tp_target = max(1, min(99, entry + tp_offset))
         target_state = "tp" if bid > entry else "sl"
-        target_px = (entry + tp_offset) if target_state == "tp" else (entry - sl_offset)
-        target_px = max(1, min(99, target_px))
+        target_px = tp_target if target_state == "tp" else max(1, min(99, entry - sl_offset))
 
         cur_id = pos.get("_protective_order_id")
         cur_px = int(pos.get("_protective_order_px", 0) or 0)
@@ -13449,36 +13481,57 @@ class PolymarketCopyEngine:
         if (now - last_replan_ts) < debounce and cur_id:
             return True  # debounce — don't churn
 
-        # Cancel old protective if any
-        if cur_id:
-            try:
-                await self._client.cancel_order(cur_id)
-            except Exception:
-                pass
-
-        # Place new protective at target_px
+        # 2026-05-01 ATOMIC PLACE-THEN-CANCEL:
+        # Old behavior cancelled the existing order BEFORE placing the new.
+        # If place failed (post_only cross, network error, etc.), the
+        # position was left naked and a subsequent retry could fill at any
+        # price and create oversells. New behavior: place new FIRST. Only
+        # if place succeeds, cancel the old. If place fails, old continues
+        # protecting. Brief window of two orders coexisting is acceptable —
+        # the count-poll OVERRUN check in the SYNC path catches doubles.
         try:
             new_order = await self._client.place_order(
                 ticker=ticker, side=side,
                 price=target_px, count=truth_ct,
                 action="sell", post_only=True,
             )
-            pos["_protective_order_id"] = getattr(new_order, "order_id", None)
-            pos["_protective_order_px"] = target_px
-            pos["_protective_order_count"] = truth_ct
-            pos["_protective_order_state"] = target_state
-            pos["_protective_last_replan_ts"] = now
-            logger.info(
-                "CopyEngine PROTECTIVE [%s]: %s %dct @ %dc entry=%dc bid=%dc "
-                "(prev=%dc count=%d)",
-                target_state.upper(), side.upper(), truth_ct, target_px,
-                entry, bid, cur_px, cur_count,
-            )
+            new_oid = getattr(new_order, "order_id", None)
+            if not new_oid:
+                logger.error(
+                    "PROTECTIVE place_order returned no order_id; "
+                    "leaving existing order in place"
+                )
+                return False
         except Exception as e:
-            logger.error("PROTECTIVE place_order failed: %s", e)
-            # If place failed, leave existing order alone. Don't return True
-            # so legacy stop logic can attempt rescue.
-            return False
+            logger.error(
+                "PROTECTIVE place_order failed: %s — leaving existing "
+                "order %s in place (no naked window)",
+                e, (cur_id or "")[:12],
+            )
+            return False  # legacy stop logic can attempt rescue
+
+        # New order placed successfully; now cancel the old one.
+        if cur_id and cur_id != new_oid:
+            try:
+                await self._client.cancel_order(cur_id)
+            except Exception:
+                # Cancel failures are typically "already terminal" (filled
+                # or already cancelled) — safe to ignore. Worst case the
+                # old order rests at a wider price and might fill too —
+                # caught by count-poll OVERRUN.
+                pass
+
+        pos["_protective_order_id"] = new_oid
+        pos["_protective_order_px"] = target_px
+        pos["_protective_order_count"] = truth_ct
+        pos["_protective_order_state"] = target_state
+        pos["_protective_last_replan_ts"] = now
+        logger.info(
+            "CopyEngine PROTECTIVE [%s]: %s %dct @ %dc entry=%dc bid=%dc "
+            "strat=%s (prev=%dc count=%d)",
+            target_state.upper(), side.upper(), truth_ct, target_px,
+            entry, bid, strat or "?", cur_px, cur_count,
+        )
         return True
 
     async def _cancel_tp_order(self) -> bool:
