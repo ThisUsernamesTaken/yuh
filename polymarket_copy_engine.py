@@ -19031,7 +19031,16 @@ class PolymarketCopyEngine:
             # signal strength — but instead of adding contracts we're
             # changing how we harvest the ones we already have.
             # ═══════════════════════════════════════════════════════════════
+            # 2026-05-01: SCALP→HOLD upgrade GATED OFF for BB_PURE.
+            # Live observed -1500-00 trade at 11:45 PT today: BB_PURE
+            # bought 14 YES @ 43c, placed preflight TP at 49c (FVG-close).
+            # 1 second later, this upgrade path fired (RSI=11 extreme),
+            # CANCELLED the 49c preflight, placed legacy staircase at
+            # 70/78/85/92/95. Those prices are unreachable for a 43c
+            # entry — the BB_PURE thesis was lost.
+            # Same gate as SCALP DCA + TRAIL: don't run on BB_PURE.
             if (count > 0 and bid > 0
+                    and pos.get("strategy_name") != "BB_PURE"
                     and pos.get("_exit_mode", "SCALP") == "SCALP"
                     and not pos.get("_upgraded_from_scalp", False)
                     and not pos.get("_scalp_stopped", False)
