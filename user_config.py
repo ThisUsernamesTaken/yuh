@@ -821,12 +821,15 @@ PRICE_FEED_WS_TIMEOUT_S = 30.0
 # Guardrails in place: DAILY_LOSS_LIMIT=$25, SIZING_HARD_CAP=80ct,
 # SR_FADE_MIN_EDGE_PP=5.0, L1 stability gate, residual reconciler,
 # one-open-position mutex. Flip back to True if anything unexpected.
-PAPER_TRADING = False  # 2026-05-01 07:18 PT: flipped back to live after
-                       # paper validated:
-                       #   - BB_PURE PREFLIGHT-TP fires <60ms after fill
-                       #   - FVG-close target captured (+30c on 60pp edge)
-                       #   - count-poll + SYNC BB_PURE-TP branch ready
-                       # Account: $1595.25 going in.
+PAPER_TRADING = False  # 2026-05-01 09:00 PT: live with full BB_PURE stack
+                       # Cumulative fixes since session start:
+                       #   - Preflight TP at fill (FVG-close target)
+                       #   - Strategy-aware protective_order maintain
+                       #   - Atomic place-then-cancel on protective replan
+                       #   - Count-poll + OVERRUN detection (3s, 6 polls)
+                       #   - BB_PURE preserved across SYNC RECLAIM
+                       #   - SCALP DCA gated off on BB_PURE
+                       # Account at restart: $1441.77
 PAPER_STARTING_BALANCE = 100.0
 PAPER_SLIPPAGE_CENTS = 1
 
