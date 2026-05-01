@@ -1,9 +1,37 @@
+# Python
 venv/
 __pycache__/
 *.pyc
 *.pyo
-data/
-.pytest_cache/
 *.egg-info/
+.pytest_cache/
+build/
+dist/
+*.spec
+
+# Secrets — NEVER commit these
+credentials/
+*.pem
+*.key
+*.env
 .env
+.env.*
+!.env.example
+kalshi*.env
+kalshi*key*
+
+# Runtime data
+data/
 *.log
+*.db
+*.db-shm
+*.db-wal
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local archives
+_archive/

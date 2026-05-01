@@ -21,7 +21,13 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
+import ssl
+
 import aiohttp
+try:
+    import certifi
+except ImportError:
+    certifi = None
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
@@ -162,6 +168,41 @@ class KalshiOrderBook:
             return self.mid_cents
         return (self.best_yes_ask * v_b + self.best_yes_bid * v_a) / total
 
+    def sell_fill_price(self, side: str, count: int) -> float:
+        """Estimated average fill price (cents) for selling `count` contracts.
+
+        Walks the bid stack on our held side (yes_bids for YES, no_bids for NO).
+        Returns 0.0 if the book is empty.
+        """
+        stack = self.yes_bids if side == "yes" else self.no_bids
+        remaining = count
+        total = 0
+        filled = 0
+        for price, qty in stack:
+            take = min(remaining, qty)
+            total += take * price
+            filled += take
+            remaining -= take
+            if remaining == 0:
+                break
+        return (total / filled) if filled > 0 else 0.0
+
+    def bid_depth_cents(self, side: str, min_contracts: int) -> int:
+        """Price (cents) of the worst bid level needed to fill min_contracts.
+
+        Walks the bid stack on our held side until cumulative qty >= min_contracts.
+        Returns the price at that level (or 0 if book too thin).
+        """
+        stack = self.yes_bids if side == "yes" else self.no_bids
+        remaining = min_contracts
+        worst_price = 0
+        for price, qty in stack:
+            worst_price = price
+            remaining -= qty
+            if remaining <= 0:
+                break
+        return worst_price
+
     # ── Depth helpers ─────────────────────────────────────────────────────
 
     def liquidity_within(self, side: str, n_cents: int) -> int:
@@ -258,7 +299,12 @@ class KalshiClient:
         self._session: Optional[aiohttp.ClientSession] = None
 
     async def __aenter__(self) -> "KalshiClient":
-        self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10))
+        ssl_ctx = ssl.create_default_context(cafile=certifi.where()) if certifi else ssl.create_default_context()
+        connector = aiohttp.TCPConnector(ssl=ssl_ctx, force_close=True)
+        self._session = aiohttp.ClientSession(
+            connector=connector,
+            timeout=aiohttp.ClientTimeout(total=10, connect=5),
+        )
         return self
 
     async def __aexit__(self, *args) -> None:
@@ -344,6 +390,7 @@ class KalshiClient:
             "GET", "/markets",
             params={
                 "series_ticker": "KXBTC15M",
+                "status": "open",
                 "limit": 100,
             }
         )
@@ -444,6 +491,8 @@ class KalshiClient:
         price: Optional[int] = None,  # Cents (1-99). Required for limit orders; ignored for market.
         order_type: str = "limit",
         action: str = "buy",  # "buy" to open, "sell" to close a position
+        post_only: bool = False,
+        time_in_force: Optional[str] = None,  # "immediate_or_cancel" | "fill_or_kill" | None (= GTC)
     ) -> KalshiOrder:
         """Place or close a KXBTC15M order.
 
@@ -459,6 +508,14 @@ class KalshiClient:
             price:      Limit price in cents. Required for limit orders.
             order_type: "limit" or "market".
             action:     "buy" (open) or "sell" (close).
+            post_only:  If True, order rejected if it would cross. Maker-only.
+            time_in_force: Optional Kalshi TIF flag. None = good-till-canceled
+                           (default). "immediate_or_cancel" = IOC (taker-only;
+                           any unfilled remainder is auto-cancelled by Kalshi
+                           rather than resting on the book — critical for ARB
+                           legs to prevent async maker-fill bag-holds).
+                           "fill_or_kill" = FOK (must fill completely or be
+                           rejected; no partial fills allowed).
         """
         payload: dict = {
             "ticker": ticker,
@@ -469,6 +526,10 @@ class KalshiClient:
         }
         if order_type == "limit":
             payload["yes_price" if side == "yes" else "no_price"] = price
+        if post_only:
+            payload["post_only"] = True
+        if time_in_force:
+            payload["time_in_force"] = time_in_force
 
         data = await self._request("POST", "/portfolio/orders", json=payload)
         return _parse_order(data["order"])
@@ -491,6 +552,100 @@ class KalshiClient:
         """Fetch all open positions."""
         data = await self._request("GET", "/portfolio/positions")
         return data.get("market_positions", [])
+
+    async def cancel_all_resting_orders(self) -> int:
+        """Fetch all resting orders and cancel them. Returns number cancelled."""
+        data = await self._request(
+            "GET", "/portfolio/orders",
+            params={"status": "resting", "limit": 100},
+        )
+        orders = data.get("orders", [])
+        cancelled = 0
+        for o in orders:
+            if await self.cancel_order(o.get("order_id", "")):
+                cancelled += 1
+        return cancelled
+
+    async def get_settlements(
+        self,
+        limit: int = 200,
+        cursor: str = "",
+    ) -> tuple[list[dict], str]:
+        """Fetch settled position outcomes (authoritative P&L source).
+
+        Each settlement record contains:
+            ticker, market_result ("yes"/"no"),
+            yes_count_fp, no_count_fp (contracts held on each side),
+            yes_total_cost_dollars, no_total_cost_dollars,
+            fee_cost, value (cents), revenue, settled_time.
+
+        Returns:
+            (settlements, next_cursor) — next_cursor is "" when no more pages.
+        """
+        params: dict = {"limit": limit}
+        if cursor:
+            params["cursor"] = cursor
+        data = await self._request("GET", "/portfolio/settlements", params=params)
+        return data.get("settlements", []), data.get("cursor", "")
+
+    async def get_fills(
+        self,
+        ticker: str = "",
+        min_ts: int = 0,
+        limit: int = 100,
+        cursor: str = "",
+    ) -> tuple[list[dict], str]:
+        """Fetch recent ACCOUNT fills (engine + manual).
+
+        Used by the manual-trade capture path: every fill returned here
+        with an order_id NOT in the engine's known order_ids is treated as
+        a user manual trade and snapshotted with engine state context.
+
+        Args:
+            ticker:  Optional market filter; "" returns all.
+            min_ts:  Unix seconds lower bound (0 = no filter).
+            limit:   Max fills per page.
+            cursor:  Pagination cursor.
+
+        Returns:
+            (fills, next_cursor) — each fill dict has order_id, ticker,
+            side, count, price, action, fee, created_time, etc.
+        """
+        params: dict = {"limit": limit}
+        if ticker:
+            params["ticker"] = ticker
+        if min_ts:
+            params["min_ts"] = min_ts
+        if cursor:
+            params["cursor"] = cursor
+        data = await self._request("GET", "/portfolio/fills", params=params)
+        return data.get("fills", []), data.get("cursor", "")
+
+    async def get_market_trades(
+        self,
+        ticker: str,
+        limit: int = 100,
+        min_ts: int = 0,
+        cursor: str = "",
+    ) -> tuple[list[dict], str]:
+        """Fetch anonymous trade tape for a market with cursor pagination.
+
+        Args:
+            ticker:  Market ticker.
+            limit:   Max trades per page.
+            min_ts:  Unix seconds lower bound (0 = no filter).
+            cursor:  Pagination cursor from previous response.
+
+        Returns:
+            (trades, next_cursor) — next_cursor is "" when no more pages.
+        """
+        params: dict = {"ticker": ticker, "limit": limit}
+        if min_ts:
+            params["min_ts"] = min_ts
+        if cursor:
+            params["cursor"] = cursor
+        data = await self._request("GET", "/markets/trades", params=params)
+        return data.get("trades", []), data.get("cursor", "")
 
 
 # ─────────────────────────────────────────────
@@ -515,7 +670,11 @@ def _parse_order(o: dict) -> KalshiOrder:
     taker_cost = float(o.get("taker_fill_cost_dollars", 0) or 0)
     maker_cost = float(o.get("maker_fill_cost_dollars", 0) or 0)
     total_cost = taker_cost + maker_cost
-    avg_price_cents = (total_cost / fill_count * 100) if fill_count > 0 else None
+    raw_avg = (total_cost / fill_count * 100) if fill_count > 0 else None
+    # For sell orders Kalshi reports cost from the buyer's perspective (100 - sell_price).
+    # Correct back to the price we actually received.
+    action = o.get("action", "buy")
+    avg_price_cents = (round(100.0 - raw_avg) if action == "sell" else raw_avg) if raw_avg is not None else None
     # Limit price: use dollars field (returned as string) then convert to cents
     side = o.get("side", "")
     price_dollars = float(

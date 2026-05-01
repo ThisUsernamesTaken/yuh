@@ -192,10 +192,20 @@ if (-not $SkipService) {
 
     $NssmExe = $null
 
-    # Try PATH first
-    try {
-        $NssmExe = (Get-Command "nssm" -ErrorAction SilentlyContinue).Source
-    } catch { }
+    # Prefer bundled NSSM at <project>/tools/nssm.exe (shipped in the
+    # F:\ install package — solves "nssm not on PATH" on fresh machines).
+    $BundledNssm = Join-Path $ProjectRoot "tools\nssm.exe"
+    if (Test-Path $BundledNssm) {
+        $NssmExe = $BundledNssm
+        Write-OK "Using bundled NSSM at $NssmExe"
+    }
+
+    # Fall back to PATH
+    if (-not $NssmExe) {
+        try {
+            $NssmExe = (Get-Command "nssm" -ErrorAction SilentlyContinue).Source
+        } catch { }
+    }
 
     # Try winget install location
     if (-not $NssmExe) {
@@ -249,7 +259,9 @@ if (-not $SkipService) {
 
     $LogFile = Join-Path $DataDir "engine.log"
 
-    & $NssmExe install $ServiceName $VenvPython "$ProjectRoot\main.py"
+    # Entry point: run_copy_engine.py (the engine's actual main module).
+    # 2026-04-28 fix: was main.py which doesn't exist on this repo.
+    & $NssmExe install $ServiceName $VenvPython "$ProjectRoot\run_copy_engine.py"
     & $NssmExe set $ServiceName AppDirectory         $ProjectRoot
     & $NssmExe set $ServiceName AppStdout            $LogFile
     & $NssmExe set $ServiceName AppStderr            $LogFile
