@@ -545,6 +545,18 @@ BB_PURE_HARD_MIN_TIME_S              = 420.0 # 7 minutes (was 60s). After
 PRE_EXPIRY_CONSOLIDATE_S             = 90.0  # Take ownership at this
                                               # remaining-seconds threshold
 
+# Orphan-position auto-flatten watchdog (2026-05-01). Background task
+# polls Kalshi truth directly (NOT engine state) every N seconds; any
+# non-zero position not from the active BB_PURE ticker AND not from a
+# recent placement gets market-sold immediately. Targets the side-flip
+# pattern where engine sells against stale state and Kalshi atomically
+# opens an opposite-side short.
+ORPHAN_FLATTEN_ENABLED               = True
+ORPHAN_FLATTEN_POLL_S                = 5.0   # Poll interval (seconds)
+ORPHAN_FLATTEN_RECENT_S              = 60.0  # Skip tickers placed within
+                                              # this window (let active
+                                              # orders fill normally)
+
 # Entry-timing filter (2026-05-01): reject BB_PURE entries when the
 # buy side is at an extreme of the recent mid range. The model's fair
 # value lags BTC moves — when YES has just spiked, fair hasn't caught

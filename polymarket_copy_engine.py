@@ -1201,6 +1201,17 @@ class PolymarketCopyEngine:
                 if bool(_uc("MANUAL_FILLS_CAPTURE_ENABLED", True))
                 else None
             )
+            # 2026-05-01: Orphan-position auto-flatten task. Reads Kalshi
+            # truth directly (NOT engine state) every N seconds. Any
+            # position the engine didn't intend to open gets market-sold
+            # immediately. Catches the side-flip pattern where a sell
+            # against stale state opens an accidental opposite-side
+            # short via Kalshi's atomic mechanism.
+            orphan_flatten_task = (
+                asyncio.create_task(self._orphan_flatten_loop())
+                if bool(_uc("ORPHAN_FLATTEN_ENABLED", True))
+                else None
+            )
             # Cross-side arb detector (Claude 2026-04-28): scans Kalshi book
             # every 0.5s; when yes_ask + no_ask < threshold (after fees),
             # fires hedge buy on both sides for guaranteed margin per pair.
@@ -15301,6 +15312,110 @@ class PolymarketCopyEngine:
                 )
             except Exception:
                 pass
+
+    async def _orphan_flatten_loop(self) -> None:
+        """Auto-flatten orphan positions (2026-05-01).
+
+        Reads Kalshi positions directly every N seconds. Any non-zero
+        position that's NOT on the active BB_PURE ticker AND NOT from a
+        recent placement (last 60s) is treated as an orphan — flattened
+        immediately via market sell.
+
+        Targets the side-flip pattern: when a path places 'sell yes' with
+        no inventory, Kalshi atomically opens a YES short (= NO long).
+        Without this watchdog, those orphan opposite-side positions ride
+        to expiry and lose money silently.
+
+        Reads Kalshi truth, NOT engine state — by design. Engine state
+        diverges; Kalshi is authoritative.
+        """
+        if not bool(_uc("ORPHAN_FLATTEN_ENABLED", True)):
+            return
+        poll_s = float(_uc("ORPHAN_FLATTEN_POLL_S", 5.0))
+        recent_window_s = float(_uc("ORPHAN_FLATTEN_RECENT_S", 60.0))
+        logger.info(
+            "CopyEngine ORPHAN-FLATTEN: starting, interval=%.1fs "
+            "recent-protection=%.0fs", poll_s, recent_window_s,
+        )
+        await asyncio.sleep(15.0)  # let engine boot first
+        while True:
+            if getattr(self, "_shutting_down", False):
+                return
+            try:
+                _now_t = time.time()
+                positions = await self._client.get_positions()
+                active_ticker = ""
+                if self._open_position is not None:
+                    active_ticker = self._open_position.get("ticker", "") or ""
+                for p in positions or []:
+                    try:
+                        ticker = p.get("ticker", "")
+                        pos_raw = p.get("position_fp", "0") or "0"
+                        pos_int = int(float(pos_raw))
+                    except Exception:
+                        continue
+                    if not ticker or pos_int == 0:
+                        continue
+                    if ticker == active_ticker:
+                        continue  # active engine position; protective_maintain owns it
+                    # Recent placement protection — order may still be filling
+                    placed_ts = float(
+                        self._recent_placement_tickers.get(ticker, 0) or 0
+                    )
+                    if (_now_t - placed_ts) < recent_window_s:
+                        continue
+                    # ORPHAN — flatten via market sell
+                    abs_count = abs(pos_int)
+                    # Position fields don't tell us yes vs no directly;
+                    # we use exposure to infer. If no_price > yes_price
+                    # the position is likely NO; otherwise YES. For
+                    # simplicity, try to read the side from the position
+                    # data if available.
+                    # In Kalshi's API, positive = long contract on the
+                    # primary side (which is the only side per ticker
+                    # that you can hold). Side='yes' if position > 0
+                    # implies you bought YES; if position < 0, you
+                    # short-sold YES (= long NO equivalent). Sell with
+                    # action=sell, side=yes regardless — Kalshi handles
+                    # the close mechanically.
+                    book = self._kalshi_ws.get_book(ticker) if (
+                        self._kalshi_ws and hasattr(self._kalshi_ws, "get_book")
+                    ) else None
+                    if book is None or not getattr(book, "is_ready", False):
+                        # No book; we can't price the sell intelligently
+                        continue
+                    if pos_int > 0:
+                        # Long YES — sell yes at bid
+                        side = "yes"
+                        bid = int(getattr(book, "best_yes_bid", 0) or 0)
+                    else:
+                        # Short YES (= long NO equivalent) — buy YES to cover
+                        # OR equivalently sell NO at no_bid
+                        side = "no"
+                        bid = int(getattr(book, "best_no_bid", 0) or 0)
+                    if bid <= 0:
+                        bid = 1
+                    sell_px = max(1, int(bid) - 1)
+                    try:
+                        _o = await self._client.place_order(
+                            ticker=ticker, side=side,
+                            price=sell_px, count=abs_count,
+                            action="sell", post_only=False,
+                        )
+                        logger.warning(
+                            "CopyEngine ORPHAN-FLATTEN: %s %dct on %s @ "
+                            "%dc (bid=%dc) — orphan position auto-cleared",
+                            side.upper(), abs_count, ticker[-15:],
+                            sell_px, bid,
+                        )
+                    except Exception as _ofe:
+                        logger.error(
+                            "CopyEngine ORPHAN-FLATTEN failed for %s: %s",
+                            ticker[-15:], _ofe,
+                        )
+            except Exception as e:
+                logger.warning("ORPHAN-FLATTEN cycle error: %s", e)
+            await asyncio.sleep(max(1.0, poll_s))
 
     async def _manual_fills_poll_loop(self) -> None:
         """Manual-trade fills poller (Claude 2026-04-28).
