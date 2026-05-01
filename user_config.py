@@ -85,7 +85,7 @@ SESSION_NO_TRADE_ZONE_ENABLED = True  # kill switch
 #   4. BtcVolumeTracker not stale; ≥ 30 prints in window
 #   5. side bid in [10, 55]
 #   6. confidence composite >= LATE_DOMINANT_MIN_CONF
-LATE_DOMINANT_ENABLED            = True   # 2026-04-28 11:15 PT: re-enabled
+LATE_DOMINANT_ENABLED            = False  # 2026-05-01 09:20 PT: DISABLED. Legacy momentum-scalp path. Same chaos pattern as TA_FORCED. BB_PURE-only mode.
                                             # alongside TA_FORCED after forensic
                                             # confirmed the 1164ct event was user
                                             # manual trading. Safety reconciler
@@ -198,7 +198,20 @@ TA_FORCED_ENABLED = True
 # now has manual-detection gates (size > 150ct OR untouched ticker OR
 # kalshi_count > 1.5x engine's known fill → leave alone). 13/13 manual-TP
 # tests pass; 11/11 reconciler tests pass. Re-enabling TA_FORCED entries.
-TA_FORCED_ENTRY_ENABLED = True
+TA_FORCED_ENTRY_ENABLED = False  # 2026-05-01 09:20 PT — DISABLED.
+                                  # TA_FORCED was the source of today's
+                                  # major losses: morning -$249 oversell
+                                  # (446ct @ 62c re-peg overrun) and
+                                  # afternoon -$83 (415ct @ 49c stopped
+                                  # via manual sell). The legacy 5-tier
+                                  # staircase TPs and unguarded SCALP DCA
+                                  # paths produced multi-path chaos.
+                                  # Engine is now BB_PURE-only: single
+                                  # signal path, FVG-close TPs, conviction
+                                  # tier sizing, 2-fire-per-window cap.
+                                  # Stop-loss for any in-flight TA_FORCED
+                                  # positions remains live (TA_FORCED_STOP
+                                  # _ENABLED unchanged).
 
 # ── DOMINANT-DIRECTION gate tuning (Claude 2026-04-28) ──────────────────────
 # Gate 1 of 4 in the DOMINANT filter (polymarket_copy_engine.py:~7421).
