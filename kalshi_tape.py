@@ -38,6 +38,11 @@ class KalshiTape:
         # Each entry: (ts_ms: int, mid_cents: int)
         self._retention_s = retention_s
         self._max_per_ticker = max_per_ticker
+        # Backwards-compat: engine code reads AND writes these directly.
+        # Kept as plain attributes (settable) so legacy assignments work.
+        # (2026-05-01)
+        self.mid_price_cents: int = 0
+        self.updated_at: float = 0.0
 
     # ── Ingest ──────────────────────────────────────────────────────────
 
@@ -76,44 +81,15 @@ class KalshiTape:
         cutoff = now_ms - int(self._retention_s * 1000)
         while dq and dq[0][0] < cutoff:
             dq.popleft()
+        # Keep global backcompat attrs fresh (engine code reads these
+        # directly to gate on tape-staleness).
+        self.mid_price_cents = int(mid_cents)
+        self.updated_at = now_ms / 1000.0
 
     def reset_ticker(self, ticker: str) -> None:
         """Drop tape for a single ticker. Called on window rotation."""
         self._trades.pop(ticker, None)
         self._mids.pop(ticker, None)
-
-    # ── Backwards-compat properties ────────────────────────────────────
-    # Engine code from before the per-ticker refactor expects global
-    # `mid_price_cents` and `updated_at` attributes. These return the
-    # most-recently-updated mid across all tickers, which approximates
-    # the old "global tape" semantics for callers that only care whether
-    # there's been recent activity. (2026-05-01)
-
-    @property
-    def mid_price_cents(self) -> int:
-        """Latest mid in cents across any tracked ticker. 0 if no data."""
-        latest_ts = -1
-        latest_mid = 0
-        for dq in self._mids.values():
-            if not dq:
-                continue
-            ts, mid = dq[-1]
-            if ts > latest_ts:
-                latest_ts = ts
-                latest_mid = int(mid)
-        return latest_mid
-
-    @property
-    def updated_at(self) -> float:
-        """Unix timestamp (seconds) of the latest mid sample, 0 if none."""
-        latest_ts_ms = 0
-        for dq in self._mids.values():
-            if not dq:
-                continue
-            ts = dq[-1][0]
-            if ts > latest_ts_ms:
-                latest_ts_ms = ts
-        return latest_ts_ms / 1000.0 if latest_ts_ms > 0 else 0.0
 
     # ── Queries ─────────────────────────────────────────────────────────
 
