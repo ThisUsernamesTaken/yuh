@@ -9085,6 +9085,13 @@ class PolymarketCopyEngine:
             self._open_position["tp_order_id"] = pre_oid
             self._open_position["tp_order_ids"] = [pre_oid] if pre_oid else []
             self._open_position["tp_price"] = preflight_px
+            # Stamp so SYNC RECONCILE TP-EXPANSION knows we already have a
+            # TP for `filled` contracts. Without this it reads
+            # _tp_placed_for_count=0, computes count_grew=True at every
+            # subsequent reconcile (even small drift), cancels the preflight,
+            # and replaces it with the legacy TA_FORCED staircase. Lost the
+            # whole FVG-close target advantage observed live 2026-05-01 PT.
+            self._open_position["_tp_placed_for_count"] = filled
             logger.warning(
                 "BB_PURE PREFLIGHT-TP: %s %dct sell @ %dc (entry=%dc, +%dc, "
                 "fair=%dc, edge=%.1fpp) order=%s — FVG-close target",
@@ -17317,20 +17324,71 @@ class PolymarketCopyEngine:
                                     except Exception:
                                         pass
                                 try:
-                                    _tp_ids = await self._place_tiered_tp(
-                                        ticker, kalshi_side, kalshi_count,
-                                        self._open_position.get("entry_cents", entry_est),
-                                    )
-                                    if _tp_ids:
-                                        self._open_position["tp_order_ids"] = _tp_ids
-                                        self._open_position["tp_order_id"] = _tp_ids[0]
-                                        self._open_position["_tp_placed_for_count"] = kalshi_count
-                                        logger.info(
-                                            "CopyEngine SYNC RECONCILE TP: %dx placed%s",
-                                            kalshi_count,
-                                            " (refreshed for grown count)" if _count_grew
-                                            else " after count update",
+                                    # 2026-05-01 BB_PURE-aware refresh:
+                                    # Preserve the FVG-close target on
+                                    # BB_PURE strategies. Falling back to
+                                    # the TA_FORCED staircase here threw
+                                    # away the wider TP advantage
+                                    # (observed live: 56ct@85c preflight
+                                    # was replaced with 107@60c+9@66c
+                                    # staircase after SYNC reconciled the
+                                    # count up to 116).
+                                    _strat = self._open_position.get("strategy_name", "")
+                                    _is_bb_pure = (_strat == "BB_PURE")
+                                    if _is_bb_pure:
+                                        _bb_entry = int(self._open_position.get(
+                                            "entry_cents", entry_est) or entry_est)
+                                        _bb_fair = int(self._open_position.get(
+                                            "_bb_pure_fair_yes_cents_at_entry", 0) or 0)
+                                        if kalshi_side == "yes":
+                                            _bb_fair_side = _bb_fair
+                                        else:
+                                            _bb_fair_side = 100 - _bb_fair
+                                        _bb_inside = int(_uc("BB_PURE_TP_INSIDE_FAIR_C", 1))
+                                        _bb_min = int(_uc("BB_PURE_TP_MIN_CENTS", 4))
+                                        _bb_max = int(_uc("BB_PURE_TP_MAX_CENTS", 30))
+                                        _bb_px = _bb_fair_side - _bb_inside
+                                        _bb_px = max(_bb_entry + _bb_min, _bb_px)
+                                        _bb_px = min(_bb_entry + _bb_max, _bb_px)
+                                        _bb_px = max(1, min(99, _bb_px))
+                                        _bb_order = await self._client.place_order(
+                                            ticker=ticker, side=kalshi_side,
+                                            price=_bb_px, count=kalshi_count,
+                                            action="sell", post_only=True,
                                         )
+                                        _bb_oid = getattr(_bb_order, "order_id", None) or ""
+                                        _tp_ids = [_bb_oid] if _bb_oid else []
+                                        if _tp_ids:
+                                            self._open_position["tp_order_ids"] = _tp_ids
+                                            self._open_position["tp_order_id"] = _tp_ids[0]
+                                            self._open_position["tp_price"] = _bb_px
+                                            self._open_position["_tp_placed_for_count"] = kalshi_count
+                                            self._open_position["_protective_order_id"] = _bb_oid
+                                            self._open_position["_protective_order_px"] = _bb_px
+                                            self._open_position["_protective_order_count"] = kalshi_count
+                                            self._open_position["_protective_order_state"] = "tp"
+                                            self._open_position["_protective_last_replan_ts"] = time.time()
+                                            logger.info(
+                                                "CopyEngine SYNC RECONCILE BB_PURE-TP: %dx sell @ %dc "
+                                                "(entry=%dc, +%dc, fair=%dc) refreshed for grown count",
+                                                kalshi_count, _bb_px, _bb_entry,
+                                                _bb_px - _bb_entry, _bb_fair_side,
+                                            )
+                                    else:
+                                        _tp_ids = await self._place_tiered_tp(
+                                            ticker, kalshi_side, kalshi_count,
+                                            self._open_position.get("entry_cents", entry_est),
+                                        )
+                                        if _tp_ids:
+                                            self._open_position["tp_order_ids"] = _tp_ids
+                                            self._open_position["tp_order_id"] = _tp_ids[0]
+                                            self._open_position["_tp_placed_for_count"] = kalshi_count
+                                            logger.info(
+                                                "CopyEngine SYNC RECONCILE TP: %dx placed%s",
+                                                kalshi_count,
+                                                " (refreshed for grown count)" if _count_grew
+                                                else " after count update",
+                                            )
                                 except Exception as _tp_err:
                                     logger.warning(
                                         "CopyEngine SYNC RECONCILE TP failed: %s", _tp_err,
