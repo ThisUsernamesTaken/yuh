@@ -655,6 +655,21 @@ class PolymarketCopyEngine:
         # on new window. Capped by BB_PURE_MAX_FIRES_PER_WINDOW so the
         # engine can't third-trade itself into gambling territory.
         self._bb_pure_fires_this_window: int = 0
+        # 2026-05-01: shutdown flag. When True, paths that cancel resting
+        # protective orders must NOT run. Live observed today on the 1200
+        # ticker — after nssm stop, the engine kept running for ~3min and
+        # cancelled the preflight TP, leaving the position naked. Position
+        # settled to zero (-$211 loss). Setting this flag in a signal
+        # handler at the top of run() and gating cancel paths on it.
+        self._shutting_down: bool = False
+        # 2026-05-01: every order_id the engine ever places. Used so fill
+        # events from these orders are NEVER misattributed to "MANUAL
+        # FILL RECORDED". Bounded growth: clean entries older than 24h.
+        self._engine_placed_order_ids: dict = {}  # {order_id: placement_ts}
+        # 2026-05-01: when True, _pre_expiry_consolidate has taken
+        # exclusive ownership of the close. Other paths (protective
+        # maintain, residual reconciler, post-close sweep) stand down.
+        self._pre_expiry_consolidating: bool = False
 
         # Daily loss tracking (circuit breaker)
         self._daily_pnl: float = 0.0           # Running P&L for current UTC day
@@ -8911,6 +8926,27 @@ class PolymarketCopyEngine:
                 cur_fires, max_fires, ticker[-15:],
             )
             return
+
+        # 2026-05-01 hard final-minute lockout (defense in depth).
+        # The bb_pure.evaluate() module already has min_time_remaining_s
+        # but other paths can synthesize signals that bypass it. This
+        # is a final guard at the FIRE site itself: NEVER place an
+        # order if the active window has < N seconds remaining. The
+        # minimum is bounded by Kalshi's settle window — once a contract
+        # is in its final 60s the book becomes unpredictable.
+        try:
+            _ws_start = float(getattr(self, "_window_start_time", 0) or 0)
+            if _ws_start > 0:
+                _secs_left = max(0.0, 900.0 - (time.time() - _ws_start))
+                _min_left = float(_uc("BB_PURE_HARD_MIN_TIME_S", 60.0))
+                if _secs_left < _min_left:
+                    logger.warning(
+                        "BB_PURE SKIP: only %.0fs left (< %.0fs hard min) — %s",
+                        _secs_left, _min_left, ticker[-15:],
+                    )
+                    return
+        except Exception:
+            pass
         # NB: The lock is acquired AFTER all gates pass but BEFORE
         # `await self._client.place_order()` below. Setting it earlier
         # caused gate-blocked attempts to permanently lock the window
@@ -9091,6 +9127,56 @@ class PolymarketCopyEngine:
             self._entered_tickers_this_window.add(ticker)
         except Exception:
             pass
+
+        # ── COUNT-POLL FOR TRUTH (2026-05-01) ──────────────────────────────
+        # `order.filled_count` returns the partial-fill snapshot at the
+        # moment place_order's API call returned. Live observed 2026-05-01
+        # 06:30 PT: order returned filled_count=47 but Kalshi continued
+        # filling the same order async — actual count was 446 by 35s
+        # later. Sizing the preflight TP to 47 left 399 contracts naked.
+        #
+        # Poll Kalshi up to 6× over 3s for a stable count. If Kalshi
+        # returns a non-zero count that's stable for 2 reads, use it.
+        # If Kalshi returns 0, trust order.filled_count (cache lag).
+        try:
+            _stable_truth = -1
+            _last_truth = -1
+            for _i in range(6):
+                await asyncio.sleep(0.5)
+                _pos_api = await self._client.get_positions()
+                _kc = 0
+                for _p in _pos_api or []:
+                    if _p.get("ticker") == ticker:
+                        _kc = abs(int(float(_p.get("position_fp", "0") or 0)))
+                        break
+                if _kc > 0 and _kc == _last_truth:
+                    _stable_truth = _kc
+                    break
+                _last_truth = _kc
+            _truth_ct = _stable_truth if _stable_truth > 0 else _last_truth
+            if _truth_ct > 0 and _truth_ct != filled:
+                _ratio = _truth_ct / max(1, filled)
+                if _ratio >= 1.5:
+                    logger.error(
+                        "BB_PURE FILL OVERRUN: order.filled_count=%d but "
+                        "Kalshi truth=%d (%.1fx) — sizing TPs to truth",
+                        filled, _truth_ct, _ratio,
+                    )
+                else:
+                    logger.warning(
+                        "BB_PURE FILL count adjust: %d → %d (Kalshi truth)",
+                        filled, _truth_ct,
+                    )
+                # Update position dict to truth before TP placement
+                self._open_position["count"] = _truth_ct
+                self._open_position["original_count"] = _truth_ct
+                self._open_position["shallow_filled"] = _truth_ct
+                filled = _truth_ct
+        except Exception as _poll_err:
+            logger.warning(
+                "BB_PURE FILL count-poll failed (using order.filled_count=%d): %s",
+                filled, _poll_err,
+            )
 
         # ── PREFLIGHT TP (2026-05-01) ──────────────────────────────────────
         # Place a resting limit-sell IMMEDIATELY after fill so the position
@@ -13401,8 +13487,114 @@ class PolymarketCopyEngine:
                 ticker, reason,
             )
 
+    async def _pre_expiry_consolidate(self) -> bool:
+        """Single owner of the close in the final pre-expiry window.
+
+        2026-05-01: Below `PRE_EXPIRY_CONSOLIDATE_S` (default 90s) we
+        take exclusive ownership of the position. All other paths must
+        stand down (gated on `_pre_expiry_consolidating` flag set here).
+
+        Behavior:
+          1. If position is open: cancel ALL resting orders for this
+             ticker (cleanup) then place ONE limit-sell at the bid
+             (or market-sell as fallback).
+          2. If position is flat: clear the flag, do nothing.
+
+        Returns True if we took action this cycle.
+        """
+        if getattr(self, "_shutting_down", False):
+            return False
+        pos = self._open_position
+        if pos is None:
+            self._pre_expiry_consolidating = False
+            return False
+        ws = float(getattr(self, "_window_start_time", 0) or 0)
+        if ws <= 0:
+            return False
+        secs_remaining = max(0.0, 900.0 - (time.time() - ws))
+        threshold = float(_uc("PRE_EXPIRY_CONSOLIDATE_S", 90.0))
+        if secs_remaining > threshold:
+            return False  # not yet
+        # We're in the consolidation window. Idempotent: only act once.
+        if getattr(self, "_pre_expiry_consolidating", False):
+            return False
+        ticker = pos.get("ticker", "")
+        side = (pos.get("side") or "").lower()
+        if not ticker or side not in ("yes", "no"):
+            return False
+        truth_ct = int(pos.get("count", 0) or 0)
+        try:
+            _pos_api = await self._client.get_positions()
+            for _p in _pos_api or []:
+                if _p.get("ticker") == ticker:
+                    truth_ct = abs(int(float(_p.get("position_fp", "0") or 0)))
+                    break
+        except Exception:
+            pass
+        if truth_ct <= 0:
+            self._pre_expiry_consolidating = False
+            return False
+        # Take ownership
+        self._pre_expiry_consolidating = True
+        logger.warning(
+            "PRE-EXPIRY CONSOLIDATE: %s %dct entry=%dc remaining=%.0fs — "
+            "cancelling all resting + placing single market-sell",
+            side.upper(), truth_ct,
+            int(pos.get("entry_cents", 0) or 0), secs_remaining,
+        )
+        # Cancel ALL resting orders on this ticker
+        try:
+            _od = await self._client._request(
+                "GET", "/portfolio/orders",
+                params={"ticker": ticker, "status": "resting", "limit": 50},
+            )
+            for o in _od.get("orders", []):
+                _oid = o.get("order_id", "")
+                if not _oid:
+                    continue
+                try:
+                    await self._client.cancel_order(_oid)
+                except Exception:
+                    pass
+        except Exception:
+            # Fallback: cancel by known protective order_id
+            cur = pos.get("_protective_order_id")
+            if cur:
+                try:
+                    await self._client.cancel_order(cur)
+                except Exception:
+                    pass
+        # Place single market-equivalent sell at the current bid (post_only=False)
+        book = self._kalshi_ws.get_book(ticker) if (
+            self._kalshi_ws and hasattr(self._kalshi_ws, "get_book")) else None
+        if side == "yes":
+            actual_bid = int(getattr(book, "best_yes_bid", 0) or 0) if book else 0
+        else:
+            actual_bid = int(getattr(book, "best_no_bid", 0) or 0) if book else 0
+        sell_px = max(1, actual_bid) if actual_bid > 0 else 1
+        try:
+            await self._client.place_order(
+                ticker=ticker, side=side,
+                price=sell_px, count=truth_ct,
+                action="sell", post_only=False,
+            )
+            logger.warning(
+                "PRE-EXPIRY CONSOLIDATE: placed sell %dct @ %dc",
+                truth_ct, sell_px,
+            )
+        except Exception as e:
+            logger.error("PRE-EXPIRY CONSOLIDATE place_order failed: %s", e)
+            self._pre_expiry_consolidating = False
+            return False
+        return True
+
     async def _maintain_protective_order(self) -> bool:
         """Always-resting protective sell order (Phase 4, 2026-04-30).
+
+        2026-05-01: SHUTDOWN GATE. If self._shutting_down is True, return
+        immediately and DO NOT touch any resting orders. The engine
+        cancelling its own protective TP during shutdown caused the
+        $211 loss on the 1200 ticker today.
 
         Replaces the bid-check stop with a Kalshi-side resting limit sell:
             - When current bid > entry (profitable): rest at TP price
@@ -13425,6 +13617,15 @@ class PolymarketCopyEngine:
             return False
         if not bool(_uc("KALSHI_TAPE_ENABLED", False)):
             return False
+        # 2026-05-01: hard gate on shutdown. Never cancel resting orders
+        # during shutdown — let them sit on Kalshi to manage the position
+        # for the full window.
+        if getattr(self, "_shutting_down", False):
+            return True  # tell caller protective is "owned" — stay out
+        # 2026-05-01: pre-expiry consolidation owns the position in the
+        # final 90s. Stand down if it's active.
+        if getattr(self, "_pre_expiry_consolidating", False):
+            return True
         pos = self._open_position
         if pos is None:
             return False
@@ -13627,7 +13828,16 @@ class PolymarketCopyEngine:
         masked the oversell bug on 2026-04-22 where a race between cancel
         and DCA rebuild left stretch legs resting while new legs were added
         on top.
+
+        2026-05-01: SHUTDOWN GATE. Never cancel TPs during shutdown. The
+        resting orders will manage the position through window settlement.
         """
+        if getattr(self, "_shutting_down", False):
+            logger.info(
+                "_cancel_tp_order: shutdown in progress — leaving "
+                "resting orders alive on Kalshi to manage position"
+            )
+            return False  # don't lie about success
         if self._open_position is None:
             return True
         # Cancel sell orders (TPs)
@@ -16180,6 +16390,13 @@ class PolymarketCopyEngine:
         # When mode is off, returns False and behavior is unchanged.
         if pos is not None:
             try:
+                # 2026-05-01: pre-expiry consolidation runs FIRST. If it
+                # takes ownership, protective_maintain stands down for
+                # the rest of the window (gated inside the function).
+                try:
+                    await self._pre_expiry_consolidate()
+                except Exception as _ce:
+                    logger.warning("pre_expiry_consolidate error: %s", _ce)
                 _protective_owned = await self._maintain_protective_order()
                 if _protective_owned:
                     # Mark position so legacy bid-check stops + TP ladders

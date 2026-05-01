@@ -506,6 +506,17 @@ BB_PURE_TP_MAX_CENTS_TIER3           = 12    # Tier 3 TP cap (tightest)
 # per window has been profitable; the third fire crosses into gamble
 # territory because of cumulative edge decay and accumulating risk.
 BB_PURE_MAX_FIRES_PER_WINDOW         = 2
+BB_PURE_HARD_MIN_TIME_S              = 60.0  # Hard final-minute lockout
+                                              # at FIRE site (defense in
+                                              # depth on top of bb_pure
+                                              # evaluator's min_time gate)
+
+# Pre-expiry consolidation (2026-05-01): single owner of the close in
+# the final N seconds. Cancels all resting orders for the open ticker,
+# places ONE limit-sell at the bid, locks out other paths until window
+# rotates. Targets the "last 5 minutes chaos" pattern.
+PRE_EXPIRY_CONSOLIDATE_S             = 90.0  # Take ownership at this
+                                              # remaining-seconds threshold
 
 # ── Post-close residual sweep (Claude 2026-04-29 per user) ────────────────
 # After every TA_FORCED / LATE_DOMINANT / SR_FADE close, poll Kalshi

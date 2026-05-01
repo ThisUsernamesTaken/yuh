@@ -129,6 +129,36 @@ async def main():
             signal_logger=signal_logger,
             whale_ref=whale_ref,
         )
+        # 2026-05-01: signal handler that flags shutdown WITHOUT
+        # cancelling resting protective orders. Live observed bug today:
+        # nssm stop → engine kept running ~3min → some path cancelled the
+        # preflight TP on the 1200 ticker → naked → settled to zero
+        # for $211 loss. Setting `_shutting_down = True` causes
+        # _maintain_protective_order and _cancel_tp_order to return
+        # immediately and leave Kalshi-side resting orders alone.
+        import signal
+        def _handle_signal(signum, frame):
+            try:
+                logger.warning(
+                    "SHUTDOWN SIGNAL %s received — setting _shutting_down=True; "
+                    "resting protective orders on Kalshi will be PRESERVED",
+                    signum,
+                )
+                engine._shutting_down = True
+            except Exception:
+                pass
+        try:
+            signal.signal(signal.SIGINT, _handle_signal)
+            try:
+                signal.signal(signal.SIGTERM, _handle_signal)
+            except (AttributeError, ValueError):
+                pass  # Windows: SIGTERM may not be available
+            try:
+                signal.signal(signal.SIGBREAK, _handle_signal)  # Windows
+            except (AttributeError, ValueError):
+                pass
+        except Exception as _e:
+            logger.warning("Signal handler install failed (non-fatal): %s", _e)
         await engine.run()
 
 if __name__ == "__main__":
