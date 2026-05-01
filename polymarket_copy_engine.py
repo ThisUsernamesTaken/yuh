@@ -11925,20 +11925,66 @@ class PolymarketCopyEngine:
                 # and use it as truth. Prevents drift that causes DCA errors,
                 # wrong TP count, and phantom stops.
                 # ═══════════════════════════════════════════════════════════
+                # 2026-05-01 BUG-FIX: poll Kalshi truth for up to 3s to
+                # capture the full fill before sizing TPs. Previous behavior
+                # (single 0.3s query) caught only the first partial-fill
+                # batch, then SYNC RECONCILE BACKFILL fixed it 30s later
+                # (during which the un-counted contracts had no TP).
+                # Today 06:30: order.filled_count=47 but actual=446. Poll
+                # until count stabilizes for 2 consecutive reads OR 3s.
+                # Also: Kalshi cache=0 means stale, NOT an actual zero —
+                # don't downgrade the engine's fill count when this happens.
                 try:
-                    await asyncio.sleep(0.3)
-                    _pos_api = await self._client.get_positions()
-                    for _p in _pos_api:
-                        if _p.get("ticker") == contract.ticker:
-                            _actual = abs(int(_p.get("position", 0)))
-                            if _actual != self._open_position["count"]:
-                                logger.warning(
-                                    "CopyEngine POS RECONCILE: engine=%dct Kalshi=%dct — using Kalshi truth",
-                                    self._open_position["count"], _actual,
-                                )
-                                self._open_position["count"] = _actual
-                                self._open_position["original_count"] = _actual
+                    _stable_count = -1
+                    _last_actual = -1
+                    _engine_ct = int(self._open_position["count"])
+                    _max_polls = 6
+                    _poll_interval = 0.5
+                    for _i in range(_max_polls):
+                        await asyncio.sleep(_poll_interval)
+                        _pos_api = await self._client.get_positions()
+                        _actual_now = 0
+                        for _p in _pos_api:
+                            if _p.get("ticker") == contract.ticker:
+                                _actual_now = abs(int(_p.get("position", 0)))
+                                break
+                        # Stable when same non-zero reading twice in a row
+                        if _actual_now > 0 and _actual_now == _last_actual:
+                            _stable_count = _actual_now
                             break
+                        _last_actual = _actual_now
+                    # Resolve final truth count
+                    _truth_ct = _stable_count if _stable_count > 0 else _last_actual
+                    if _truth_ct == 0 and _engine_ct > 0:
+                        logger.warning(
+                            "CopyEngine POS RECONCILE: Kalshi=0ct after "
+                            "%.1fs poll (cache lag) but engine=%dct from "
+                            "order fill — trusting fill record",
+                            _max_polls * _poll_interval, _engine_ct,
+                        )
+                        # Keep engine count; SYNC RECONCILE BACKFILL later
+                        # will adjust if real count differs.
+                    elif _truth_ct > 0 and _truth_ct != _engine_ct:
+                        # Detect re-peg / partial-fill overrun: if Kalshi
+                        # shows materially more than the order reported,
+                        # the order kept filling after the API responded.
+                        _overrun_ratio = _truth_ct / max(1, _engine_ct)
+                        if _overrun_ratio >= 1.5:
+                            logger.error(
+                                "CopyEngine POS RECONCILE OVERRUN: "
+                                "engine=%dct (from order.filled_count) "
+                                "Kalshi=%dct (truth) — %.1fx overrun. "
+                                "Sizing TPs to truth %dct.",
+                                _engine_ct, _truth_ct, _overrun_ratio,
+                                _truth_ct,
+                            )
+                        else:
+                            logger.warning(
+                                "CopyEngine POS RECONCILE: engine=%dct Kalshi=%dct — using Kalshi truth",
+                                _engine_ct, _truth_ct,
+                            )
+                        self._open_position["count"] = _truth_ct
+                        self._open_position["original_count"] = _truth_ct
                 except Exception as e:
                     logger.debug("CopyEngine POS RECONCILE skipped: %s", e)
 

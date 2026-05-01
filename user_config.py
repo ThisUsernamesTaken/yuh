@@ -821,7 +821,10 @@ PRICE_FEED_WS_TIMEOUT_S = 30.0
 # Guardrails in place: DAILY_LOSS_LIMIT=$25, SIZING_HARD_CAP=80ct,
 # SR_FADE_MIN_EDGE_PP=5.0, L1 stability gate, residual reconciler,
 # one-open-position mutex. Flip back to True if anything unexpected.
-PAPER_TRADING = False
+PAPER_TRADING = True   # 2026-05-01: flipped to paper after live -$249 in one window
+                       # (TA_FORCED 446ct @ 62c → TPs filled but net negative).
+                       # Stay in paper until BB_PURE preflight-TP + TA_FORCED
+                       # cache-lag count erasure are both proven in paper.
 PAPER_STARTING_BALANCE = 100.0
 PAPER_SLIPPAGE_CENTS = 1
 

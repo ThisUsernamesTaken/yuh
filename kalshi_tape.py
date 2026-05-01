@@ -82,6 +82,39 @@ class KalshiTape:
         self._trades.pop(ticker, None)
         self._mids.pop(ticker, None)
 
+    # ── Backwards-compat properties ────────────────────────────────────
+    # Engine code from before the per-ticker refactor expects global
+    # `mid_price_cents` and `updated_at` attributes. These return the
+    # most-recently-updated mid across all tickers, which approximates
+    # the old "global tape" semantics for callers that only care whether
+    # there's been recent activity. (2026-05-01)
+
+    @property
+    def mid_price_cents(self) -> int:
+        """Latest mid in cents across any tracked ticker. 0 if no data."""
+        latest_ts = -1
+        latest_mid = 0
+        for dq in self._mids.values():
+            if not dq:
+                continue
+            ts, mid = dq[-1]
+            if ts > latest_ts:
+                latest_ts = ts
+                latest_mid = int(mid)
+        return latest_mid
+
+    @property
+    def updated_at(self) -> float:
+        """Unix timestamp (seconds) of the latest mid sample, 0 if none."""
+        latest_ts_ms = 0
+        for dq in self._mids.values():
+            if not dq:
+                continue
+            ts = dq[-1][0]
+            if ts > latest_ts_ms:
+                latest_ts_ms = ts
+        return latest_ts_ms / 1000.0 if latest_ts_ms > 0 else 0.0
+
     # ── Queries ─────────────────────────────────────────────────────────
 
     def flow(self, ticker: str, window_s: float) -> dict:
