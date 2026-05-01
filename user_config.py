@@ -541,6 +541,20 @@ BB_PURE_RANGE_BLOCK_PCT              = 0.80   # Block buys above this
 BB_PURE_RANGE_MIN_SAMPLES            = 10     # Need at least N mids in
                                               # the lookback to gate
 
+# BTC velocity gate (2026-05-01): block BB_PURE entries when BTC spot
+# is actively moving against the FVG position. Per user diagnosis after
+# watching trades all day: contract price is pegged to BTC, so when BTC
+# moves down, YES drops; entering YES (bullish bet) while BTC is
+# dropping means we're chasing a moving market. The model's fair value
+# lags BTC by seconds. Wait for BTC to stabilize before entering.
+BB_PURE_BTC_ADVERSE_VEL              = 5.0    # $/s threshold. If BTC
+                                              # vel ≤ -5 $/s and we want
+                                              # YES, skip. If vel ≥ +5
+                                              # and we want NO, skip.
+                                              # tick_velocity window is
+                                              # the price_feed default
+                                              # (~30s typically).
+
 # ── Post-close residual sweep (Claude 2026-04-29 per user) ────────────────
 # After every TA_FORCED / LATE_DOMINANT / SR_FADE close, poll Kalshi
 # positions every POST_CLOSE_RESIDUAL_POLL_S seconds for

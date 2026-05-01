@@ -8866,13 +8866,41 @@ class PolymarketCopyEngine:
         if sig is None:
             return None
 
+        # 2026-05-01 BTC VELOCITY GATE:
+        # Contract price on Kalshi BTC binaries is pegged to BTC spot.
+        # When BTC is moving AGAINST our FVG position (e.g. BTC dropping
+        # while we want to buy YES = bullish bet), we're entering into
+        # an active adverse move. The model's fair value lags BTC by
+        # seconds; entering during the move means buying just before
+        # the bid drops further. User's diagnosis after watching trades
+        # all day: every entry goes negative first because we're
+        # entering into the BTC move, not after it stabilizes.
+        try:
+            pf_btc = getattr(self, "_price_feed", None)
+            tt_btc = getattr(pf_btc, "tick_tracker", None) if pf_btc else None
+            adverse_thresh = float(_uc("BB_PURE_BTC_ADVERSE_VEL", 5.0))
+            if tt_btc is not None and not getattr(tt_btc, "is_stale", True):
+                _btc_vel = float(getattr(tt_btc, "tick_velocity", 0.0) or 0.0)
+                # YES buy: adverse if BTC dropping (vel < 0)
+                # NO  buy: adverse if BTC rising  (vel > 0)
+                _adverse = (
+                    (sig.side == "yes" and _btc_vel <= -adverse_thresh)
+                    or (sig.side == "no" and _btc_vel >= adverse_thresh)
+                )
+                if _adverse:
+                    logger.warning(
+                        "BB_PURE BTC-ADVERSE-BLOCK: %s buy with BTC vel=%+.1f "
+                        "(threshold=±%.1f $/s) — skipping (BTC moving "
+                        "against FVG position)",
+                        sig.side.upper(), _btc_vel, adverse_thresh,
+                    )
+                    return None
+        except Exception as _bve:
+            logger.debug("BB_PURE BTC velocity check failed: %s", _bve)
+
         # 2026-05-01 ENTRY-TIMING FILTER (range position):
-        # Live observed -1330-30 trade today: BB_PURE bought YES @ 66c
-        # at the LOCAL HIGH of the recent range. BTC immediately moved
-        # against us; YES collapsed to 8c in 10 min for a -$252 loss.
-        # The model's "fair=94c" lagged behind the move that had just
-        # happened. Reject entries when our buy side is in the top X%
-        # of the last N seconds of mids — the model is chasing.
+        # Secondary check on contract-side range (in case BTC velocity
+        # check passes but contract is at extreme of recent range).
         try:
             tape = getattr(self, "_kalshi_tape", None)
             range_lookback = float(_uc("BB_PURE_RANGE_LOOKBACK_S", 180.0))
