@@ -747,9 +747,16 @@ MANUAL_TP_ENABLED             = True   # 2026-04-28: flipped ON per user
 #   50c @ 100ct entry ($50)   → +5c @ 55c TP → +$5.00 (10%)
 #   65c @ 30ct entry ($19.50) → +6.5c → +6c → 71c TP → +$1.80 (~9%)
 # For early-session inversion scalps where 3-5c bounces are common.
-MANUAL_TP_PCT_OF_ENTRY        = 0.10    # 10% of entry price = 10% of capital
+MANUAL_TP_PCT_OF_ENTRY        = 0.15    # 15% of entry price (was 0.10 —
+                                        # bumped 2026-05-01 PT per user:
+                                        # +5c TPs were closing winners
+                                        # too early; manual scalps had
+                                        # more room to run)
 MANUAL_TP_MIN_OFFSET_CENTS    = 2       # at least 2c above entry (covers fees)
-MANUAL_TP_MAX_OFFSET_CENTS    = 15      # cap absolute offset (deep entries)
+MANUAL_TP_MAX_OFFSET_CENTS    = 20      # cap absolute offset (was 15 —
+                                        # bumped 2026-05-01 PT to allow
+                                        # higher-conviction TPs on deep
+                                        # mid entries like 50-65c)
 MANUAL_TP_MAX_PRICE_CENTS     = 95      # never sell above 95c (Kalshi cap)
 MANUAL_TP_MIN_ENTRY_CENTS     = 5       # don't TP fills below this — too cheap, may be a probe
 MANUAL_TP_MAX_ENTRY_CENTS     = 92      # above this, no room for profit after fees
