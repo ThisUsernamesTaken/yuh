@@ -13853,11 +13853,31 @@ class PolymarketCopyEngine:
         # if place succeeds, cancel the old. If place fails, old continues
         # protecting. Brief window of two orders coexisting is acceptable —
         # the count-poll OVERRUN check in the SYNC path catches doubles.
+        #
+        # 2026-05-01 SL EXECUTION FIX: when target_state is "sl" (bid has
+        # already broken below entry), use post_only=False AND price at
+        # the current bid (or bid-1) so the order CROSSES THE SPREAD and
+        # actually fills. Today's losses (-$211, -$252) all rode through
+        # the protective SL because post_only=True at entry-8c rested as
+        # maker; bid kept dropping past 8c without trading exactly there,
+        # so order never matched. Real SL must take liquidity, not provide
+        # it.
+        if target_state == "sl":
+            # Cross the spread at the current bid - 1c slippage allowance.
+            # bid is guaranteed > 0 (checked above). Sell at bid hits the
+            # buyer immediately.
+            sl_exec_px = max(1, int(bid) - 1)
+            sl_post_only = False
+            place_px = sl_exec_px
+            place_post_only = sl_post_only
+        else:
+            place_px = target_px
+            place_post_only = True
         try:
             new_order = await self._client.place_order(
                 ticker=ticker, side=side,
-                price=target_px, count=truth_ct,
-                action="sell", post_only=True,
+                price=place_px, count=truth_ct,
+                action="sell", post_only=place_post_only,
             )
             new_oid = getattr(new_order, "order_id", None)
             if not new_oid:
@@ -13886,15 +13906,15 @@ class PolymarketCopyEngine:
                 pass
 
         pos["_protective_order_id"] = new_oid
-        pos["_protective_order_px"] = target_px
+        pos["_protective_order_px"] = place_px
         pos["_protective_order_count"] = truth_ct
         pos["_protective_order_state"] = target_state
         pos["_protective_last_replan_ts"] = now
-        logger.info(
+        logger.warning(
             "CopyEngine PROTECTIVE [%s]: %s %dct @ %dc entry=%dc bid=%dc "
-            "strat=%s (prev=%dc count=%d)",
-            target_state.upper(), side.upper(), truth_ct, target_px,
-            entry, bid, strat or "?", cur_px, cur_count,
+            "strat=%s post_only=%s (prev=%dc count=%d)",
+            target_state.upper(), side.upper(), truth_ct, place_px,
+            entry, bid, strat or "?", place_post_only, cur_px, cur_count,
         )
         return True
 

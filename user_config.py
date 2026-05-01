@@ -526,11 +526,17 @@ BB_PURE_TP_MAX_CENTS_TIER3           = 12    # Tier 3 TP cap (tightest)
 # Per-window fire cap (2026-05-01). Live observation: 1-2 BB_PURE fires
 # per window has been profitable; the third fire crosses into gamble
 # territory because of cumulative edge decay and accumulating risk.
-BB_PURE_MAX_FIRES_PER_WINDOW         = 2
-BB_PURE_HARD_MIN_TIME_S              = 60.0  # Hard final-minute lockout
-                                              # at FIRE site (defense in
-                                              # depth on top of bb_pure
-                                              # evaluator's min_time gate)
+BB_PURE_MAX_FIRES_PER_WINDOW         = 99    # 2026-05-01 PT: lifted from 2.
+                                              # User directive: any number of
+                                              # entries OK as long as we have
+                                              # 7+ min runway and the new SL
+                                              # path actually executes losers.
+BB_PURE_HARD_MIN_TIME_S              = 420.0 # 7 minutes (was 60s). After
+                                              # this point in the window
+                                              # there isn't enough runway
+                                              # for FVG-close TPs to fill;
+                                              # late-session entries are
+                                              # exposure to pin risk.
 
 # Pre-expiry consolidation (2026-05-01): single owner of the close in
 # the final N seconds. Cancels all resting orders for the open ticker,
