@@ -499,16 +499,27 @@ BB_PURE_TP_MAX_CENTS             = 30     # Cap — never TP wider than this
 # fill probability so trades close in-window instead of riding to expiry.
 BB_PURE_KELLY_TIER2_MIN_EDGE_PP      = 25.0  # Tier 2 edge floor
 BB_PURE_KELLY_TIER2_MIN_FAIR_EXTREME = 85.0  # Tier 2 fair-extremity floor
-BB_PURE_KELLY_TIER2_MAX_FRAC         = 0.50  # Tier 2 Kelly cap (was 0.30 —
-                                              # bumped 2026-05-01 PT after $1k
-                                              # withdrawal: smaller bankroll
-                                              # needs higher fraction to
-                                              # make meaningful gains)
+BB_PURE_KELLY_TIER2_MAX_FRAC         = 0.10  # Tier 2 Kelly cap INVERTED
+                                              # 2026-05-01 late PT. Was 0.50;
+                                              # data showed 5 Tier-2 trades
+                                              # today netted -\$522 with 0%
+                                              # hit rate. Model overshoots
+                                              # fair after fast BTC moves;
+                                              # 'high confidence' actually
+                                              # means 'just chased a move'.
+                                              # Shrinking the cap reduces
+                                              # exposure when model is least
+                                              # reliable.
 BB_PURE_KELLY_TIER3_MIN_EDGE_PP      = 40.0  # Tier 3 edge floor
 BB_PURE_KELLY_TIER3_MIN_FAIR_EXTREME = 95.0  # Tier 3 fair-extremity floor
-BB_PURE_KELLY_TIER3_MAX_FRAC         = 0.75  # Tier 3 Kelly cap (was 0.50 —
-                                              # bumped per scale-harder
-                                              # directive after withdrawal)
+BB_PURE_KELLY_TIER3_MAX_FRAC         = 0.05  # Tier 3 Kelly cap INVERTED.
+                                              # Was 0.75; data showed 4
+                                              # Tier-3 trades today netted
+                                              # -\$275 (with -\$252 single
+                                              # catastrophe). Model is
+                                              # WORST at extremes (fair
+                                              # >= 95c or <= 5c). Cap is
+                                              # now smaller than Tier 1.
 BB_PURE_TP_MAX_CENTS_TIER2           = 20    # Tier 2 TP cap (tighter)
 BB_PURE_TP_MAX_CENTS_TIER3           = 12    # Tier 3 TP cap (tightest)
 

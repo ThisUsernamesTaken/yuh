@@ -75,18 +75,26 @@ def evaluate(
     kelly_max = float(config.get("kelly_max_frac", 0.15))
     max_contracts = int(config.get("max_contracts", 200))
 
-    # Conviction-tier sizing thresholds (2026-05-01 per user)
-    # Tier 2 / 3 raise the kelly_max ceiling when both edge AND fair-side
-    # extremity exceed thresholds. Rationale: when the model says
-    # YES is 95% likely (fair=95c) AND market is mispricing by 30pp+,
-    # the standard Kelly cap is leaving size on the table. Liquidity is
-    # the real ceiling, not Kelly fraction.
+    # Conviction-tier sizing thresholds (2026-05-01 INVERTED late PM)
+    # Original framing: extreme-confidence trades (fair >= 95c) are the
+    # most reliable, so size up. Reality from 2026-05-01 trading data:
+    # extreme-fair trades are the engine's WORST performers.
+    #   Fair >= 95c or <= 5c: 4 trades → -$275 net (1 win, 3 losses,
+    #     with -$252, -$83 catastrophes)
+    #   Fair 85-94c or 6-15c: 5 trades → -$522 net, 0% hit rate
+    #   Fair 50-84c moderate: 75% hit rate, small consistent wins
+    # The Brownian-Bridge model overshoots after fast BTC moves; its
+    # "fair=95c" is actually "BTC just rallied hard, model expects
+    # continuation". But fast moves are exactly when reversals happen.
+    # NEW: at extreme fair, SHRINK the Kelly cap rather than expand.
+    # Mild fair (model uncertain) gets the largest size because that's
+    # where the model is most calibrated.
     t2_min_edge = float(config.get("kelly_tier2_min_edge_pp", 25.0))
     t2_min_extreme = float(config.get("kelly_tier2_min_fair_extreme", 85.0))
-    t2_kelly_max = float(config.get("kelly_tier2_max_frac", 0.30))
+    t2_kelly_max = float(config.get("kelly_tier2_max_frac", 0.10))
     t3_min_edge = float(config.get("kelly_tier3_min_edge_pp", 40.0))
     t3_min_extreme = float(config.get("kelly_tier3_min_fair_extreme", 95.0))
-    t3_kelly_max = float(config.get("kelly_tier3_max_frac", 0.50))
+    t3_kelly_max = float(config.get("kelly_tier3_max_frac", 0.05))
 
     # ── Time gate ─────────────────────────────────────────────────────
     if seconds_to_expiry < min_time:
