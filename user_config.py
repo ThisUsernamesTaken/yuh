@@ -464,7 +464,11 @@ BB_PURE_MIN_ENTRY_CENTS          = 5      # Don't fire on dust prices
 BB_PURE_MIN_TIME_REMAINING_S     = 60.0   # No new entries within last minute
 BB_PURE_KELLY_FRACTION           = 0.25   # Quarter-Kelly base (matches existing
                                           # KELLY_FRACTION default)
-BB_PURE_KELLY_MAX_FRAC           = 0.15   # Hard cap on bankroll % per position
+BB_PURE_KELLY_MAX_FRAC           = 0.30   # Hard cap on bankroll % per position
+                                          # (was 0.15 — bumped 2026-05-01 PT
+                                          # after $1k withdrawal: small
+                                          # bankroll needs bigger fraction
+                                          # for meaningful gains)
 BB_PURE_VOLATILITY_LOOKBACK      = 15     # Mirrors founding-doc default
 # Fair-value-anchored protective-order targets (used in Session 2 refactor)
 BB_PURE_TP_EDGE_PP               = 5.0    # TP when fair value crosses
@@ -495,10 +499,16 @@ BB_PURE_TP_MAX_CENTS             = 30     # Cap — never TP wider than this
 # fill probability so trades close in-window instead of riding to expiry.
 BB_PURE_KELLY_TIER2_MIN_EDGE_PP      = 25.0  # Tier 2 edge floor
 BB_PURE_KELLY_TIER2_MIN_FAIR_EXTREME = 85.0  # Tier 2 fair-extremity floor
-BB_PURE_KELLY_TIER2_MAX_FRAC         = 0.30  # Tier 2 Kelly cap (2x base)
+BB_PURE_KELLY_TIER2_MAX_FRAC         = 0.50  # Tier 2 Kelly cap (was 0.30 —
+                                              # bumped 2026-05-01 PT after $1k
+                                              # withdrawal: smaller bankroll
+                                              # needs higher fraction to
+                                              # make meaningful gains)
 BB_PURE_KELLY_TIER3_MIN_EDGE_PP      = 40.0  # Tier 3 edge floor
 BB_PURE_KELLY_TIER3_MIN_FAIR_EXTREME = 95.0  # Tier 3 fair-extremity floor
-BB_PURE_KELLY_TIER3_MAX_FRAC         = 0.50  # Tier 3 Kelly cap (3.3x base)
+BB_PURE_KELLY_TIER3_MAX_FRAC         = 0.75  # Tier 3 Kelly cap (was 0.50 —
+                                              # bumped per scale-harder
+                                              # directive after withdrawal)
 BB_PURE_TP_MAX_CENTS_TIER2           = 20    # Tier 2 TP cap (tighter)
 BB_PURE_TP_MAX_CENTS_TIER3           = 12    # Tier 3 TP cap (tightest)
 
