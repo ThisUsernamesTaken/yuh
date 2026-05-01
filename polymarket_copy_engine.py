@@ -642,6 +642,15 @@ class PolymarketCopyEngine:
         # {ticker: placement_ts}; entries older than 60s are ignored by
         # the consumer logic in the SYNC RECONCILE block.
         self._recent_placement_tickers: dict = {}
+        # 2026-05-01: parallel store keyed on ticker for BB_PURE-specific
+        # placement context. RECLAIM uses this to reconstruct a BB_PURE
+        # position correctly (with strategy_name + fair_yes_cents) when
+        # an order NOFILLs synchronously but cache catches up showing the
+        # position later. Without this, RECLAIM resets strategy to
+        # TA_FORCED_SIGNAL and the BB_PURE-aware TP/protective targets
+        # are never used. {ticker: {ts, side, entry_cents,
+        # fair_yes_cents, edge_pp}}
+        self._recent_bb_pure_placements: dict = {}
 
         # Daily loss tracking (circuit breaker)
         self._daily_pnl: float = 0.0           # Running P&L for current UTC day
@@ -8951,6 +8960,22 @@ class PolymarketCopyEngine:
             pass
         try:
             self._recent_placement_tickers[ticker] = time.time()
+        except Exception:
+            pass
+        # 2026-05-01: stamp BB_PURE placement context so RECLAIM can
+        # reconstruct correctly if the order NOFILLs but cache catches
+        # up showing the position later (live observed -1145-45 trade
+        # at 08:30 PT — the position was adopted as TA_FORCED with the
+        # tight TA staircase, losing the FVG-close target).
+        try:
+            self._recent_bb_pure_placements[ticker] = {
+                "ts": time.time(),
+                "side": sig.side,
+                "entry_cents": int(entry_px),
+                "fair_yes_cents": int(sig.fair_yes_cents),
+                "edge_pp": float(sig.edge_pp),
+                "market_mid_cents": int(sig.market_mid_cents),
+            }
         except Exception:
             pass
         logger.warning(
@@ -17467,6 +17492,29 @@ class PolymarketCopyEngine:
                                 _placed_recently,
                                 ticker in getattr(self, "_entered_tickers_this_window", set()),
                             )
+                            # 2026-05-01: detect BB_PURE-origin reclaim.
+                            # If the placement context store shows this
+                            # ticker had a recent BB_PURE FIRE, reconstruct
+                            # as BB_PURE so the FVG-close TP target is
+                            # used by both preflight-equivalent placement
+                            # below AND _maintain_protective_order on
+                            # subsequent cycles. Falling back to TA_FORCED
+                            # was the bug observed live 2026-05-01 08:30
+                            # PT on -1145-45 (449x adopted as TA_FORCED,
+                            # tight 70/78 staircase placed instead of the
+                            # FVG-close +30c target).
+                            _bb_ctx = self._recent_bb_pure_placements.get(ticker)
+                            _is_bb_reclaim = bool(
+                                _bb_ctx
+                                and (time.time() - float(_bb_ctx.get("ts", 0))) < 90.0
+                                and _bb_ctx.get("side") == kalshi_side
+                            )
+                            if _is_bb_reclaim:
+                                _reclaim_tier = "BB_PURE"
+                                _reclaim_strat = "BB_PURE"
+                            else:
+                                _reclaim_tier = "TA_FORCED"
+                                _reclaim_strat = "TA_FORCED_SIGNAL"
                             self._open_position = {
                                 "order_id": "synced_reclaim",
                                 "side": kalshi_side,
@@ -17474,8 +17522,8 @@ class PolymarketCopyEngine:
                                 "original_entry_cents": entry_est,
                                 "original_count": kalshi_count,
                                 "ticker": ticker,
-                                "tier": "TA_FORCED",
-                                "strategy_name": "TA_FORCED_SIGNAL",
+                                "tier": _reclaim_tier,
+                                "strategy_name": _reclaim_strat,
                                 "count": kalshi_count,
                                 "fill_time": time.time(),
                                 "_dca_maxed": True,  # don't re-DCA reclaimed positions
@@ -17495,20 +17543,77 @@ class PolymarketCopyEngine:
                                 "tp_order_ids": [],
                                 "tp_price": 0,
                             }
+                            if _is_bb_reclaim:
+                                # Cache the BB_PURE context fields so
+                                # _maintain_protective_order's BB_PURE
+                                # branch can read fair_yes_cents.
+                                self._open_position["_bb_pure_fair_yes_cents_at_entry"] = int(
+                                    _bb_ctx.get("fair_yes_cents", 0)
+                                )
+                                self._open_position["_bb_pure_market_mid_at_entry"] = int(
+                                    _bb_ctx.get("market_mid_cents", 0)
+                                )
+                                self._open_position["_bb_pure_edge_pp_at_entry"] = float(
+                                    _bb_ctx.get("edge_pp", 0.0)
+                                )
+                                self._open_position["_protective_active"] = True
+                                logger.warning(
+                                    "CopyEngine SYNC RECLAIM: tagged as BB_PURE "
+                                    "(fair_yes=%dc edge=%.1fpp)",
+                                    int(_bb_ctx.get("fair_yes_cents", 0)),
+                                    float(_bb_ctx.get("edge_pp", 0.0)),
+                                )
                             # Place TPs immediately on reclaimed position
                             if resting == 0:
                                 try:
-                                    _tp_ids_rc = await self._place_tiered_tp(
-                                        ticker, kalshi_side, kalshi_count, entry_est,
-                                    )
-                                    if _tp_ids_rc:
-                                        self._open_position["tp_order_ids"] = _tp_ids_rc
-                                        self._open_position["tp_order_id"] = _tp_ids_rc[0]
-                                        self._open_position["_tp_placed_for_count"] = kalshi_count
-                                        logger.info(
-                                            "CopyEngine SYNC RECLAIM TP: %dx placed",
-                                            kalshi_count,
+                                    if _is_bb_reclaim:
+                                        # Use FVG-close target identical to preflight
+                                        _bb_fair_side = (
+                                            int(_bb_ctx.get("fair_yes_cents", 0))
+                                            if kalshi_side == "yes"
+                                            else (100 - int(_bb_ctx.get("fair_yes_cents", 0)))
                                         )
+                                        _bb_inside = int(_uc("BB_PURE_TP_INSIDE_FAIR_C", 1))
+                                        _bb_min = int(_uc("BB_PURE_TP_MIN_CENTS", 4))
+                                        _bb_max = int(_uc("BB_PURE_TP_MAX_CENTS", 30))
+                                        _bb_px = _bb_fair_side - _bb_inside
+                                        _bb_px = max(entry_est + _bb_min, _bb_px)
+                                        _bb_px = min(entry_est + _bb_max, _bb_px)
+                                        _bb_px = max(1, min(99, _bb_px))
+                                        _bb_order = await self._client.place_order(
+                                            ticker=ticker, side=kalshi_side,
+                                            price=_bb_px, count=kalshi_count,
+                                            action="sell", post_only=True,
+                                        )
+                                        _bb_oid = getattr(_bb_order, "order_id", None) or ""
+                                        if _bb_oid:
+                                            self._open_position["tp_order_ids"] = [_bb_oid]
+                                            self._open_position["tp_order_id"] = _bb_oid
+                                            self._open_position["tp_price"] = _bb_px
+                                            self._open_position["_tp_placed_for_count"] = kalshi_count
+                                            self._open_position["_protective_order_id"] = _bb_oid
+                                            self._open_position["_protective_order_px"] = _bb_px
+                                            self._open_position["_protective_order_count"] = kalshi_count
+                                            self._open_position["_protective_order_state"] = "tp"
+                                            self._open_position["_protective_last_replan_ts"] = time.time()
+                                            logger.info(
+                                                "CopyEngine SYNC RECLAIM BB_PURE-TP: %dx sell @ %dc "
+                                                "(entry=%dc, +%dc, fair=%dc) FVG-close target",
+                                                kalshi_count, _bb_px, entry_est,
+                                                _bb_px - entry_est, _bb_fair_side,
+                                            )
+                                    else:
+                                        _tp_ids_rc = await self._place_tiered_tp(
+                                            ticker, kalshi_side, kalshi_count, entry_est,
+                                        )
+                                        if _tp_ids_rc:
+                                            self._open_position["tp_order_ids"] = _tp_ids_rc
+                                            self._open_position["tp_order_id"] = _tp_ids_rc[0]
+                                            self._open_position["_tp_placed_for_count"] = kalshi_count
+                                            logger.info(
+                                                "CopyEngine SYNC RECLAIM TP: %dx placed",
+                                                kalshi_count,
+                                            )
                                 except Exception as _tp_err:
                                     logger.warning(
                                         "CopyEngine SYNC RECLAIM TP failed: %s", _tp_err,
@@ -18768,8 +18873,17 @@ class PolymarketCopyEngine:
             # broken. DCA buys into a broken thesis and is the opposite of
             # the user's alpha (cheap entry + scalp recovery). No DCA on
             # SR-FADE regardless of drawdown.
+            # 2026-05-01: SCALP DCA explicitly excluded for BB_PURE.
+            # Live observed -1130-30 trade at 08:16 PT — BB_PURE position
+            # closed clean at +$8, then SCALP DCA fired immediately and
+            # bought 60 YES @ 55c on top of the closed position, leaving
+            # an untracked naked long. BB_PURE is Kelly-sized once at
+            # entry; doubling-down on adverse moves is not part of its
+            # thesis (which is mispricing convergence, not mean reversion
+            # from drawdown). Same exclusion as SR_FADE.
             if (count > 0 and bid > 0
                     and pos.get("strategy_name") != "SR_FADE"
+                    and pos.get("strategy_name") != "BB_PURE"
                     and not pos.get("_scalp_dca_fired", False)
                     and not pos.get("_scalp_stopped", False)
                     and not pos.get("_profit_trail_exited", False)
