@@ -15777,19 +15777,36 @@ class PolymarketCopyEngine:
                     # immediate exit on orphan positions.
                     aggressive_off = int(_uc("ORPHAN_FLATTEN_OFFSET_C", 5))
                     sell_px = max(1, int(bid) - aggressive_off)
+                    # 2026-05-02 Phase 0.1.1: route through _place_capped_side_sell.
+                    # Live test 2026-05-02 01:31 PT exposed this path piling
+                    # up 9 sell-no orders in 28s on -26MAY020445-45 because
+                    # each cycle placed a new order without checking for
+                    # already-resting orders on the same ticker. The helper
+                    # enforces:
+                    #   - >1 OVERSELL-GUARD (cancel all + abort if pile-up)
+                    #   - inventory cap (position - resting)
+                    #   - position-zero gate (no sells when flat)
+                    # The orphan path supplies known_position_count = abs_count
+                    # so the position lookup short-circuits to the truth value
+                    # we just observed.
                     try:
-                        _o = await self._client.place_order(
-                            ticker=ticker, side=side,
-                            price=sell_px, count=abs_count,
-                            action="sell", post_only=False,
+                        _o, _placed = await self._place_capped_side_sell(
+                            ticker=ticker,
+                            side=side,
+                            price=sell_px,
+                            requested_count=abs_count,
+                            post_only=False,
+                            reason="ORPHAN-FLATTEN",
+                            known_position_count=abs_count,
                         )
-                        logger.warning(
-                            "CopyEngine ORPHAN-FLATTEN: %s %dct on %s @ "
-                            "%dc (bid=%dc, aggressive cross -%dc) — orphan "
-                            "position auto-cleared",
-                            side.upper(), abs_count, ticker[-15:],
-                            sell_px, bid, aggressive_off,
-                        )
+                        if _o is not None and _placed > 0:
+                            logger.warning(
+                                "CopyEngine ORPHAN-FLATTEN: %s %dct on %s @ "
+                                "%dc (bid=%dc, aggressive cross -%dc) — orphan "
+                                "position auto-cleared",
+                                side.upper(), _placed, ticker[-15:],
+                                sell_px, bid, aggressive_off,
+                            )
                     except Exception as _ofe:
                         logger.error(
                             "CopyEngine ORPHAN-FLATTEN failed for %s: %s",
