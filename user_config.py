@@ -679,6 +679,44 @@ BB_PURE_VOL_LOOSE_WITH_TREND         = 50.0   # looser cap when going
                                               # with the trend (rare for
                                               # BB_PURE)
 
+# 2026-05-02 Phase 8 — TAPE PRESSURE / ABSORPTION DETECTION.
+# Encodes the user's manual-trading edge: sustained large buys on the
+# side OPPOSITE to BTC's recent direction = institutional absorption =
+# high-conviction signal that retracement is coming. Decision logic in
+# tape_pressure.py.
+#
+# SHADOW mode = compute and log the decision but don't gate yet. We need
+# a few sessions of data to validate the thresholds before turning the
+# gate on. Once enabled, BB_PURE entries on the side BEING ABSORBED AGAINST
+# will be blocked.
+BB_PURE_TAPE_SHADOW_ENABLED          = True   # log BB_PURE TAPE-SHADOW lines
+BB_PURE_TAPE_GATE_ENABLED            = False  # actively block on "block"
+                                              # decision (start False —
+                                              # shadow first)
+BB_PURE_TAPE_WINDOW_MIN_S            = 0.0    # start of session-age window
+BB_PURE_TAPE_WINDOW_MAX_S            = 300.0  # 5 min — only count buys
+                                              # in first N seconds of
+                                              # session. User: most trades
+                                              # happen in first 3-5 min
+BB_PURE_TAPE_LARGE_BUY_USD           = 100.0  # min $ to count toward
+                                              # large_count
+BB_PURE_TAPE_RELIABLE_BUY_USD        = 200.0  # higher conviction
+                                              # threshold (per user)
+BB_PURE_TAPE_INVERSE_MIN_USD         = 200.0  # min $ on inverse-trend
+                                              # side to flag absorption
+BB_PURE_TAPE_DOMINANCE_RATIO         = 2.0    # inverse-side $ must be
+                                              # ≥ N× with-trend $
+BB_PURE_TAPE_MIN_CONSISTENCY         = 3      # ≥ N large buys on inverse
+                                              # side (sustained, not a
+                                              # single dump)
+BB_PURE_TAPE_BTC_DEAD_ZONE_USD       = 20.0   # |BTC 5m change| ≤ this
+                                              # → no trend, no decision
+
+# Bump KalshiTape retention to 5 min so the absorption window has
+# enough trade history. Default in kalshi_tape.py is 120s.
+KALSHI_TAPE_RETENTION_S              = 360.0  # 6 min — covers 5-min
+                                              # window with buffer
+
 # ── Post-close residual sweep (Claude 2026-04-29 per user) ────────────────
 # After every TA_FORCED / LATE_DOMINANT / SR_FADE close, poll Kalshi
 # positions every POST_CLOSE_RESIDUAL_POLL_S seconds for

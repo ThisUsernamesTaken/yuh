@@ -9062,6 +9062,85 @@ class PolymarketCopyEngine:
         except Exception as _bve:
             logger.debug("BB_PURE BTC velocity check failed: %s", _bve)
 
+        # 2026-05-02 Phase 8 — TAPE PRESSURE / ABSORPTION SHADOW LOGGING.
+        # Encodes user's manual-trading edge: sustained large buys against
+        # the BTC trend in early session = institutional absorption =
+        # high-conviction signal of imminent retracement. We compute the
+        # signal here on every BB_PURE eval but only LOG the decision —
+        # no gating yet. After 1-2 sessions of shadow data we'll review
+        # whether to flip BB_PURE_TAPE_GATE_ENABLED.
+        try:
+            tape = getattr(self, "_kalshi_tape", None)
+            ws_start_t = float(getattr(self, "_window_start_time", 0) or 0)
+            if (tape is not None and ws_start_t > 0
+                    and bool(_uc("BB_PURE_TAPE_SHADOW_ENABLED", True))):
+                from tape_pressure import (
+                    compute_pressure_snapshot,
+                    evaluate_tape_decision,
+                )
+                # Pull all trades for this ticker; the snapshot windows
+                # internally by session_start + window_max_s.
+                _trades_dq = tape._trades.get(ticker)
+                _trades_list = list(_trades_dq) if _trades_dq else []
+                _ss_ms = int(ws_start_t * 1000)
+                _now_ms = int(time.time() * 1000)
+                # 5-min BTC change for inverse-trend classification
+                _btc_change_5m = 0.0
+                try:
+                    pf_btc2 = getattr(self, "_price_feed", None)
+                    tt_btc2 = getattr(pf_btc2, "tick_tracker", None) if pf_btc2 else None
+                    if tt_btc2 is not None and not getattr(tt_btc2, "is_stale", True):
+                        _prices2 = getattr(tt_btc2, "_prices", None)
+                        if _prices2 and len(_prices2) >= 10:
+                            _now_ts = _prices2[-1][0]
+                            _cutoff5 = _now_ts - 300.0
+                            _trend_p = [p for ts, p in _prices2 if ts >= _cutoff5]
+                            if len(_trend_p) >= 10:
+                                _btc_change_5m = float(_trend_p[-1] - _trend_p[0])
+                except Exception:
+                    pass
+                _snap = compute_pressure_snapshot(
+                    trades=_trades_list,
+                    session_start_ms=_ss_ms,
+                    now_ms=_now_ms,
+                    btc_5m_change_usd=_btc_change_5m,
+                    window_min_s=float(_uc("BB_PURE_TAPE_WINDOW_MIN_S", 0.0)),
+                    window_max_s=float(_uc("BB_PURE_TAPE_WINDOW_MAX_S", 300.0)),
+                    large_buy_usd=float(_uc("BB_PURE_TAPE_LARGE_BUY_USD", 100.0)),
+                    reliable_buy_usd=float(_uc("BB_PURE_TAPE_RELIABLE_BUY_USD", 200.0)),
+                    btc_dead_zone_usd=float(_uc("BB_PURE_TAPE_BTC_DEAD_ZONE_USD", 20.0)),
+                )
+                _decision = evaluate_tape_decision(
+                    _snap, sig.side,
+                    inverse_trend_min_usd=float(_uc("BB_PURE_TAPE_INVERSE_MIN_USD", 200.0)),
+                    dominance_ratio=float(_uc("BB_PURE_TAPE_DOMINANCE_RATIO", 2.0)),
+                    min_consistency_count=int(_uc("BB_PURE_TAPE_MIN_CONSISTENCY", 3)),
+                )
+                logger.warning(
+                    "BB_PURE TAPE-SHADOW [%s]: side=%s decision=%s | "
+                    "yes_$=%.0f no_$=%.0f yes_lc=%d no_lc=%d "
+                    "btc_5m=$%+.0f inv_side=%s inv_$=%.0f with_$=%.0f n=%d",
+                    ticker[-15:], sig.side.upper(), _decision.upper(),
+                    _snap.yes_buy_dollars, _snap.no_buy_dollars,
+                    _snap.yes_large_count, _snap.no_large_count,
+                    _snap.btc_5m_change_usd, _snap.inverse_trend_side,
+                    _snap.inverse_trend_dollars, _snap.with_trend_dollars,
+                    _snap.sample_count,
+                )
+                # When the live gate flag is on, BLOCK actually blocks.
+                # Default off for shadow mode.
+                if (_decision == "block"
+                        and bool(_uc("BB_PURE_TAPE_GATE_ENABLED", False))):
+                    logger.warning(
+                        "BB_PURE TAPE-BLOCK: %s side=%s — fighting absorption "
+                        "on %s side ($%.0f inverse-trend big-money flow) — skipping",
+                        ticker[-15:], sig.side.upper(),
+                        _snap.inverse_trend_side, _snap.inverse_trend_dollars,
+                    )
+                    return None
+        except Exception as _tpe:
+            logger.debug("BB_PURE tape-pressure shadow check failed: %s", _tpe)
+
         # 2026-05-01 ENTRY-TIMING FILTER (range position):
         # Secondary check on contract-side range (in case BTC velocity
         # check passes but contract is at extreme of recent range).
@@ -14169,8 +14248,31 @@ class PolymarketCopyEngine:
                     )
             except Exception as _mfe_exc:
                 logger.debug("BB_PURE MFE trail calculation failed: %s", _mfe_exc)
-        target_state = "tp" if bid > entry else "sl"
-        target_px = tp_target if target_state == "tp" else max(1, min(99, entry - sl_offset))
+        # 2026-05-02 SL TRIGGER FIX: previously `target_state = "tp" if bid > entry else "sl"`.
+        # This flipped to SL state on ANY 1c dip below entry — the sl_offset
+        # was only the FALLBACK PRICE, not the trigger. Live observed
+        # 12:45 PT today: entry 41c, bid dropped to 39c (just 2c down),
+        # engine immediately crossed-spread sold at 38c. The 5c offset
+        # should have given the trade a 5c buffer; it didn't.
+        #
+        # New logic: three states.
+        #   - "tp"   when bid > entry (profitable; rest at FVG-close target)
+        #   - "sl"   when bid <= entry - sl_offset (real loss; cross-spread bail)
+        #   - "hold" otherwise (in the buffer zone; keep existing TP, do nothing)
+        _existing_protective_px = int(pos.get("_protective_order_px", 0) or 0)
+        sl_trigger_px = max(1, entry - sl_offset)
+        if bid > entry:
+            target_state = "tp"
+            target_px = tp_target
+        elif bid <= sl_trigger_px:
+            target_state = "sl"
+            target_px = max(1, min(99, sl_trigger_px))
+        else:
+            target_state = "hold"
+            # In the buffer zone, keep the existing TP target if any,
+            # otherwise fall back to the freshly-computed tp_target so
+            # we still place a maker sell at FVG-close (initial fill case).
+            target_px = tp_target if _existing_protective_px <= 0 else _existing_protective_px
 
         # 2026-05-01 MID-TRADE BTC VELOCITY SL: if BTC is moving sharply
         # against our position right now (faster than the entry-time
