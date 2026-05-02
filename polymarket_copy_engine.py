@@ -14114,14 +14114,56 @@ class PolymarketCopyEngine:
         side = (pos.get("side") or "").lower()
         if not ticker or side not in ("yes", "no"):
             return False
-        # Truth count from Kalshi (with brief retry to defeat cache lag)
+        # Truth count from Kalshi (with brief retry to defeat cache lag).
+        # Cache-lag has TWO directions:
+        #   1. Right after BUY fill, Kalshi may briefly show 0 before the
+        #      position propagates. Trust engine state during this window.
+        #   2. Right after our own SELL fill (TP hit, SL fired, etc.),
+        #      Kalshi may briefly show our pre-sell count before reflecting
+        #      the close. Trust engine state during this window too —
+        #      EXCEPT we don't have engine-state acks for sell fills if the
+        #      order_id wasn't tracked. So once enough time has passed
+        #      since fill_time, ALSO trust Kalshi when it says 0.
+        #
+        # 2026-05-02 race postmortem: BB_PURE bought 40ct YES, ~100s later
+        # the protective sell filled but its order_id was untracked
+        # ("MANUAL FILL" label). Engine state still showed +40 YES. 47s
+        # later a MID-TRADE-SL fired, placed sell-yes 40ct, and Kalshi
+        # treated it as a NEW SHORT YES (= synthetic LONG NO of 40ct)
+        # because the actual YES inventory was already 0. User had to
+        # manually flatten. The fix: after fill_time + N seconds, if
+        # Kalshi positions API confirms 0, clear engine state and stop.
         truth_ct = int(pos.get("count", 0) or 0)
+        verified_ct = -1  # sentinel for "not fetched"
         try:
             verified_ct = await self._get_verified_side_position_count(ticker, side)
             if verified_ct > 0:
                 truth_ct = verified_ct
         except Exception:
             pass
+
+        # 2026-05-02 FLAT-CONFIRM gate: if Kalshi explicitly returned 0
+        # AND we're past the entry cache-lag window, treat the position
+        # as closed. Clear engine state and exit. The protective layer
+        # is no longer needed for a flat position.
+        flat_confirm_window = float(_uc("PROTECTIVE_FLAT_CONFIRM_S", 30.0))
+        fill_time_ts = float(pos.get("fill_time", 0) or 0)
+        fill_age_s = (time.time() - fill_time_ts) if fill_time_ts > 0 else 0.0
+        if (verified_ct == 0
+                and fill_age_s >= flat_confirm_window):
+            logger.warning(
+                "PROTECTIVE FLAT-CONFIRMED: %s side=%s engine_count=%d "
+                "kalshi_count=0 fill_age=%.1fs (≥%.0fs window) — clearing "
+                "engine state, NOT placing further sells. (Likely caused "
+                "by an untracked fill closing the position.)",
+                ticker, side, truth_ct, fill_age_s, flat_confirm_window,
+            )
+            try:
+                await self._clear_position(reason="kalshi_truth_flat")
+            except Exception as _ce:
+                logger.error("FLAT-CONFIRM clear_position raised: %s", _ce)
+            return True  # owned, no further action this cycle
+
         if truth_ct <= 0:
             # Position not yet visible; let caller fall through to existing
             # cache-lag deferred logic.

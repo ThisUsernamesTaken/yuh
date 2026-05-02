@@ -733,6 +733,23 @@ BB_PURE_TAPE_EXIT_DOM_RATIO          = 3.0    # opp $ ≥ N × our $ (one-
 BB_PURE_TAPE_EXIT_MIN_LARGE          = 2      # ≥ N large opposite buys
                                               # (sustained, not single)
 
+# 2026-05-02 cache-lag race fix.
+# Live observed today (13:32-13:34 PT): BB_PURE bought 40ct YES,
+# protective sell closed at +profit but the order_id wasn't tracked
+# ("MANUAL FILL" label). 47s later the engine still thought +40 YES,
+# fired MID-TRADE-SL, placed a new sell-yes that Kalshi treated as a
+# new SHORT YES (synthetic LONG NO 40ct) since YES inventory was 0.
+# User had to manually flatten the synthetic NO position.
+#
+# Fix: in _maintain_protective_order, if Kalshi positions API EXPLICITLY
+# returns 0 AND fill_age >= this window, treat the position as closed.
+# Clear engine state and stop placing sells. The window must be long
+# enough to cover Kalshi's BUY-side propagation lag (don't want to
+# falsely-clear right after entry) but short enough to detect close
+# events from untracked sells.
+PROTECTIVE_FLAT_CONFIRM_S            = 30.0   # seconds past fill_time
+                                              # before trusting Kalshi=0
+
 # ── Post-close residual sweep (Claude 2026-04-29 per user) ────────────────
 # After every TA_FORCED / LATE_DOMINANT / SR_FADE close, poll Kalshi
 # positions every POST_CLOSE_RESIDUAL_POLL_S seconds for
