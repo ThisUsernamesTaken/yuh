@@ -3510,3 +3510,126 @@ test_strategy_index — not regressions).
    manual trading "my primary alpha".
 3. Maker→taker $25/s threshold tuning after 50-entry sample.
 4. Day/night cap smoothing across transition windows (deferred).
+## 2026-05-01 22:15 PT - Codex - Phase 1 alpha extraction implemented
+
+### Trigger
+User: "Implement strategy" after post-session reflection and plan draft.
+
+### Safety posture
+- Confirmed `BTCBiasEngine` remains `SERVICE_STOPPED`.
+- Implemented read-only analysis only. No live strategy gates changed and no service restart.
+
+### Changes
+- Added `scripts/alpha_table.py`, a read-only SQLite report generator for:
+  - engine trade expectancy by entry-price, regime, volatility, raw edge, BTC 5m move, and UTC hour buckets
+  - candidate retrospective filters
+  - manual-fill context
+  - MFE/MAE coverage when `trade_decisions` fields exist
+- Generated `docs/alpha_table_2026_05_01.md` with `--since 2026-04-29`.
+
+### Commands / results
+- `nssm status BTCBiasEngine` -> `SERVICE_STOPPED`
+- `python -m py_compile scripts\alpha_table.py` -> pass
+- `python scripts\alpha_table.py --since 2026-04-29 --out docs\alpha_table_2026_05_01.md` -> pass
+
+### Findings
+- Selected DB slice: 42 engine trades, 47 manual buy fills.
+- Engine rows since 2026-04-29 are all `TA_FORCED_SIGNAL` in `kalshi_trades`; BB_PURE later activity appears better represented in logs/gate decisions/manual fills than closed engine rows.
+- Engine net in the selected slice: `-$150.43`, WR `64.3%`.
+- Entry buckets did not support blindly shipping cheap-only gating from the reflection: there were zero engine trades <=35c in this DB slice.
+- MFE capture is low where excursion fields exist: average positive-trade capture ratio `10.6%`.
+
+### Next recommendation
+Do not implement Phase 2 cheap-only gating from the narrative without better BB_PURE-specific closed-trade linkage. The next low-risk implementation should either:
+1. improve closed-trade attribution for BB_PURE/gate_decisions/manual fills, or
+2. implement Phase 0 sell-order ownership safety before any live restart.
+
+---
+
+## 2026-05-01 23:00 PT - Claude - Plan revision after Phase 1 findings + sizing-down directive
+
+### Read
+- `to-do/PLAN_alpha_extraction_2026_05_01.md` (with Codex implementation notes)
+- `docs/alpha_table_2026_05_01.md` (Phase 1 mining output)
+- Codex collab entry above (2026-05-01 22:15 PT)
+
+### Trigger
+User directive after reviewing Phase 1 results: "we should test improvements live"
+followed by "1. smaller sizing" — meaning option 1 from the proposed paths
+(implement Phase 0 MVP + Phase 3 MFE trail next session, then live-test) AND
+reduce per-trade sizing materially before that restart.
+
+### Safety posture
+- `BTCBiasEngine` remains `SERVICE_STOPPED`. No code changes this session.
+- This entry documents agreed scope only. Implementation deferred to next coding session.
+- All sizing changes proposed but not yet written to `user_config.py`.
+
+### Plan revisions in light of Phase 1 data
+
+**Phase 2 (cheap-side gating): PAUSED.** Phase 1 mining showed zero engine trades ≤35c in
+`kalshi_trades` since 2026-04-29. The "today's wins were cheap" claim that justified
+Phase 2 was anchored on verbal recall of BB_PURE trades that aren't in the closed-trade
+DB. Cannot validate against data until closure-attribution is fixed.
+
+**Phase 3 (MFE-aware trail): PROMOTED.** 10.6% MFE capture ratio is the strongest data
+signal Phase 1 surfaced. Even though the data is mostly TA_FORCED-flavored, the trail
+bug-class is shared (both strategies route exits through `_maintain_protective_order`).
+
+**New Phase 1.5 (BB_PURE closure attribution):** required before Phase 2 can ever be
+validated. Two sub-paths:
+- `1.5a`: read-only log-mining via `scripts/bb_pure_log_mine.py` (parses
+  `data/engine_history.log` for `BB_PURE FILL` / `SELL TIER FILLED` /
+  `TRAIL FIRED` / `RESIDUAL-CLEAN` / `MANUAL_TP` events, reconstructs trade pairs).
+- `1.5b`: fix the `kalshi_trades` write path so future BB_PURE closures are attributed
+  natively. Bundled with Phase 0 surgery.
+
+### Sizing reduction (agreed for next session)
+
+User directive: bundle "smaller sizing" with Phase 0 + Phase 3. Concrete knobs:
+
+| Knob | Current | Proposed | Rationale |
+|---|---|---|---|
+| `BB_PURE_KELLY_MAX_FRAC` | 0.30 | **0.10** | Cap any single trade at 10% of bankroll |
+| `BB_PURE_KELLY_TIER2_MAX_FRAC` | 0.10 | **0.06** | Inverted ladder (tier 2 = high fair = worse) |
+| `BB_PURE_KELLY_TIER3_MAX_FRAC` | 0.05 | **0.03** | Even smaller for extreme-fair zone |
+| `SIZING_HARD_CAP_CONTRACTS_DAY` | 25 | **10** | Hard-floor protection regardless of math |
+| `SIZING_MAX_FRACTION` | 0.20 | **0.08** | Absolute per-position ceiling |
+
+At $220 bankroll: max single trade falls from ~$66 → **~$22**; max contracts at 50c entry
+from ~132 → **~44ct**. Worst-case per-trade drawdown ~$22. Phase kill-switch at −$30
+(~14% of bankroll) hits well before damage compounds.
+
+### Locked scope for next coding session
+
+1. Phase 0 MVP — sell-helper + inventory cap + cancel-status-confirmed
+2. Phase 3 — MFE-aware trail (data-backed by 10.6% capture finding)
+3. Sizing knobs above
+4. Tests for all three (one commit per logical unit)
+5. Single live-restart with all three active, −$30 kill-switch armed
+
+Stop conditions per Codex notes still apply. No bundled commits. No live restart
+without test passes.
+
+### Commands / results
+
+- `nssm status BTCBiasEngine` → `SERVICE_STOPPED` (verified earlier in session)
+- No code changes; this is plan-only
+
+### Next
+
+1. Update `to-do/PLAN_alpha_extraction_2026_05_01.md`:
+   - Mark Phase 2 PAUSED, Phase 3 PROMOTED
+   - Insert Phase 1.5 (BB_PURE attribution)
+   - Embed sizing knobs into Phase 0/3 scope
+2. Commit the plan and this collab entry as the working spec for next session.
+
+### Guardrails
+
+- Engine stays stopped until next session lands Phase 0 MVP + Phase 3 + sizing.
+- `−$30 phase kill-switch` armed for any live restart.
+- "Smaller sizing" is bundled into the same restart, not deferred — the live test
+  validates the new trail AND the new sizing together.
+- If next session can't land all three cleanly, restart is deferred again, not bundled
+  with partial work.
+
+---
