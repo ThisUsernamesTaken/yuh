@@ -8961,25 +8961,70 @@ class PolymarketCopyEngine:
         # recovering by luck or losing. The drawdown happens because we
         # enter during a BTC trend that hasn't finished. Solution: require
         # BTC to be in a TIGHT RANGE over recent N seconds before firing.
+        #
+        # 2026-05-02 Phase 0.1.6 — ASYMMETRIC vol cap based on 5-min trend
+        # direction. Tonight's loser pattern: BB_PURE bought NO at 24c
+        # right after BTC ripped 200+ in 2 min. Both contract sides got
+        # volatile, but the *direction* of that vol mattered — fading WITH
+        # the prevailing trend (= our side opposite to BTC direction =
+        # classic mean-reversion fade) is the high-risk case. Going WITH
+        # the trend (rare for BB_PURE since the model would have priced
+        # it in already) is lower risk because the move is in our favor.
+        #
+        # Counter-trend fade: stricter vol cap (only fire if trend is
+        #                     visibly exhausting → low recent range)
+        # With-trend / no-trend: default or looser cap
         try:
             pf_btc = getattr(self, "_price_feed", None)
             tt_btc = getattr(pf_btc, "tick_tracker", None) if pf_btc else None
             stab_window = float(_uc("BB_PURE_BTC_STABILITY_WINDOW_S", 30.0))
             stab_max_range = float(_uc("BB_PURE_BTC_STABILITY_MAX_RANGE", 30.0))
+            trend_window = float(_uc("BB_PURE_TREND_WINDOW_S", 300.0))
+            trend_dead_zone = float(_uc("BB_PURE_TREND_DEAD_ZONE_USD", 20.0))
+            vol_cap_counter = float(_uc("BB_PURE_VOL_STRICT_COUNTER_TREND", 20.0))
+            vol_cap_with = float(_uc("BB_PURE_VOL_LOOSE_WITH_TREND", 50.0))
             if tt_btc is not None and not getattr(tt_btc, "is_stale", True):
                 _prices = getattr(tt_btc, "_prices", None)
                 if _prices and len(_prices) >= 5:
                     _now = _prices[-1][0]
                     _cutoff = _now - stab_window
                     _recent = [p for ts, p in _prices if ts >= _cutoff]
+
+                    # 2026-05-02: classify trend orientation over a longer
+                    # window (5min default) and pick the right vol cap.
+                    # Pure helpers in protective_math for testability.
+                    from protective_math import (
+                        classify_trend_orientation,
+                        select_vol_cap,
+                    )
+                    _trend_cutoff = _now - trend_window
+                    _trend_prices = [p for ts, p in _prices if ts >= _trend_cutoff]
+                    _trend_label = "neutral"
+                    _trend_change = 0.0
+                    _vol_cap = stab_max_range  # default
+                    if len(_trend_prices) >= 10:
+                        _trend_change = _trend_prices[-1] - _trend_prices[0]
+                        _orient = classify_trend_orientation(
+                            side=sig.side,
+                            trend_change_usd=_trend_change,
+                            dead_zone_usd=trend_dead_zone,
+                        )
+                        _trend_label = "%s ($%+.0f)" % (_orient, _trend_change)
+                        _vol_cap = select_vol_cap(
+                            orientation=_orient,
+                            cap_neutral=stab_max_range,
+                            cap_counter=vol_cap_counter,
+                            cap_with=vol_cap_with,
+                        )
+
                     if len(_recent) >= 5:
                         _btc_range = max(_recent) - min(_recent)
-                        if _btc_range > stab_max_range:
+                        if _btc_range > _vol_cap:
                             logger.warning(
                                 "BB_PURE BTC-RANGE-BLOCK: BTC moved $%.0f in "
-                                "last %.0fs (max=$%.0f) — too volatile, "
-                                "skipping (waiting for chop)",
-                                _btc_range, stab_window, stab_max_range,
+                                "last %.0fs (cap=$%.0f trend=%s side=%s) — skipping",
+                                _btc_range, stab_window, _vol_cap,
+                                _trend_label, sig.side.upper(),
                             )
                             return None
         except Exception as _se:

@@ -660,6 +660,25 @@ BB_PURE_BTC_STABILITY_MAX_RANGE      = 30.0   # Max BTC range ($) in
                                               # the window. If exceeded,
                                               # BTC is trending; skip.
 
+# 2026-05-02 Phase 0.1.6 — ASYMMETRIC vol gate by trend orientation.
+# Tonight's loser pattern: -$5 fade trade fired NO at 24c right after BTC
+# ripped 200+ in 2 min. Both contract sides got volatile, but the
+# direction matters — fading WITH the prevailing trend (= classic mean-
+# reversion fade) is the high-risk case. The previous symmetric cap
+# (30) treated all volatility the same. New asymmetric design:
+#   - Counter-trend (mean-reversion fade): stricter (default 20) — only
+#     fire if trend is visibly exhausting.
+#   - With-trend (rare for BB_PURE): looser (default 50) — vol is in our
+#     favor.
+#   - Neutral (|trend_change| ≤ dead zone): use the legacy default cap.
+BB_PURE_TREND_WINDOW_S               = 300.0  # 5-min trend lookback
+BB_PURE_TREND_DEAD_ZONE_USD          = 20.0   # |change| ≤ this = neutral
+BB_PURE_VOL_STRICT_COUNTER_TREND     = 20.0   # tighter cap when fading
+                                              # against the trend
+BB_PURE_VOL_LOOSE_WITH_TREND         = 50.0   # looser cap when going
+                                              # with the trend (rare for
+                                              # BB_PURE)
+
 # ── Post-close residual sweep (Claude 2026-04-29 per user) ────────────────
 # After every TA_FORCED / LATE_DOMINANT / SR_FADE close, poll Kalshi
 # positions every POST_CLOSE_RESIDUAL_POLL_S seconds for
