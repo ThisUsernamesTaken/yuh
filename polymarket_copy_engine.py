@@ -55,6 +55,15 @@ from regime import (
 )
 from shadow_edge import compute_shadow_edge, ShadowEdge
 import contract_sr  # Phase C: contract-native S/R detector (empirical)
+from protective_math import compute_mfe_trail_price
+from sell_safety import (
+    cap_sell_count,
+    filter_resting_side_sells,
+    order_price,
+    order_remaining_count,
+    order_status_terminal,
+    resting_sell_count,
+)
 # edge_sizer (2026-04-17): reverse-engineered Apr 15 rapid-fire sizing.
 # Replaces the simplified 4/6/8 + CONVICTION BOOST chain that drifted us
 # away from Wednesday's $1k+ behavior. See edge_sizer.py for the full
@@ -13538,13 +13547,18 @@ class PolymarketCopyEngine:
                           else int(getattr(book, "best_no_bid", 0) or 0)
                 # Fallback price: 1c floor so the order is always placeable.
                 sell_px = max(1, bid - 1 if bid > 1 else 1)
-                await self._client.place_order(
+                _flatten_order, _flatten_count = await self._place_capped_side_sell(
                     ticker=ticker, side=held_side,
-                    price=sell_px, count=held_count, action="sell",
+                    price=sell_px, requested_count=held_count,
+                    post_only=False,
+                    reason="RESIDUAL-SELL",
+                    known_position_count=held_count,
                 )
+                if not _flatten_order:
+                    raise RuntimeError("sell-cap blocked residual flatten")
                 logger.warning(
                     "CopyEngine RESIDUAL-SELL: %s %dct %s @ %dc (attempt=%d)",
-                    ticker, held_count, held_side.upper(), sell_px, attempt + 1,
+                    ticker, _flatten_count, held_side.upper(), sell_px, attempt + 1,
                 )
             except Exception as e:
                 logger.error("CopyEngine RESIDUAL-SELL error (%s): %s", ticker, e)
@@ -13694,20 +13708,125 @@ class PolymarketCopyEngine:
             actual_bid = int(getattr(book, "best_no_bid", 0) or 0) if book else 0
         sell_px = max(1, actual_bid) if actual_bid > 0 else 1
         try:
-            await self._client.place_order(
+            _consolidate_order, _consolidate_count = await self._place_capped_side_sell(
                 ticker=ticker, side=side,
-                price=sell_px, count=truth_ct,
-                action="sell", post_only=False,
+                price=sell_px, requested_count=truth_ct,
+                post_only=False,
+                reason="PRE-EXPIRY CONSOLIDATE",
+                known_position_count=truth_ct,
             )
+            if not _consolidate_order:
+                raise RuntimeError("sell-cap blocked pre-expiry consolidate")
             logger.warning(
                 "PRE-EXPIRY CONSOLIDATE: placed sell %dct @ %dc",
-                truth_ct, sell_px,
+                _consolidate_count, sell_px,
             )
         except Exception as e:
             logger.error("PRE-EXPIRY CONSOLIDATE place_order failed: %s", e)
             self._pre_expiry_consolidating = False
             return False
         return True
+
+    async def _get_verified_side_position_count(self, ticker: str, side: str) -> int:
+        """Return Kalshi-truth inventory count for ticker/side."""
+        try:
+            positions = await self._client.get_positions()
+        except Exception:
+            return 0
+        normalized_side = (side or "").lower()
+        for p in positions or []:
+            if p.get("ticker") != ticker:
+                continue
+            try:
+                raw_position = int(p.get("position", 0) or 0)
+            except Exception:
+                raw_position = 0
+            try:
+                fp_position = int(float(p.get("position_fp", "0") or 0))
+            except Exception:
+                fp_position = 0
+            if normalized_side == "yes":
+                return max(0, raw_position, fp_position)
+            if normalized_side == "no":
+                return max(0, -raw_position, abs(fp_position) if raw_position < 0 else 0)
+            return abs(raw_position or fp_position)
+        return 0
+
+    async def _fetch_resting_side_sells(self, ticker: str, side: str) -> list[dict]:
+        """Fetch authoritative resting sell orders for ticker/side."""
+        data = await self._client._request(
+            "GET", "/portfolio/orders",
+            params={"status": "resting", "ticker": ticker, "limit": 50},
+        )
+        return filter_resting_side_sells(data.get("orders", []) or [], side)
+
+    async def _cancel_and_verify_order(self, order_id: str, *, context: str = "sell") -> bool:
+        """Cancel an order and verify it is terminal before replacement."""
+        if not order_id:
+            return True
+        try:
+            cancel_ok = await self._client.cancel_order(order_id)
+        except Exception as exc:
+            logger.error("%s cancel %s raised: %s", context, order_id[:12], exc)
+            return False
+        if cancel_ok:
+            return True
+        try:
+            order = await self._client.get_order(order_id)
+            status = ""
+            if isinstance(order, dict):
+                status = str(order.get("status") or "")
+            else:
+                status = str(getattr(order, "status", "") or "")
+            if order_status_terminal(status):
+                logger.info("%s cancel %s returned False but order is %s", context, order_id[:12], status)
+                return True
+            logger.error("%s cancel %s returned False and order is still %s", context, order_id[:12], status or "unknown")
+            return False
+        except Exception as exc:
+            logger.error("%s cancel-verify get_order(%s) raised: %s", context, order_id[:12], exc)
+            return False
+
+    async def _place_capped_side_sell(
+        self,
+        *,
+        ticker: str,
+        side: str,
+        price: int,
+        requested_count: int,
+        post_only: bool,
+        reason: str,
+        known_position_count: int | None = None,
+    ):
+        """Place a sell capped to verified inventory not already resting."""
+        position_count = (
+            int(known_position_count)
+            if known_position_count is not None
+            else await self._get_verified_side_position_count(ticker, side)
+        )
+        resting_orders = await self._fetch_resting_side_sells(ticker, side)
+        resting_count = resting_sell_count(resting_orders, side)
+        capped_count = cap_sell_count(position_count, resting_count, requested_count)
+        if capped_count <= 0:
+            logger.error(
+                "%s SELL-CAP: blocked %s %s requested=%d position=%d resting=%d",
+                reason, ticker, side.upper(), requested_count, position_count, resting_count,
+            )
+            return None, 0
+        if capped_count < int(requested_count or 0):
+            logger.warning(
+                "%s SELL-CAP: capped %s %s %d -> %d (position=%d resting=%d)",
+                reason, ticker, side.upper(), requested_count, capped_count, position_count, resting_count,
+            )
+        order = await self._client.place_order(
+            ticker=ticker,
+            side=side,
+            price=price,
+            count=capped_count,
+            action="sell",
+            post_only=post_only,
+        )
+        return order, capped_count
 
     async def _maintain_protective_order(self) -> bool:
         """Always-resting protective sell order (Phase 4, 2026-04-30).
@@ -13757,11 +13876,9 @@ class PolymarketCopyEngine:
         # Truth count from Kalshi (with brief retry to defeat cache lag)
         truth_ct = int(pos.get("count", 0) or 0)
         try:
-            positions = await self._client.get_positions()
-            for p in positions or []:
-                if p.get("ticker") == ticker:
-                    truth_ct = abs(int(p.get("position", 0)))
-                    break
+            verified_ct = await self._get_verified_side_position_count(ticker, side)
+            if verified_ct > 0:
+                truth_ct = verified_ct
         except Exception:
             pass
         if truth_ct <= 0:
@@ -13784,15 +13901,19 @@ class PolymarketCopyEngine:
             except Exception:
                 pass
             try:
-                await self._client.place_order(
+                _flatten_order, _flatten_count = await self._place_capped_side_sell(
                     ticker=ticker, side=side,
-                    price=1, count=truth_ct, action="sell",
+                    price=1, requested_count=truth_ct,
                     post_only=False,
+                    reason="PROTECTIVE PRE-EXPIRY FLATTEN",
+                    known_position_count=truth_ct,
                 )
+                if not _flatten_order:
+                    raise RuntimeError("sell-cap blocked pre-expiry flatten")
                 logger.warning(
                     "CopyEngine PROTECTIVE PRE-EXPIRY FLATTEN: %s %dct entry=%dc "
                     "remaining=%.0fs — forced market sell @ 1¢",
-                    side.upper(), truth_ct, entry, secs_remaining,
+                    side.upper(), _flatten_count, entry, secs_remaining,
                 )
             except Exception as e:
                 logger.error("PROTECTIVE PRE-EXPIRY FLATTEN failed: %s", e)
@@ -13865,6 +13986,27 @@ class PolymarketCopyEngine:
         else:
             tp_offset = int(_uc("PROTECTIVE_TP_OFFSET_C", 5))
             tp_target = max(1, min(99, entry + tp_offset))
+        if strat == "BB_PURE":
+            try:
+                _mfe_decision = compute_mfe_trail_price(
+                    entry_cents=entry,
+                    bid_cents=bid,
+                    previous_mfe_cents=int(pos.get("_bb_pure_mfe_cents", 0) or 0),
+                    min_profit_cents=int(_uc("BB_PURE_TP_MIN_CENTS", 4)),
+                    base_trail_cents=int(_uc("BB_PURE_TRAIL_DISTANCE_C", 3)),
+                    trail_ratio=float(_uc("BB_PURE_MFE_TRAIL_RATIO", 0.4)),
+                    threshold_cents=int(_uc("BB_PURE_MFE_TRAIL_THRESHOLD_C", 8)),
+                )
+                pos["_bb_pure_mfe_cents"] = _mfe_decision.mfe_cents
+                if _mfe_decision.armed and _mfe_decision.trail_price is not None:
+                    old_tp_target = tp_target
+                    tp_target = int(_mfe_decision.trail_price)
+                    logger.info(
+                        "BB_PURE MFE-TRAIL: entry=%dc bid=%dc mfe=%dc target %dc -> %dc",
+                        entry, bid, _mfe_decision.mfe_cents, old_tp_target, tp_target,
+                    )
+            except Exception as _mfe_exc:
+                logger.debug("BB_PURE MFE trail calculation failed: %s", _mfe_exc)
         target_state = "tp" if bid > entry else "sl"
         target_px = tp_target if target_state == "tp" else max(1, min(99, entry - sl_offset))
 
@@ -13981,8 +14123,8 @@ class PolymarketCopyEngine:
         if _resting_count == 1:
             _o = _our_sells[0]
             _oid = _o.get("order_id") or ""
-            _opx = int(_o.get("yes_price" if side == "yes" else "no_price", 0) or 0)
-            _oct = int(_o.get("remaining_count", _o.get("count", 0)) or 0)
+            _opx = order_price(_o, side)
+            _oct = order_remaining_count(_o)
             # If the existing matches what we'd want, just return True
             if _oid and _opx == target_px and _oct == truth_ct:
                 # Sync local state to truth and skip placement
@@ -14072,10 +14214,12 @@ class PolymarketCopyEngine:
             place_px = target_px
             place_post_only = True
         try:
-            new_order = await self._client.place_order(
+            new_order, placed_count = await self._place_capped_side_sell(
                 ticker=ticker, side=side,
-                price=place_px, count=truth_ct,
-                action="sell", post_only=place_post_only,
+                price=place_px, requested_count=truth_ct,
+                post_only=place_post_only,
+                reason=f"PROTECTIVE {target_state.upper()}",
+                known_position_count=truth_ct,
             )
             new_oid = getattr(new_order, "order_id", None)
             if not new_oid:
@@ -14091,13 +14235,13 @@ class PolymarketCopyEngine:
 
         pos["_protective_order_id"] = new_oid
         pos["_protective_order_px"] = place_px
-        pos["_protective_order_count"] = truth_ct
+        pos["_protective_order_count"] = placed_count
         pos["_protective_order_state"] = target_state
         pos["_protective_last_replan_ts"] = now
         logger.warning(
             "CopyEngine PROTECTIVE [%s]: %s %dct @ %dc entry=%dc bid=%dc "
             "strat=%s post_only=%s (prev=%dc count=%d resting_pre=%d)",
-            target_state.upper(), side.upper(), truth_ct, place_px,
+            target_state.upper(), side.upper(), placed_count, place_px,
             entry, bid, strat or "?", place_post_only, cur_px, cur_count,
             _resting_count,
         )

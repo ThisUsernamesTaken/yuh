@@ -19,9 +19,9 @@ SIZING_BALANCE_FRACTION = 0.10      # 2026-04-29 retune (was 0.30): tighter base
                                      # sizing aligned with parallel-terminal
                                      # post-incident config. Kelly path still
                                      # primary; this is the legacy fallback.
-SIZING_MAX_FRACTION     = 0.20      # 2026-04-29 retune (was 0.75): hard
+SIZING_MAX_FRACTION     = 0.08      # 2026-05-01 safety retune (was 0.20):
                                      # absolute ceiling per position. Worst-
-                                     # case loss bounded at 20% of balance.
+                                     # case loss bounded at 8% of balance.
 SIZING_MAX_DOLLARS      = 10_000.0  # fallback only (effectively unbinding)
 MIN_BALANCE_TO_TRADE = 2.00
 DAILY_LOSS_LIMIT = 15.00            # 2026-04-29 retune (was 500.00): static
@@ -45,7 +45,7 @@ DAILY_LOSS_FRACTION = 0.20          # 2026-04-29 NEW: live daily-loss limit
 #   $200 × 0.30 = 60ct,      $200 × 0.10 = 20ct
 #   $500 × 0.30 = 150ct,     $500 × 0.10 = 50ct
 #   $1000 × 0.30 = 300ct,    $1000 × 0.10 = 100ct
-SIZING_HARD_CAP_CONTRACTS_DAY   = 25   # 2026-04-29 (was 100): static fallback
+SIZING_HARD_CAP_CONTRACTS_DAY   = 10   # 2026-05-01 safety retune (was 25)
 SIZING_HARD_CAP_CONTRACTS_NIGHT = 10   # 2026-04-29 (was 100): static fallback
 SIZING_CAP_BALANCE_FRAC_DAY     = 0.30 # 2026-04-29 NEW: live day-cap fraction
 SIZING_CAP_BALANCE_FRAC_NIGHT   = 0.10 # 2026-04-29 NEW: live night-cap fraction
@@ -448,6 +448,10 @@ PROTECTIVE_MID_TRADE_ADVERSE_VEL  = 10.0   # $/sec adverse threshold.
 BB_PURE_TRAIL_DISTANCE_C          = 3      # cents below current bid
                                            # for trail floor (give back
                                            # at most 3c from peak)
+BB_PURE_MFE_TRAIL_THRESHOLD_C     = 8      # Arm dynamic MFE trail after
+                                           # the trade has moved +8c.
+BB_PURE_MFE_TRAIL_RATIO           = 0.4    # Give back max(base trail,
+                                           # 40% of MFE) once armed.
 PROTECTIVE_REPLAN_DEBOUNCE_S     = 2.0    # Min seconds between cancel+replace
 PROTECTIVE_PRE_EXPIRY_FORCE_S    = 60     # Force market sell when remaining < this
 
@@ -489,11 +493,9 @@ BB_PURE_MIN_ENTRY_CENTS          = 5      # Don't fire on dust prices
 BB_PURE_MIN_TIME_REMAINING_S     = 60.0   # No new entries within last minute
 BB_PURE_KELLY_FRACTION           = 0.25   # Quarter-Kelly base (matches existing
                                           # KELLY_FRACTION default)
-BB_PURE_KELLY_MAX_FRAC           = 0.30   # Hard cap on bankroll % per position
-                                          # (was 0.15 — bumped 2026-05-01 PT
-                                          # after $1k withdrawal: small
-                                          # bankroll needs bigger fraction
-                                          # for meaningful gains)
+BB_PURE_KELLY_MAX_FRAC           = 0.10   # 2026-05-01 safety retune
+                                          # (was 0.30): cap any BB_PURE
+                                          # position at 10% of bankroll.
 BB_PURE_VOLATILITY_LOOKBACK      = 15     # Mirrors founding-doc default
 # Fair-value-anchored protective-order targets (used in Session 2 refactor)
 BB_PURE_TP_EDGE_PP               = 5.0    # TP when fair value crosses
@@ -524,7 +526,7 @@ BB_PURE_TP_MAX_CENTS             = 30     # Cap — never TP wider than this
 # fill probability so trades close in-window instead of riding to expiry.
 BB_PURE_KELLY_TIER2_MIN_EDGE_PP      = 25.0  # Tier 2 edge floor
 BB_PURE_KELLY_TIER2_MIN_FAIR_EXTREME = 85.0  # Tier 2 fair-extremity floor
-BB_PURE_KELLY_TIER2_MAX_FRAC         = 0.10  # Tier 2 Kelly cap INVERTED
+BB_PURE_KELLY_TIER2_MAX_FRAC         = 0.06  # Tier 2 Kelly cap INVERTED
                                               # 2026-05-01 late PT. Was 0.50;
                                               # data showed 5 Tier-2 trades
                                               # today netted -\$522 with 0%
@@ -537,7 +539,7 @@ BB_PURE_KELLY_TIER2_MAX_FRAC         = 0.10  # Tier 2 Kelly cap INVERTED
                                               # reliable.
 BB_PURE_KELLY_TIER3_MIN_EDGE_PP      = 40.0  # Tier 3 edge floor
 BB_PURE_KELLY_TIER3_MIN_FAIR_EXTREME = 95.0  # Tier 3 fair-extremity floor
-BB_PURE_KELLY_TIER3_MAX_FRAC         = 0.05  # Tier 3 Kelly cap INVERTED.
+BB_PURE_KELLY_TIER3_MAX_FRAC         = 0.03  # Tier 3 Kelly cap INVERTED.
                                               # Was 0.75; data showed 4
                                               # Tier-3 trades today netted
                                               # -\$275 (with -\$252 single
@@ -1428,4 +1430,3 @@ ATM_SESSION_PROBE_END_AGE_S = 180.0
 ATM_SESSION_PROBE_MIN_BTC_MOVE_USD = 10.0
 ATM_SESSION_PROBE_MAX_ENTRY_CENTS = 55
 ATM_SESSION_PROBE_MAX_SPREAD_CENTS = 8
-
