@@ -2891,6 +2891,61 @@ python scripts/atm_paper_status.py --live-check --limit 5
 
 ---
 
+## 2026-05-01 23:18 PT - Codex - Plan implementation: BB_PURE mining, sell safety, MFE trail, reduced sizing
+
+### Read
+- `AI_COLLAB_LOG.md`
+- `to-do/PLAN_alpha_extraction_2026_05_01.md`
+- `polymarket_copy_engine.py`
+- `user_config.py`
+
+### Work
+- Added read-only `scripts/bb_pure_log_mine.py` and generated:
+  - `docs/bb_pure_trades_2026_05_01.md`
+  - `docs/bb_pure_trades_2026_05_01.csv`
+- Added pure safety modules:
+  - `sell_safety.py` for terminal status detection, resting sell filtering, and inventory-based sell cap math.
+  - `protective_math.py` for BB_PURE MFE-aware trail calculation.
+- Integrated sell cap helper into residual flatten, pre-expiry consolidate, protective pre-expiry flatten, and `_maintain_protective_order` placement.
+- Integrated BB_PURE MFE-aware trail into `_maintain_protective_order`.
+- Reduced configured sizing:
+  - `SIZING_MAX_FRACTION`: `0.20 -> 0.08`
+  - `SIZING_HARD_CAP_CONTRACTS_DAY`: `25 -> 10`
+  - `BB_PURE_KELLY_MAX_FRAC`: `0.30 -> 0.10`
+  - `BB_PURE_KELLY_TIER2_MAX_FRAC`: `0.10 -> 0.06`
+  - `BB_PURE_KELLY_TIER3_MAX_FRAC`: `0.05 -> 0.03`
+- Added focused tests:
+  - `tests/test_sell_helper.py`
+  - `tests/test_mfe_trail.py`
+
+### Commands
+```text
+python -m py_compile scripts\bb_pure_log_mine.py
+python scripts\bb_pure_log_mine.py --since "2026-04-30 00:00:00" --out docs\bb_pure_trades_2026_05_01.md --csv docs\bb_pure_trades_2026_05_01.csv
+python -m py_compile sell_safety.py protective_math.py scripts\bb_pure_log_mine.py polymarket_copy_engine.py user_config.py
+python -m pytest tests\test_sell_helper.py tests\test_mfe_trail.py -q
+python -m pytest tests\test_sell_helper.py tests\test_mfe_trail.py tests\test_bb_pure.py -q
+nssm status BTCBiasEngine
+```
+
+### Results
+- BB_PURE log miner parsed `32557` events and reconstructed `41` entries.
+- Focused tests: `8 passed`.
+- Focused + existing BB_PURE tests: `33 passed`.
+- Service remains `SERVICE_STOPPED`.
+
+### Next
+- Review the sell-cap integration before any live restart.
+- If accepted, stage/commit this implementation.
+- Live restart remains gated on explicit user approval with the `-$30` kill-switch posture from the plan.
+
+### Guardrails
+- No live restart performed.
+- `scripts/kalshi_session_replay.py` remains unrelated/untracked and was not touched.
+- BB_PURE log-mined exits are heuristic because some exit log lines are tickerless; report is calibration evidence, not accounting truth.
+
+---
+
 ## 2026-04-26 16:28 PT - Codex
 
 ### Trigger
