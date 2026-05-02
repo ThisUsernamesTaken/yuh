@@ -13868,6 +13868,33 @@ class PolymarketCopyEngine:
         target_state = "tp" if bid > entry else "sl"
         target_px = tp_target if target_state == "tp" else max(1, min(99, entry - sl_offset))
 
+        # 2026-05-01 MID-TRADE BTC VELOCITY SL: if BTC is moving sharply
+        # against our position right now (faster than the entry-time
+        # velocity gate), force SL state regardless of bid level. This
+        # catches the "BTC just turned" moment before bid catches up.
+        try:
+            pf_btc = getattr(self, "_price_feed", None)
+            tt_btc = getattr(pf_btc, "tick_tracker", None) if pf_btc else None
+            if tt_btc is not None and not getattr(tt_btc, "is_stale", True):
+                _btc_vel = float(getattr(tt_btc, "tick_velocity", 0.0) or 0.0)
+                _adverse_thresh = float(_uc("PROTECTIVE_MID_TRADE_ADVERSE_VEL", 10.0))
+                _adverse = (
+                    (side == "yes" and _btc_vel <= -_adverse_thresh)
+                    or (side == "no" and _btc_vel >= _adverse_thresh)
+                )
+                if _adverse and target_state != "sl":
+                    logger.warning(
+                        "PROTECTIVE MID-TRADE-SL: BTC vel=%+.1f adverse "
+                        "(threshold=±%.1f) — forcing SL exit on %s "
+                        "position despite bid=%dc above entry-%dc",
+                        _btc_vel, _adverse_thresh, side.upper(),
+                        bid, sl_offset,
+                    )
+                    target_state = "sl"
+                    target_px = max(1, min(99, entry - sl_offset))
+        except Exception as _mte:
+            logger.debug("Mid-trade BTC velocity SL check failed: %s", _mte)
+
         cur_id = pos.get("_protective_order_id")
         cur_px = int(pos.get("_protective_order_px", 0) or 0)
         cur_count = int(pos.get("_protective_order_count", 0) or 0)

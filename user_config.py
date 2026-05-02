@@ -422,7 +422,21 @@ BOOK_DENSITY_MAX_OPP_DOMINANCE   = 4.0    # Block if opp_density > X * same_dens
 # ── Phase 4: Protective-order mode ─────────────────────────────────────
 PROTECTIVE_ORDER_MODE            = True   # Replaces bid-check stop entirely
 PROTECTIVE_TP_OFFSET_C           = 5      # TP price = entry + this
-PROTECTIVE_SL_OFFSET_C           = 8      # SL price = entry - this
+PROTECTIVE_SL_OFFSET_C           = 5      # SL price = entry - this
+                                          # 2026-05-01 PT: tightened from
+                                          # 8 → 5 per user. MFE/MAE data:
+                                          # successful trades had 1-2c
+                                          # adverse drawdown; losers had
+                                          # 8-47c. 5c trigger catches
+                                          # losers ~3c earlier with
+                                          # cross-spread execution.
+# Mid-trade BTC velocity SL (2026-05-01): force SL state regardless of
+# bid if BTC is moving sharply against our position. Catches "BTC just
+# reversed" moment before contract bid catches up.
+PROTECTIVE_MID_TRADE_ADVERSE_VEL  = 10.0   # $/sec adverse threshold.
+                                           # Higher than entry gate
+                                           # (5 $/s) — only trips on
+                                           # decisive mid-trade reversal.
 PROTECTIVE_REPLAN_DEBOUNCE_S     = 2.0    # Min seconds between cancel+replace
 PROTECTIVE_PRE_EXPIRY_FORCE_S    = 60     # Force market sell when remaining < this
 
