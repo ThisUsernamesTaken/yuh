@@ -234,6 +234,126 @@ def test_strong_absorption_pattern_full():
 # ── Tonight's actual loser scenario ──────────────────────────────────────
 
 
+# ── Exit-side: compute_exit_pressure_snapshot ────────────────────────────
+
+
+from tape_pressure import (
+    ExitPressureSnapshot,
+    compute_exit_pressure_snapshot,
+    evaluate_exit_signal,
+)
+
+
+def _ex_trade(t_offset_s: float, side: str, count: int, yes_px: int):
+    """Trade with timestamp offset from a reference now_ms."""
+    NOW_MS = 1_500_000_000_000
+    return (NOW_MS + int(t_offset_s * 1000), side, count, yes_px)
+
+
+def test_exit_snapshot_yes_holder_aggregates_no_pressure():
+    """Holding YES, NO buys are the opposite-side pressure."""
+    NOW_MS = 1_500_000_000_000
+    trades = [
+        _ex_trade(-5, "no", 500, 30),    # $350 no buy in last 5s
+        _ex_trade(-10, "no", 300, 30),   # $210 no buy 10s ago
+        _ex_trade(-15, "yes", 100, 30),  # $30 yes buy 15s ago — within 30s
+        _ex_trade(-40, "no", 1000, 30),  # outside 30s window — exclude
+    ]
+    snap = compute_exit_pressure_snapshot(
+        trades=trades,
+        holding_side="yes",
+        now_ms=NOW_MS,
+        window_s=30.0,
+        large_buy_usd=100.0,
+    )
+    assert snap.holding_side == "yes"
+    assert snap.opposite_side == "no"
+    # NO buys at yes_px=30 → no_dollars per ct = 0.70
+    # 500 × 0.70 + 300 × 0.70 = 350 + 210 = 560
+    assert snap.opposite_dollars == 560.0
+    # 100 × 0.30 = 30
+    assert snap.our_side_dollars == 30.0
+    # Both NO buys ≥ $100
+    assert snap.opposite_large_count == 2
+    assert snap.sample_count == 3
+
+
+def test_exit_snapshot_no_holder_aggregates_yes_pressure():
+    """Holding NO, YES buys are the opposite-side pressure."""
+    NOW_MS = 1_500_000_000_000
+    trades = [
+        _ex_trade(-5, "yes", 1000, 60),  # $600 yes buy
+        _ex_trade(-10, "no", 200, 60),   # $80 no buy
+    ]
+    snap = compute_exit_pressure_snapshot(
+        trades=trades,
+        holding_side="no",
+        now_ms=NOW_MS,
+        window_s=30.0,
+    )
+    assert snap.opposite_side == "yes"
+    assert snap.opposite_dollars == 600.0
+    assert snap.our_side_dollars == 80.0
+
+
+def test_exit_snapshot_unknown_side_is_safe_default():
+    snap = compute_exit_pressure_snapshot(
+        trades=[],
+        holding_side="banana",
+        now_ms=1_500_000_000_000,
+    )
+    assert snap.holding_side == ""
+    assert snap.opposite_dollars == 0.0
+
+
+# ── Exit-side: evaluate_exit_signal ──────────────────────────────────────
+
+
+def _exit_snap(holding, opp, our_d, opp_d, opp_lc, n=10):
+    return ExitPressureSnapshot(
+        holding_side=holding, opposite_side=opp,
+        our_side_dollars=our_d, opposite_dollars=opp_d,
+        opposite_large_count=opp_lc, sample_count=n,
+    )
+
+
+def test_exit_when_massive_opposite_flow():
+    """User's pattern: holding YES, big wave of NO buys hits."""
+    snap = _exit_snap("yes", "no", our_d=50, opp_d=600, opp_lc=4)
+    assert evaluate_exit_signal(snap) == "exit"
+
+
+def test_hold_when_opposite_below_threshold():
+    """$200 of opposite flow isn't 'massive' (threshold default 300)."""
+    snap = _exit_snap("yes", "no", our_d=50, opp_d=200, opp_lc=2)
+    assert evaluate_exit_signal(snap, massive_volume_usd=300) == "hold"
+
+
+def test_hold_when_dominance_too_low():
+    """$400 opposite vs $200 our-side = 2x ratio < 3.0 default → hold."""
+    snap = _exit_snap("yes", "no", our_d=200, opp_d=400, opp_lc=3)
+    assert evaluate_exit_signal(snap, dominance_ratio=3.0) == "hold"
+
+
+def test_hold_when_only_one_large_buy():
+    """Single $500 print isn't 'sustained' — could be noise."""
+    snap = _exit_snap("yes", "no", our_d=20, opp_d=500, opp_lc=1)
+    assert evaluate_exit_signal(snap, min_large_count=2) == "hold"
+
+
+def test_exit_when_our_side_dollars_zero():
+    """If our side is zero, dominance ratio is infinite → only the
+    threshold and consistency checks need to pass."""
+    snap = _exit_snap("yes", "no", our_d=0, opp_d=400, opp_lc=3)
+    assert evaluate_exit_signal(snap) == "exit"
+
+
+def test_hold_when_holder_invalid():
+    """Empty/invalid holding_side returns hold (defensive default)."""
+    snap = _exit_snap("", "", our_d=0, opp_d=10000, opp_lc=10)
+    assert evaluate_exit_signal(snap) == "hold"
+
+
 def test_tonight_24c_no_fade_would_be_blocked():
     """The actual losing fade from 2026-05-02 01:31 PT.
 

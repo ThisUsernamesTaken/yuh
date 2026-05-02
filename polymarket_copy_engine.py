@@ -14301,6 +14301,55 @@ class PolymarketCopyEngine:
         except Exception as _mte:
             logger.debug("Mid-trade BTC velocity SL check failed: %s", _mte)
 
+        # 2026-05-02 Phase 8b — TAPE EXIT-PRESSURE (shadow mode).
+        # User: "massive volume to the opposite direction is also an
+        # indicator to exit." Symmetric to the entry absorption signal
+        # but on a much shorter window — recent 30s opposite-side flow.
+        # When smart money suddenly aggresses against our side, the
+        # thesis is broken before bid catches up.
+        try:
+            tape_x = getattr(self, "_kalshi_tape", None)
+            if (tape_x is not None
+                    and bool(_uc("BB_PURE_TAPE_EXIT_SHADOW_ENABLED", True))):
+                from tape_pressure import (
+                    compute_exit_pressure_snapshot,
+                    evaluate_exit_signal,
+                )
+                _trades_dq_x = tape_x._trades.get(ticker)
+                _trades_list_x = list(_trades_dq_x) if _trades_dq_x else []
+                _ex_snap = compute_exit_pressure_snapshot(
+                    trades=_trades_list_x,
+                    holding_side=side,
+                    now_ms=int(time.time() * 1000),
+                    window_s=float(_uc("BB_PURE_TAPE_EXIT_WINDOW_S", 30.0)),
+                    large_buy_usd=float(_uc("BB_PURE_TAPE_LARGE_BUY_USD", 100.0)),
+                )
+                _exit_decision = evaluate_exit_signal(
+                    _ex_snap,
+                    massive_volume_usd=float(_uc("BB_PURE_TAPE_EXIT_MASSIVE_USD", 300.0)),
+                    dominance_ratio=float(_uc("BB_PURE_TAPE_EXIT_DOM_RATIO", 3.0)),
+                    min_large_count=int(_uc("BB_PURE_TAPE_EXIT_MIN_LARGE", 2)),
+                )
+                if _exit_decision == "exit":
+                    logger.warning(
+                        "PROTECTIVE TAPE-EXIT-SHADOW [%s]: holding=%s "
+                        "opp_$=%.0f our_$=%.0f opp_lc=%d (window=%ds) "
+                        "— %s",
+                        ticker[-15:], side.upper(),
+                        _ex_snap.opposite_dollars, _ex_snap.our_side_dollars,
+                        _ex_snap.opposite_large_count,
+                        int(_uc("BB_PURE_TAPE_EXIT_WINDOW_S", 30.0)),
+                        "GATE-LIVE: forcing SL"
+                        if bool(_uc("BB_PURE_TAPE_EXIT_GATE_ENABLED", False))
+                        else "shadow only, no action",
+                    )
+                    if (bool(_uc("BB_PURE_TAPE_EXIT_GATE_ENABLED", False))
+                            and target_state != "sl"):
+                        target_state = "sl"
+                        target_px = max(1, min(99, entry - sl_offset))
+        except Exception as _tex:
+            logger.debug("Tape exit-pressure check failed: %s", _tex)
+
         cur_id = pos.get("_protective_order_id")
         cur_px = int(pos.get("_protective_order_px", 0) or 0)
         cur_count = int(pos.get("_protective_order_count", 0) or 0)

@@ -717,6 +717,22 @@ BB_PURE_TAPE_BTC_DEAD_ZONE_USD       = 20.0   # |BTC 5m change| ≤ this
 KALSHI_TAPE_RETENTION_S              = 360.0  # 6 min — covers 5-min
                                               # window with buffer
 
+# 2026-05-02 Phase 8b — TAPE EXIT-PRESSURE (massive opposite flow = exit).
+# User: "massive volume to the opposite direction is also an indicator to
+# exit." Symmetric to the entry absorption signal but on a 30s reactive
+# window. When smart money aggresses against our side, bail before the
+# bid catches up.
+BB_PURE_TAPE_EXIT_SHADOW_ENABLED     = True   # log shadow decisions
+BB_PURE_TAPE_EXIT_GATE_ENABLED       = False  # actually force SL on exit
+                                              # (start False — shadow first)
+BB_PURE_TAPE_EXIT_WINDOW_S           = 30.0   # how recent the spike must be
+BB_PURE_TAPE_EXIT_MASSIVE_USD        = 300.0  # min $ on opposite side to
+                                              # call it "massive"
+BB_PURE_TAPE_EXIT_DOM_RATIO          = 3.0    # opp $ ≥ N × our $ (one-
+                                              # sided flow)
+BB_PURE_TAPE_EXIT_MIN_LARGE          = 2      # ≥ N large opposite buys
+                                              # (sustained, not single)
+
 # ── Post-close residual sweep (Claude 2026-04-29 per user) ────────────────
 # After every TA_FORCED / LATE_DOMINANT / SR_FADE close, poll Kalshi
 # positions every POST_CLOSE_RESIDUAL_POLL_S seconds for

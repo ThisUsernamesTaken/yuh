@@ -202,3 +202,122 @@ def evaluate_tape_decision(
     if side_l == snapshot.inverse_trend_side:
         return "confirm"
     return "block"
+
+
+# ── Exit-side detection (Phase 8b) ───────────────────────────────────────
+# User: "massive volume to the opposite direction is also an indicator to
+# exit." Symmetric to entry absorption but on a much shorter window. While
+# entry looks at 5-min cumulative absorption, exit looks at 15-30s flow
+# spikes — when smart money suddenly sells our side aggressively, the
+# thesis is broken before the bid catches up.
+
+ExitDecision = Literal["exit", "hold"]
+
+
+@dataclass(frozen=True)
+class ExitPressureSnapshot:
+    holding_side: str               # "yes" or "no"
+    opposite_side: str              # the OTHER side (where adverse flow lives)
+    our_side_dollars: float         # buys on our side in window
+    opposite_dollars: float         # buys on opposite side in window
+    opposite_large_count: int       # # of opposite buys >= large_buy_usd
+    sample_count: int
+
+
+def compute_exit_pressure_snapshot(
+    trades: Iterable[tuple],
+    *,
+    holding_side: str,
+    now_ms: int,
+    window_s: float = 30.0,
+    large_buy_usd: float = 100.0,
+) -> ExitPressureSnapshot:
+    """Aggregate recent tape on each side from the holder's perspective.
+
+    Trade format (from kalshi_tape): (ts_ms, side, count, yes_price_cents)
+    where side is the BUY-aggressor side.
+
+    For a holder of YES, the opposite side is NO; if NO buys spike, that
+    means aggressors are buying NO = selling-pressure on YES = thesis-
+    break signal.
+    """
+    side_l = (holding_side or "").lower()
+    if side_l not in ("yes", "no"):
+        # Defensive default — return all-zero snapshot
+        return ExitPressureSnapshot(
+            holding_side="", opposite_side="",
+            our_side_dollars=0.0, opposite_dollars=0.0,
+            opposite_large_count=0, sample_count=0,
+        )
+    opp_l = "no" if side_l == "yes" else "yes"
+    cutoff_ms = now_ms - int(window_s * 1000)
+
+    our_dollars = 0.0
+    opp_dollars = 0.0
+    opp_large = 0
+    samples = 0
+
+    for entry in trades:
+        try:
+            ts_ms, side, count, yes_px = entry
+        except (ValueError, TypeError):
+            continue
+        ts_ms = int(ts_ms or 0)
+        if ts_ms < cutoff_ms:
+            continue
+        s = (str(side) or "").lower()
+        if s not in ("yes", "no"):
+            continue
+        dollars = trade_dollar_value(s, count, yes_px)
+        if dollars <= 0:
+            continue
+        samples += 1
+        if s == side_l:
+            our_dollars += dollars
+        elif s == opp_l:
+            opp_dollars += dollars
+            if dollars >= large_buy_usd:
+                opp_large += 1
+
+    return ExitPressureSnapshot(
+        holding_side=side_l,
+        opposite_side=opp_l,
+        our_side_dollars=our_dollars,
+        opposite_dollars=opp_dollars,
+        opposite_large_count=opp_large,
+        sample_count=samples,
+    )
+
+
+def evaluate_exit_signal(
+    snapshot: ExitPressureSnapshot,
+    *,
+    massive_volume_usd: float = 300.0,
+    dominance_ratio: float = 3.0,
+    min_large_count: int = 2,
+) -> ExitDecision:
+    """Decide EXIT or HOLD based on opposite-side flow spike.
+
+    Three conditions to flag exit:
+      1. opposite_dollars >= massive_volume_usd  (real size, not noise)
+      2. opposite_dollars >= dominance_ratio × our_side_dollars
+                                                 (one-sided flow)
+      3. opposite_large_count >= min_large_count (sustained, not single)
+
+    Tighter than entry-confirm because exits are reactive — false-positives
+    cost realised P&L rather than just a missed entry.
+    """
+    if not snapshot.holding_side or not snapshot.opposite_side:
+        return "hold"
+    if snapshot.opposite_dollars < massive_volume_usd:
+        return "hold"
+    if snapshot.opposite_large_count < min_large_count:
+        return "hold"
+    # Dominance check: only meaningful if our_side has *some* volume; if
+    # our side is zero the ratio is infinite and the threshold check
+    # above is sufficient.
+    if snapshot.our_side_dollars > 0:
+        ratio = snapshot.opposite_dollars / snapshot.our_side_dollars
+        if ratio < dominance_ratio:
+            return "hold"
+    return "exit"
