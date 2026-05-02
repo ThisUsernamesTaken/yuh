@@ -14393,7 +14393,17 @@ class PolymarketCopyEngine:
             tp_ids.append(legacy_id)
         # Cancel resting ladder buy orders
         resting = self._open_position.get("_resting_buy_ids", [])
+        # 2026-05-02 Phase 0.1.4: also include the original entry order_id.
+        # Live test today: BB_PURE placed a 22ct maker buy that partial-
+        # filled 1ct. Engine treated that as the full position, exited
+        # the 1ct, but the rest of the 22ct buy kept RESTING on Kalshi.
+        # When BTC ticked through the bid again, 20 more contracts filled
+        # — a phantom new position the engine didn't initiate. Sweeping
+        # the entry order_id at close time eliminates that bug class.
+        entry_oid = self._open_position.get("order_id") or ""
         all_ids = tp_ids + resting
+        if entry_oid and entry_oid not in all_ids:
+            all_ids.append(entry_oid)
 
         all_ok = True
         for oid in all_ids:
@@ -14415,6 +14425,41 @@ class PolymarketCopyEngine:
                 else:
                     logger.warning("CopyEngine: cancel %s FAILED — %s", oid[:12], e)
                     all_ok = False
+
+        # 2026-05-02 Phase 0.1.4: belt-and-suspenders — sweep ANY resting
+        # buy on this ticker via Kalshi truth. Catches buy orders placed
+        # by paths that didn't track the id in `order_id` or
+        # `_resting_buy_ids`. Sweep is best-effort; failures are logged
+        # but don't block the close path.
+        ticker = self._open_position.get("ticker", "") or ""
+        side = (self._open_position.get("side") or "").lower()
+        if ticker and side in ("yes", "no"):
+            try:
+                _data = await self._client._request(
+                    "GET", "/portfolio/orders",
+                    params={"status": "resting", "ticker": ticker, "limit": 50},
+                )
+                _resting_buys = [
+                    o for o in (_data.get("orders") or [])
+                    if (o.get("side") or "").lower() == side
+                    and (o.get("action") or "").lower() == "buy"
+                ]
+                for _o in _resting_buys:
+                    _oid = _o.get("order_id") or ""
+                    if not _oid or _oid in all_ids:
+                        continue
+                    try:
+                        await self._client.cancel_order(_oid)
+                        logger.warning(
+                            "CopyEngine ORPHAN-BUY SWEEP: cancelled %s on %s "
+                            "(side=%s, was resting at close-time)",
+                            _oid[:12], ticker, side,
+                        )
+                    except Exception:
+                        pass
+            except Exception as _e:
+                logger.warning("ORPHAN-BUY SWEEP query failed: %s", _e)
+
         self._open_position["_resting_buy_ids"] = []
         return all_ok
 

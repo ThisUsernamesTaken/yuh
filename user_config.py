@@ -488,7 +488,21 @@ BB_PURE_MODE                     = True   # 2026-04-30 PM: Session 2 wired
                                           # — bypasses composite cascade,
                                           # trades pure BB mispricing
 BB_PURE_MIN_EDGE_PP              = 8.0    # Min mispricing pp to fire
-BB_PURE_MAX_ENTRY_CENTS          = 70     # Don't enter above this price
+BB_PURE_MAX_ENTRY_CENTS          = 55     # 2026-05-02 Phase 0.1.5 (was 70):
+                                          # data-driven cap. Tonight's
+                                          # clean wins: 48c, 51c. Today's
+                                          # earlier wins: 26c, 30c, 32c.
+                                          # Today/yesterday's biggest
+                                          # losers (-$36, -$56, fade
+                                          # trades): 55-65c entries. The
+                                          # asymmetric payoff math says
+                                          # cheap entries dominate; mid-
+                                          # priced entries (56-70c) are
+                                          # where the engine reliably
+                                          # loses money. Cap at 55 keeps
+                                          # the cheap-side bias without
+                                          # forcing 35c (which the alpha
+                                          # table didn't have data for).
 BB_PURE_MIN_ENTRY_CENTS          = 5      # Don't fire on dust prices
 BB_PURE_MIN_TIME_REMAINING_S     = 60.0   # No new entries within last minute
 BB_PURE_KELLY_FRACTION           = 0.25   # Quarter-Kelly base (matches existing

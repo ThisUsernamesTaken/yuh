@@ -225,6 +225,43 @@ def test_reason_contains_diagnostics():
     assert "kelly=" in r
 
 
+# ── 2026-05-02 Phase 0.1.5: cheap-side primary cap ──────────────────────
+
+
+def test_max_entry_55c_blocks_56c_yes_entry():
+    """Phase 0.1.5: with the 55c cap, a 56c YES entry must be blocked
+    even with strong edge. Catches the mid-priced-entry loser pattern."""
+    # market=56, fair=80 → 24pp edge, but entry would be 56c
+    sig = _eval(market=56, fair=80, max_entry_cents=55)
+    assert sig is None
+
+
+def test_max_entry_55c_passes_55c_yes_entry():
+    """At the cap, the entry should still fire."""
+    sig = _eval(market=55, fair=78, max_entry_cents=55)
+    assert sig is not None
+    assert sig.side == "yes"
+    assert sig.suggested_entry_cents == 55
+
+
+def test_max_entry_55c_passes_no_at_45c():
+    """No-side entry where 100-market = 45c is well within the cap."""
+    # market=55 → buying NO at 45c. fair=30 means YES is overpriced.
+    sig = _eval(market=55, fair=30, max_entry_cents=55)
+    assert sig is not None
+    assert sig.side == "no"
+    assert sig.suggested_entry_cents == 45
+
+
+def test_max_entry_55c_blocks_no_at_60c():
+    """No at 60c (market=40, buy NO at 100-40=60) blocked by 55 cap."""
+    sig = _eval(market=40, fair=70, max_entry_cents=55)
+    # market=40 buys YES at 40c, well below cap → fires YES
+    # Need market=40 fair=10 to trigger NO buy at 60c
+    sig = _eval(market=40, fair=10, max_entry_cents=55)
+    assert sig is None  # NO entry would be at 60c, blocked
+
+
 # ── Founding-doc canonical example ──────────────────────────────────────
 # "if the script says 60% probability but the market is trading at 80
 # cents, the contract is overpriced" → buy NO at 20c.
