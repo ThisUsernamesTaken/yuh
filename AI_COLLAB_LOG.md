@@ -3833,14 +3833,22 @@ Phase 3 MFE trail + reduced sizing + −$30 kill-switch.
    Phase 6 (asymmetric vol gate, stricter when fading WITH trend) was never
    shipped — it's the rule that should block exactly this kind of trade.
 
-### NEW USER DIRECTIVE — one trade per session
+### NEW USER DIRECTIVE — one trade per 15-min session
 
 > User (2026-05-01 23:55 PT): "limit to one trade, per session"
+> Clarification (2026-05-02 00:05 PT): "I meant 15 minut session, engine should be active continuosly"
 
-This is now a **hard rule**. Once a ticker has had any fill in the current
-15-min window, no further entries on that ticker for the rest of the window.
-The intent: prevent same-ticker re-entry / opposite-side fade after a clean
-exit, even when fair value flips.
+This is now a **hard rule**. Once a ticker has had any **engine** fill in the
+current 15-min window, no further engine entries on that ticker for the rest
+of the window. The intent: prevent same-ticker re-entry / opposite-side fade
+after a clean exit, even when fair value flips.
+
+**Critical clarification**: the engine stays **continuously active** across all
+windows. The lock is per-ticker (= per-15-min-session), NOT global. When a
+window flips, the new ticker has no lock and trading resumes immediately. The
+engine should run 24/7 with the per-window lock as the only entry constraint.
+
+User manual trades are not affected — they can happen on any ticker any time.
 
 This subsumes some of today's pain:
 - Eliminates the post-exit fade pattern (lost $5 today, $80+ earlier)

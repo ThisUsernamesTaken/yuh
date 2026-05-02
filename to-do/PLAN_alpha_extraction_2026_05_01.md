@@ -16,7 +16,18 @@
 4. P&L kill-switch: if any single phase produces > $30 net loss in its first live session, **rollback the feature flag** and re-validate.
 5. Each phase ships on its own commit. No bundled feature ships.
 6. **Sizing reduction is bundled with the first live restart** (see "Sizing reduction" below). The first live test validates Phase 0 safety + Phase 3 MFE trail under reduced size, not pre-restart size.
-7. **HARD RULE (added 2026-05-01 23:55 PT after live test): one trade per session per ticker.** Once a ticker has had any fill in the current 15-min window, no further entries on that ticker for the rest of the window. Lock must persist across engine restarts.
+7. **HARD RULE (added 2026-05-01 23:55 PT, clarified 2026-05-02 00:05 PT): one trade per 15-min window (ticker).** Once a ticker has had any engine fill in the current 15-min window, no further engine entries on that ticker for the rest of the window. **The engine remains continuously active across all windows** — when the window flips, the new ticker is unlocked and trading resumes immediately. The lock is per-ticker (= per-15-min-session), NOT global. Lock must persist across engine restarts so a mid-window restart can't re-enter a ticker we already traded.
+
+   **What this rules out (engine-side):**
+   - Same-ticker re-entry on opposite side after a clean exit (tonight's −$5 fade)
+   - Pyramiding adds on the same ticker
+   - Stop-loss → re-buy → stop-loss cycles within one window
+
+   **What stays allowed:**
+   - Engine entries on each new window's new ticker (24/7 operation)
+   - User manual trades on any ticker, any time (no engine-side block on user actions)
+   - Engine re-pegging the SINGLE protective sell as the trade evolves
+   - Engine flattening residual positions on the locked ticker (cleanup is exit-side, not entry-side)
 
 ---
 
