@@ -25,6 +25,7 @@ import asyncio
 import json
 import logging
 import math
+import os
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
@@ -564,6 +565,66 @@ class PolymarketCopyEngine:
     Kalshi's current pricing.
     """
 
+    # 2026-05-02 Phase 0.1.2: per-window ticker lock persistence path.
+    _SESSION_LOCK_PATH = os.path.join("data", "session_state.json")
+    _SESSION_LOCK_MAX_AGE_S = 900  # one Kalshi 15-min window
+
+    def _load_session_lock(self) -> set:
+        """Load `_entered_tickers_this_window` from disk if recent.
+
+        Lock auto-expires after 15 minutes (one window). If the saved
+        timestamp is older, return an empty set — the window has rotated
+        and the lock no longer applies.
+        """
+        try:
+            import json
+            if not os.path.exists(self._SESSION_LOCK_PATH):
+                return set()
+            with open(self._SESSION_LOCK_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            saved_at = float(data.get("saved_at_ms", 0)) / 1000.0
+            if not saved_at or (time.time() - saved_at) > self._SESSION_LOCK_MAX_AGE_S:
+                return set()
+            tickers = data.get("tickers", []) or []
+            restored = set(t for t in tickers if isinstance(t, str) and t)
+            if restored:
+                logger.warning(
+                    "SESSION-LOCK: restored %d ticker(s) from disk: %s "
+                    "(age=%.0fs)",
+                    len(restored), ", ".join(sorted(restored))[:200],
+                    time.time() - saved_at,
+                )
+            return restored
+        except Exception as _e:
+            logger.warning("SESSION-LOCK load failed: %s", _e)
+            return set()
+
+    def _persist_session_lock(self) -> None:
+        """Write `_entered_tickers_this_window` to disk with timestamp.
+
+        Must be called every time a ticker is added so a restart 1ms
+        later restores the same lock state.
+        """
+        try:
+            import json
+            os.makedirs(os.path.dirname(self._SESSION_LOCK_PATH), exist_ok=True)
+            payload = {
+                "saved_at_ms": int(time.time() * 1000),
+                "tickers": sorted(self._entered_tickers_this_window),
+            }
+            with open(self._SESSION_LOCK_PATH, "w", encoding="utf-8") as f:
+                json.dump(payload, f)
+        except Exception as _e:
+            logger.warning("SESSION-LOCK persist failed: %s", _e)
+
+    def _add_session_lock(self, ticker: str) -> None:
+        """Add a ticker to the window-lock set AND persist to disk."""
+        try:
+            self._entered_tickers_this_window.add(ticker)
+            self._persist_session_lock()
+        except Exception:
+            pass
+
     def __init__(
         self,
         kalshi_client,
@@ -640,7 +701,12 @@ class PolymarketCopyEngine:
         # Independent of `_trades_this_window` counter (which has had reset
         # bugs in the past). Any ticker we've entered is permanently locked
         # out for the remainder of its 15-min life. Cleared on new-window.
-        self._entered_tickers_this_window: set = set()
+        # 2026-05-02 Phase 0.1.2: persist across engine restarts. Live test
+        # 01:35 PT showed the engine restart at 01:33 cleared this set,
+        # allowing a 3rd entry on the same locked ticker. State now persists
+        # to data/session_state.json with a saved_at timestamp; on startup
+        # we restore tickers if the file is < 15 min old (one window).
+        self._entered_tickers_this_window: set = self._load_session_lock()
 
         # 2026-04-29 GHOST-bug fix #5: track per-ticker order PLACEMENT
         # timestamps. _entered_tickers_this_window only fills AFTER fill
@@ -5308,6 +5374,9 @@ class PolymarketCopyEngine:
                 self._trend_trades_this_window = 0
                 self._ta_trades_this_window = 0
                 self._entered_tickers_this_window = set()  # 2026-04-22 per-window lock
+                # 2026-05-02 Phase 0.1.2: persist the cleared state so a
+                # restart immediately after window flip starts fresh too.
+                self._persist_session_lock()
                 self._bb_pure_fires_this_window = 0  # 2026-05-01 per-window fire cap
                 self._cap_logged_this_window = False
                 self._range_skip_logged = False
@@ -8532,7 +8601,7 @@ class PolymarketCopyEngine:
         try:
             _upg_ticker = pos.get("ticker") if isinstance(pos, dict) else None
             if _upg_ticker:
-                self._entered_tickers_this_window.add(_upg_ticker)
+                self._add_session_lock(_upg_ticker)
         except Exception:
             pass
 
@@ -9147,10 +9216,9 @@ class PolymarketCopyEngine:
         # before await place_order). Set BEFORE the await so subsequent
         # cycles see the lock immediately. Set AFTER gate-blocks so a
         # blocked attempt doesn't permanently lock the window.
-        try:
-            self._entered_tickers_this_window.add(ticker)
-        except Exception:
-            pass
+        # 2026-05-02 Phase 0.1.2: persist to disk so engine restarts
+        # mid-window don't clear the lock.
+        self._add_session_lock(ticker)
         try:
             self._recent_placement_tickers[ticker] = time.time()
         except Exception:
@@ -9253,10 +9321,8 @@ class PolymarketCopyEngine:
             "_bb_pure_edge_pp_at_entry": sig.edge_pp,
             "_bb_pure_conviction_tier": int(getattr(sig, "conviction_tier", 1)),
         }
-        try:
-            self._entered_tickers_this_window.add(ticker)
-        except Exception:
-            pass
+        # 2026-05-02 Phase 0.1.2: defensive re-add via persist helper.
+        self._add_session_lock(ticker)
 
         # ── COUNT-POLL FOR TRUTH (2026-05-01) ──────────────────────────────
         # `order.filled_count` returns the partial-fill snapshot at the
@@ -12039,10 +12105,7 @@ class PolymarketCopyEngine:
                 self._trades_this_window += 1
                 # 1-per-window ticker lock (2026-04-21): populate set so _evaluate_ta_forced_signal
                 # short-circuits any future entry attempt on this ticker this window.
-                try:
-                    self._entered_tickers_this_window.add(contract.ticker)
-                except Exception:
-                    pass
+                self._add_session_lock(contract.ticker)
                 # Phase F: if this was an SR_FADE fire, activate the mutex
                 # — DOMINANT and TA_FORCED both stand down for the session.
                 if signal.signal_tier == "SR_FADE":
@@ -18509,10 +18572,7 @@ class PolymarketCopyEngine:
                                     )
                             # Add to entered set so stop-loss path doesn't
                             # treat this as a foreign position
-                            try:
-                                self._entered_tickers_this_window.add(ticker)
-                            except Exception:
-                                pass
+                            self._add_session_lock(ticker)
                             _sync_handled_this_iter = True
                         else:
                             # Case B: truly orphaned — do not touch.
