@@ -593,6 +593,16 @@ BB_PURE_BTC_ADVERSE_VEL              = 5.0    # $/s threshold. If BTC
                                               # the price_feed default
                                               # (~30s typically).
 
+# BTC stability gate (2026-05-01 evening): require BTC to be in a tight
+# range over the last N seconds before firing. MFE/MAE analysis showed
+# successful entries had ~1-2c adverse drawdown; failed entries drew
+# down 8-47c. The latter happened during BTC trends, not chop. Wait
+# for chop = wait for the trend to exhaust.
+BB_PURE_BTC_STABILITY_WINDOW_S       = 30.0   # Window to scan
+BB_PURE_BTC_STABILITY_MAX_RANGE      = 30.0   # Max BTC range ($) in
+                                              # the window. If exceeded,
+                                              # BTC is trending; skip.
+
 # ── Post-close residual sweep (Claude 2026-04-29 per user) ────────────────
 # After every TA_FORCED / LATE_DOMINANT / SR_FADE close, poll Kalshi
 # positions every POST_CLOSE_RESIDUAL_POLL_S seconds for

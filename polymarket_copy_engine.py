@@ -8877,6 +8877,36 @@ class PolymarketCopyEngine:
         if sig is None:
             return None
 
+        # 2026-05-01 BTC STABILITY GATE (added evening of session):
+        # MFE/MAE analysis showed: successful entries had small adverse
+        # drawdown (~1-2c). Failed entries drew down 8-47c before either
+        # recovering by luck or losing. The drawdown happens because we
+        # enter during a BTC trend that hasn't finished. Solution: require
+        # BTC to be in a TIGHT RANGE over recent N seconds before firing.
+        try:
+            pf_btc = getattr(self, "_price_feed", None)
+            tt_btc = getattr(pf_btc, "tick_tracker", None) if pf_btc else None
+            stab_window = float(_uc("BB_PURE_BTC_STABILITY_WINDOW_S", 30.0))
+            stab_max_range = float(_uc("BB_PURE_BTC_STABILITY_MAX_RANGE", 30.0))
+            if tt_btc is not None and not getattr(tt_btc, "is_stale", True):
+                _prices = getattr(tt_btc, "_prices", None)
+                if _prices and len(_prices) >= 5:
+                    _now = _prices[-1][0]
+                    _cutoff = _now - stab_window
+                    _recent = [p for ts, p in _prices if ts >= _cutoff]
+                    if len(_recent) >= 5:
+                        _btc_range = max(_recent) - min(_recent)
+                        if _btc_range > stab_max_range:
+                            logger.warning(
+                                "BB_PURE BTC-RANGE-BLOCK: BTC moved $%.0f in "
+                                "last %.0fs (max=$%.0f) — too volatile, "
+                                "skipping (waiting for chop)",
+                                _btc_range, stab_window, stab_max_range,
+                            )
+                            return None
+        except Exception as _se:
+            logger.debug("BB_PURE BTC stability check failed: %s", _se)
+
         # 2026-05-01 BTC VELOCITY GATE:
         # Contract price on Kalshi BTC binaries is pegged to BTC spot.
         # When BTC is moving AGAINST our FVG position (e.g. BTC dropping
