@@ -30,6 +30,20 @@ class _FakeClient:
         self._orders.append((ticker, side, price, count, action))
         return _FakeOrder("oid_" + ticker[:6], count)
 
+    async def _request(self, method, path, params=None, **_):
+        # 2026-05-01: sell-cap helper queries /portfolio/orders before
+        # placing. Tests assume no resting sells exist on the residual
+        # ticker, so return an empty orders list.
+        if path == "/portfolio/orders":
+            return {"orders": []}
+        return {}
+
+    async def cancel_order(self, order_id):
+        return True
+
+    async def get_order(self, order_id):
+        return _FakeOrder(order_id, 0)
+
 
 class _FakeOrder:
     def __init__(self, oid, fc):
