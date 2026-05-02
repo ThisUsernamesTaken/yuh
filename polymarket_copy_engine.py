@@ -19946,7 +19946,16 @@ class PolymarketCopyEngine:
             # entry; doubling-down on adverse moves is not part of its
             # thesis (which is mispricing convergence, not mean reversion
             # from drawdown). Same exclusion as SR_FADE.
+            # 2026-05-02 Phase 0.1.3: hard kill on SCALP DCA when not allowed.
+            # Live test 01:42 PT: a phantom position (from orphan-flatten
+            # residue) had strategy_name set to TA_FORCED (legacy default)
+            # and SCALP DCA fired on it, buying 60ct NO @ 2c on a ticker
+            # we'd already locked. The strategy-name gates below pass when
+            # strategy_name is missing or set to TA_FORCED — not what we
+            # want when BB_PURE_MODE is the only live strategy.
+            scalp_dca_globally_enabled = bool(_uc("SCALP_DCA_ENABLED", False))
             if (count > 0 and bid > 0
+                    and scalp_dca_globally_enabled
                     and pos.get("strategy_name") != "SR_FADE"
                     and pos.get("strategy_name") != "BB_PURE"
                     and not pos.get("_scalp_dca_fired", False)

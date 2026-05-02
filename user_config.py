@@ -1149,6 +1149,14 @@ TP_LAYERED_ENABLED = False
 TP_LAYER_BASE_FRACTION = 0.60
 TP_LAYER_STRETCH_CENTS = 5
 
+# 2026-05-02 Phase 0.1.3: hard kill on SCALP DCA when BB_PURE-only.
+# Live test 01:42 PT: SCALP DCA fired on a phantom position (orphan-flatten
+# residue with strategy_name=TA_FORCED) on a locked ticker, adding 60ct NO
+# @ 2c. The strategy_name-based gate ("not BB_PURE and not SR_FADE")
+# passed because the phantom didn't carry BB_PURE labels. Hard global kill
+# is the simplest fix while we're BB_PURE-only.
+SCALP_DCA_ENABLED = False
+
 # â”€â”€ Safety: oversell hardening umbrella (A6, 2026-04-22) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Master kill-switch for A2 (bool-returning cancel), A3 (gated DCA rebuild),
 # A4 (double-gated ticker lock), and A5 (residual reconciler). Default on.
