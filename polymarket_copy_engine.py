@@ -13798,13 +13798,67 @@ class PolymarketCopyEngine:
         reason: str,
         known_position_count: int | None = None,
     ):
-        """Place a sell capped to verified inventory not already resting."""
+        """Place a sell capped to verified inventory not already resting.
+
+        2026-05-02 Phase 0.1 hardening (after live test exposed pile-up bug
+        on the residual-flatten path):
+
+        Two new guards added before placement:
+
+        1. POSITION-ZERO GATE: if Kalshi truth says we hold zero contracts
+           on this side, never place a sell. Tonight's near-miss came from
+           _reconcile_residual_position calling here in a loop while
+           position was already flat — 11 sell orders piled up. With this
+           gate, the second call returns immediately.
+
+        2. OVERSELL-GUARD (>1 resting): if more than one resting sell
+           already exists for this ticker/side, cancel ALL of them and
+           abort this cycle. Mirrors the same logic
+           _maintain_protective_order got in commit 168dfd2. Per the
+           agreed scope, the residual-flatten path needs the same
+           protection.
+        """
         position_count = (
             int(known_position_count)
             if known_position_count is not None
             else await self._get_verified_side_position_count(ticker, side)
         )
+        # ── Guard 1: position-zero gate ──────────────────────────────────
+        # Never place a sell when the Kalshi-truth position is zero.
+        # When known_position_count is provided by a caller, trust it
+        # (e.g. residual-flatten passes the held_count it just observed).
+        # Otherwise we just queried Kalshi and zero is the truth.
+        if position_count <= 0:
+            logger.warning(
+                "%s SELL-CAP: blocked %s %s — position_count=0 (no sells when flat)",
+                reason, ticker, side.upper(),
+            )
+            return None, 0
+
         resting_orders = await self._fetch_resting_side_sells(ticker, side)
+        # ── Guard 2: OVERSELL-GUARD on >1 resting sells ──────────────────
+        # If more than one resting sell exists, cancel them all and abort.
+        # Never place on top of orphans. Next cycle re-evaluates from clean
+        # state.
+        if len(resting_orders) > 1:
+            logger.error(
+                "%s SELL-CAP OVERSELL-GUARD: %d resting sells on %s side=%s "
+                "(should be ≤1) — cancelling ALL and aborting cycle",
+                reason, len(resting_orders), ticker, side,
+            )
+            for _o in resting_orders:
+                _oid = _o.get("order_id") or ""
+                if not _oid:
+                    continue
+                try:
+                    await self._client.cancel_order(_oid)
+                except Exception as _e:
+                    logger.warning(
+                        "%s SELL-CAP OVERSELL-GUARD: cancel %s raised: %s",
+                        reason, _oid[:12], _e,
+                    )
+            return None, 0
+
         resting_count = resting_sell_count(resting_orders, side)
         capped_count = cap_sell_count(position_count, resting_count, requested_count)
         if capped_count <= 0:
@@ -18611,13 +18665,28 @@ class PolymarketCopyEngine:
                                     _unfilled, _tier_px, bid,
                                 )
                                 try:
+                                    # 2026-05-02 Phase 0.1: route through
+                                    # _place_capped_side_sell instead of direct
+                                    # place_order. The helper enforces:
+                                    #   - position-zero gate (no sells when flat)
+                                    #   - >1 resting OVERSELL-GUARD
+                                    #   - Kalshi-truth inventory cap
+                                    # Tonight's −$5 fade was caused by this path
+                                    # bypassing all three: stale tp_order_ids
+                                    # triggered TIER RETRY after position closed,
+                                    # the place_order short-sold YES and atomically
+                                    # opened a synthetic NO long.
                                     await self._client.cancel_order(oid)
                                     _retry_px = min(int(bid) + 1, 95)
-                                    _retry_order = await self._client.place_order(
-                                        ticker=pos["ticker"], side=pos["side"],
-                                        price=_retry_px, count=_unfilled, action="sell",
+                                    _retry_order, _retry_count = await self._place_capped_side_sell(
+                                        ticker=pos["ticker"],
+                                        side=pos["side"],
+                                        price=_retry_px,
+                                        requested_count=_unfilled,
+                                        post_only=True,
+                                        reason="TIER-RETRY",
                                     )
-                                    if _retry_order and _retry_order.order_id:
+                                    if _retry_order and getattr(_retry_order, "order_id", None):
                                         pos["tp_order_ids"].append(_retry_order.order_id)
                                         still_resting.remove(oid)
                                         still_resting.append(_retry_order.order_id)
@@ -18666,16 +18735,25 @@ class PolymarketCopyEngine:
                         except Exception:
                             pass
                         if _actual_remaining > 0:
-                            # Market sell at current bid — take what the market gives
+                            # Market sell at current bid — take what the market gives.
+                            # 2026-05-02 Phase 0.1: route through the safe helper so
+                            # the position-zero gate and >1 OVERSELL-GUARD apply here
+                            # too. Belt-and-suspenders with the _actual_remaining
+                            # check above.
                             _book = await self._client.get_orderbook(pos["ticker"])
                             _cur_bid = _book.best_yes_bid if pos["side"] == "yes" else _book.best_no_bid
                             if _cur_bid and _cur_bid > 0:
                                 try:
-                                    _sweep = await self._client.place_order(
-                                        ticker=pos["ticker"], side=pos["side"],
-                                        price=max(int(_cur_bid), 1), count=int(_actual_remaining), action="sell",
+                                    _sweep, _sweep_count = await self._place_capped_side_sell(
+                                        ticker=pos["ticker"],
+                                        side=pos["side"],
+                                        price=max(int(_cur_bid), 1),
+                                        requested_count=int(_actual_remaining),
+                                        post_only=False,
+                                        reason="SWEEP-SELL",
+                                        known_position_count=int(_actual_remaining),
                                     )
-                                    _swept = _sweep.filled_count if _sweep else 0
+                                    _swept = getattr(_sweep, "filled_count", 0) if _sweep else 0
                                     if _swept > 0:
                                         _sweep_pnl = (_cur_bid - entry) * _swept / 100.0
                                         logger.warning(

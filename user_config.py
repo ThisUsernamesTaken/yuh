@@ -558,6 +558,22 @@ BB_PURE_MAX_FIRES_PER_WINDOW         = 99    # 2026-05-01 PT: lifted from 2.
                                               # entries OK as long as we have
                                               # 7+ min runway and the new SL
                                               # path actually executes losers.
+                                              # NOTE: per-ticker is still
+                                              # capped via _entered_tickers_this_window
+                                              # (= MAX_TRADES_PER_SESSION_TICKER)
+                                              # — this counts ALL fires across
+                                              # all tickers within a window.
+# 2026-05-02 user directive after live test: "limit to one trade per session"
+# where session = one 15-min window = one ticker. Once the engine has any fill
+# on a ticker, no further engine entries on that ticker until the window flips
+# (auto-resets per ticker). The engine remains continuously active across all
+# windows. Lock is enforced at the BB_PURE preflight site via
+# _entered_tickers_this_window membership check.
+MAX_TRADES_PER_SESSION_TICKER        = 1     # Hard cap: one engine entry per
+                                              # 15-min ticker / window. Engine
+                                              # runs continuously; lock auto-
+                                              # resets on window flip. User
+                                              # manual trades are not affected.
 BB_PURE_HARD_MIN_TIME_S              = 420.0 # 7 minutes (was 60s). After
                                               # this point in the window
                                               # there isn't enough runway
