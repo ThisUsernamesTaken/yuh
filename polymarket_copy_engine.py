@@ -13902,6 +13902,103 @@ class PolymarketCopyEngine:
         debounce = float(_uc("PROTECTIVE_REPLAN_DEBOUNCE_S", 2.0))
         now = time.time()
 
+        # ── 2026-05-01 OVERSELL POSTMORTEM HARDENING ──────────────────────
+        # Live oversell on -2230-30 today: 7 sell-no orders placed in 18s,
+        # 5 stale ones filled simultaneously at no=49c → atomic ~190ct
+        # YES synthetic short. Lost ~$39 in unwind plus $91 of residual
+        # exposure. Root cause: "atomic place-then-cancel" silently
+        # swallowed cancel failures. Stale orders piled up.
+        #
+        # New behavior: BEFORE placing anything, query Kalshi for ALL
+        # resting sell orders on this ticker/side. The Kalshi truth is
+        # authoritative — engine state may lag.
+        #   - 0 resting sells: normal place
+        #   - 1 resting sell matching desired (px, ct): adopt & return
+        #   - 1 resting sell mismatched: cancel-AND-VERIFY before place
+        #   - >1 resting sells: ABORT — cancel ALL, return False, let next
+        #     cycle re-evaluate from clean state. Never place on top of
+        #     orphaned sells.
+        try:
+            _resting_data = await self._client._request(
+                "GET", "/portfolio/orders",
+                params={
+                    "status": "resting",
+                    "ticker": ticker,
+                    "limit": 50,
+                },
+            )
+            _all_resting = _resting_data.get("orders", []) or []
+        except Exception as _e:
+            logger.error(
+                "PROTECTIVE preflight: failed to query resting orders for %s: %s "
+                "— skipping cycle (will retry, no place)",
+                ticker, _e,
+            )
+            return False
+        # Filter to sells on our side (defense against schema variation)
+        _our_sells = [
+            o for o in _all_resting
+            if (o.get("side") or "").lower() == side
+            and (o.get("action") or "").lower() == "sell"
+        ]
+        _resting_count = len(_our_sells)
+
+        # Hard cap: if MORE than 1 resting sell exists, that's the oversell
+        # precondition. Cancel them all and bail. Next cycle starts clean.
+        if _resting_count > 1:
+            logger.error(
+                "PROTECTIVE OVERSELL-GUARD: %d resting sells on %s side=%s "
+                "(should be ≤1) — cancelling ALL and aborting cycle",
+                _resting_count, ticker, side,
+            )
+            cancelled_all = True
+            for _o in _our_sells:
+                _oid = _o.get("order_id") or ""
+                if not _oid:
+                    continue
+                try:
+                    ok = await self._client.cancel_order(_oid)
+                    if not ok:
+                        cancelled_all = False
+                        logger.warning(
+                            "PROTECTIVE OVERSELL-GUARD: cancel %s returned False",
+                            _oid[:12],
+                        )
+                except Exception as _e:
+                    cancelled_all = False
+                    logger.warning(
+                        "PROTECTIVE OVERSELL-GUARD: cancel %s raised: %s",
+                        _oid[:12], _e,
+                    )
+            # Drop our local handle so next cycle starts fresh
+            pos["_protective_order_id"] = None
+            pos["_protective_order_px"] = 0
+            pos["_protective_order_count"] = 0
+            pos["_protective_last_replan_ts"] = now
+            return False  # skip placement this cycle; let next cycle decide
+
+        # Adopt the existing single resting order if it matches desired
+        if _resting_count == 1:
+            _o = _our_sells[0]
+            _oid = _o.get("order_id") or ""
+            _opx = int(_o.get("yes_price" if side == "yes" else "no_price", 0) or 0)
+            _oct = int(_o.get("remaining_count", _o.get("count", 0)) or 0)
+            # If the existing matches what we'd want, just return True
+            if _oid and _opx == target_px and _oct == truth_ct:
+                # Sync local state to truth and skip placement
+                pos["_protective_order_id"] = _oid
+                pos["_protective_order_px"] = _opx
+                pos["_protective_order_count"] = _oct
+                pos["_protective_order_state"] = target_state
+                pos["_protective_last_replan_ts"] = now
+                return True
+            # Else: there's exactly one resting sell, but it doesn't match
+            # our desired state. We'll cancel it FIRST (and verify), then
+            # place. cur_id local handle is overridden by the truth view.
+            cur_id = _oid or cur_id
+            cur_px = _opx if _opx else cur_px
+            cur_count = _oct if _oct else cur_count
+
         # Replan if: no order, state changed (px target moved), count changed
         needs_replan = (
             not cur_id
@@ -13913,15 +14010,51 @@ class PolymarketCopyEngine:
         if (now - last_replan_ts) < debounce and cur_id:
             return True  # debounce — don't churn
 
-        # 2026-05-01 ATOMIC PLACE-THEN-CANCEL:
-        # Old behavior cancelled the existing order BEFORE placing the new.
-        # If place failed (post_only cross, network error, etc.), the
-        # position was left naked and a subsequent retry could fill at any
-        # price and create oversells. New behavior: place new FIRST. Only
-        # if place succeeds, cancel the old. If place fails, old continues
-        # protecting. Brief window of two orders coexisting is acceptable —
-        # the count-poll OVERRUN check in the SYNC path catches doubles.
-        #
+        # 2026-05-01 CANCEL-FIRST-VERIFIED:
+        # Postmortem on today's oversell required reverting the old "place
+        # new first, then cancel old" pattern. The old pattern relied on
+        # cancel succeeding async-after-place — when cancels silently
+        # failed we got the 5-stale-sells pile-up. New pattern: cancel
+        # FIRST, verify the order is terminal via cancel_order's bool
+        # return + status check, only THEN place new.
+        if cur_id:
+            try:
+                cancel_ok = await self._client.cancel_order(cur_id)
+            except Exception as _e:
+                logger.error(
+                    "PROTECTIVE cancel %s raised: %s — aborting cycle "
+                    "(no place; next cycle re-evaluates)",
+                    (cur_id or "")[:12], _e,
+                )
+                return False
+            if not cancel_ok:
+                # cancel_order returned False — order may still be resting.
+                # Don't place a second one on top. Re-fetch to see if
+                # already terminal; if so, proceed to place. Otherwise abort.
+                try:
+                    _o = await self._client.get_order(cur_id)
+                    _status = (getattr(_o, "status", "") or "").lower()
+                    if _status in ("filled", "canceled", "cancelled", "expired", "terminal"):
+                        logger.info(
+                            "PROTECTIVE cancel %s returned False but order "
+                            "is %s — proceeding with place",
+                            cur_id[:12], _status,
+                        )
+                    else:
+                        logger.error(
+                            "PROTECTIVE cancel %s returned False AND order "
+                            "is still %s — aborting cycle to avoid oversell",
+                            cur_id[:12], _status or "unknown",
+                        )
+                        return False
+                except Exception as _e:
+                    logger.error(
+                        "PROTECTIVE cancel-verify get_order(%s) raised: %s "
+                        "— aborting cycle to avoid oversell",
+                        cur_id[:12], _e,
+                    )
+                    return False
+
         # 2026-05-01 SL EXECUTION FIX: when target_state is "sl" (bid has
         # already broken below entry), use post_only=False AND price at
         # the current bid (or bid-1) so the order CROSSES THE SPREAD and
@@ -13931,9 +14064,6 @@ class PolymarketCopyEngine:
         # so order never matched. Real SL must take liquidity, not provide
         # it.
         if target_state == "sl":
-            # Cross the spread at the current bid - 1c slippage allowance.
-            # bid is guaranteed > 0 (checked above). Sell at bid hits the
-            # buyer immediately.
             sl_exec_px = max(1, int(bid) - 1)
             sl_post_only = False
             place_px = sl_exec_px
@@ -13950,28 +14080,14 @@ class PolymarketCopyEngine:
             new_oid = getattr(new_order, "order_id", None)
             if not new_oid:
                 logger.error(
-                    "PROTECTIVE place_order returned no order_id; "
-                    "leaving existing order in place"
+                    "PROTECTIVE place_order returned no order_id"
                 )
+                pos["_protective_order_id"] = None
                 return False
         except Exception as e:
-            logger.error(
-                "PROTECTIVE place_order failed: %s — leaving existing "
-                "order %s in place (no naked window)",
-                e, (cur_id or "")[:12],
-            )
-            return False  # legacy stop logic can attempt rescue
-
-        # New order placed successfully; now cancel the old one.
-        if cur_id and cur_id != new_oid:
-            try:
-                await self._client.cancel_order(cur_id)
-            except Exception:
-                # Cancel failures are typically "already terminal" (filled
-                # or already cancelled) — safe to ignore. Worst case the
-                # old order rests at a wider price and might fill too —
-                # caught by count-poll OVERRUN.
-                pass
+            logger.error("PROTECTIVE place_order failed: %s", e)
+            pos["_protective_order_id"] = None
+            return False
 
         pos["_protective_order_id"] = new_oid
         pos["_protective_order_px"] = place_px
@@ -13980,9 +14096,10 @@ class PolymarketCopyEngine:
         pos["_protective_last_replan_ts"] = now
         logger.warning(
             "CopyEngine PROTECTIVE [%s]: %s %dct @ %dc entry=%dc bid=%dc "
-            "strat=%s post_only=%s (prev=%dc count=%d)",
+            "strat=%s post_only=%s (prev=%dc count=%d resting_pre=%d)",
             target_state.upper(), side.upper(), truth_ct, place_px,
             entry, bid, strat or "?", place_post_only, cur_px, cur_count,
+            _resting_count,
         )
         return True
 
