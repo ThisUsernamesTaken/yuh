@@ -3688,3 +3688,96 @@ without test passes.
   with partial work.
 
 ---
+
+## 2026-05-01 23:35 PT - Claude - Verify Codex implementation + fix test mock
+
+### Read
+- `AI_COLLAB_LOG.md` Codex entry (2026-05-01 23:18 PT)
+- `git log 70b5304..HEAD` (commits 8650a58, c145379, 95da0df)
+- `sell_safety.py`, `protective_math.py` (new modules from c145379)
+- `user_config.py` diff vs 168dfd2 (sizing knobs verified)
+- `tests/test_residual_reconciler.py` (3 newly-failing tests)
+
+### Trigger
+User confirmed plan implementation pushed through `95da0df`. Verified work
+matches the agreed scope and ran the full test suite to catch regressions.
+
+### Safety posture
+- `BTCBiasEngine` confirmed `SERVICE_STOPPED`.
+- No live code changes. Only test mock updated (test-only fix).
+- No live restart performed.
+
+### Work
+1. Pulled `origin/master` to `12a27fc` (Codex's three commits + my mock fix).
+2. Ran targeted tests: `tests/test_sell_helper.py tests/test_mfe_trail.py
+   tests/test_bb_pure.py` → 33 passed (matches Codex's report).
+3. Ran full test suite: discovered 6 failures.
+4. Bisected: 3 failures (LATE_DOMINANT sizing, SR_FADE sizing) reproduce
+   at `168dfd2` — pre-existing, unrelated to this work.
+5. 3 failures (`test_residual_reconciler.py`) are NEW — caused by Codex's
+   sell-cap helper now calling `_client._request("GET", "/portfolio/orders")`
+   in the residual flatten path. The test's `_FakeClient` didn't implement
+   `_request`, `cancel_order`, or `get_order`.
+6. Fixed `_FakeClient` mock (test-only, no production change). All 11
+   residual reconciler tests now pass.
+
+### Commands
+```text
+git fetch origin && git pull origin master --ff-only
+git log --stat 70b5304..HEAD
+python -m pytest tests/test_sell_helper.py tests/test_mfe_trail.py tests/test_bb_pure.py -q
+python -m pytest tests/ -q --ignore=tests/test_bias_engine.py --ignore=tests/test_consensus.py --ignore=tests/test_phase3.py --ignore=tests/test_strategy_index.py
+git checkout 168dfd2 -- user_config.py polymarket_copy_engine.py  # bisect
+python -m pytest tests/test_late_dominant.py tests/test_residual_reconciler.py tests/test_sr_fade_gates.py -q
+git checkout HEAD -- user_config.py polymarket_copy_engine.py  # restore
+[edit tests/test_residual_reconciler.py: add _request/cancel_order/get_order to _FakeClient]
+python -m pytest tests/test_residual_reconciler.py -q
+git add tests/test_residual_reconciler.py && git commit && git push
+```
+
+### Results
+- HEAD now at `12a27fc` on `origin/master`.
+- Targeted tests: 33 passed.
+- Full suite: 325 passed, 3 pre-existing failures (LATE_DOMINANT and
+  SR_FADE sizing tests — fail at `168dfd2` too, not regressions).
+- Verified all five sizing knobs in `user_config.py` match the agreed
+  values exactly.
+- Verified `protective_math.compute_mfe_trail_price` math matches Phase 3
+  spec (threshold 8c, ratio 0.4, floor at entry + min profit).
+- Verified `sell_safety.cap_sell_count` enforces `position - resting`
+  inventory cap.
+
+### Plan status after this verification
+- Phase 1 (alpha-table): DONE
+- Phase 1.5a (BB_PURE log-mining): DONE (`scripts/bb_pure_log_mine.py`,
+  41 entries reconstructed)
+- Phase 0 MVP (sell-helper + inventory cap + cancel-confirmed): DONE
+- Phase 3 (MFE-aware trail): DONE
+- Sizing reduction: DONE
+- Tests: DONE (33 targeted + 11 reconciler all green)
+- **Live restart with -$30 kill-switch: PENDING USER APPROVAL**
+
+### Next
+Engine is staged for the controlled live restart. Outstanding items
+before flipping the service:
+
+1. User reads the diff at `95da0df` + `12a27fc` and confirms the live
+   surface is acceptable.
+2. User decides on session timing — fresh window flip preferred so the
+   first protective placement on real fills is observable.
+3. On approval: `nssm start BTCBiasEngine`. Truth-monitor stays running.
+4. First live test of: new sell cap, new MFE trail, reduced sizing, all
+   active simultaneously. -$30 phase kill-switch enforced via discipline
+   (manual stop) — no automated halt yet.
+
+### Guardrails
+- Stop conditions from Codex notes still apply (any path bypassing
+  helper, mocked Kalshi response, sleep-retry fix, mixed strategy/order
+  refactor in one commit, live restart needed to verify correctness).
+- The 3 pre-existing test failures (LATE_DOMINANT, SR_FADE) should be
+  flagged for next-session cleanup but don't block live restart — they
+  test code paths that aren't on the BB_PURE-only live config.
+- If first live session trips the -$30 kill-switch, all phases freeze
+  pending review, regardless of which feature caused it.
+
+---
