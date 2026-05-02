@@ -16,6 +16,53 @@
 4. P&L kill-switch: if any single phase produces > $30 net loss in its first live session, **rollback the feature flag** and re-validate.
 5. Each phase ships on its own commit. No bundled feature ships.
 6. **Sizing reduction is bundled with the first live restart** (see "Sizing reduction" below). The first live test validates Phase 0 safety + Phase 3 MFE trail under reduced size, not pre-restart size.
+7. **HARD RULE (added 2026-05-01 23:55 PT after live test): one trade per session per ticker.** Once a ticker has had any fill in the current 15-min window, no further entries on that ticker for the rest of the window. Lock must persist across engine restarts.
+
+---
+
+## Phase 0.1 — Residual-path safety + per-session lock (NEW, 2026-05-01 23:55 PT)
+
+> **STATUS: BLOCKING all further live restarts.** Live test on 2026-05-01 23:45–23:53 PT
+> exposed two gaps that Phase 0 MVP did not cover:
+>
+> 1. **Residual-flatten path lacks the >1-orders OVERSELL-GUARD.** When the position
+>    was already flat after the fade trade crashed, `_reconcile_residual_position`
+>    called `_place_capped_side_sell` repeatedly — it has the inventory cap but not
+>    the abort-on-many-resting logic. 11 sell orders piled up over 31 seconds. None
+>    filled (Kalshi caching may have helped) but it was a near-miss.
+> 2. **Same-ticker re-entry was not blocked.** After the YES round-trip closed clean,
+>    BB_PURE re-fired on NO (opposite side, same ticker) within 1.5 minutes. Lost $5.
+>    The `_entered_tickers_this_window` lock was either cleared by the prior restart
+>    or wasn't being respected by the BB_PURE preflight path.
+
+### Implementation (next session, before any live restart)
+
+| Item | Surface | Effort |
+|---|---|---|
+| `MAX_TRADES_PER_SESSION_TICKER = 1` config knob | `user_config.py` | trivial |
+| Check `_entered_tickers_this_window` at every entry placement site BEFORE `place_order` — abort if ticker already in set | `polymarket_copy_engine.py` BB_PURE preflight site | small |
+| Add ticker to `_entered_tickers_this_window` on FIRST FILL, not on signal eval (avoids race) | engine fill-event handler | small |
+| Persist `_entered_tickers_this_window` across restarts (today's restart cleared the lock) | new — `data/session_state.json` or DB row | medium |
+| Extend OVERSELL-GUARD (>1 resting → cancel all + abort) to `_place_capped_side_sell` | `polymarket_copy_engine.py` | small |
+| Gate every sell helper on `position_count > 0` — flat = no new sells, ever | `_place_capped_side_sell` | trivial |
+
+### Tests required
+
+- `tests/test_sell_helper.py`: position=0 + repeated sell calls → 0 placements
+- `tests/test_sell_helper.py`: 1 resting sell + new placement attempt → cancel-then-place, NEVER pile-up
+- `tests/test_sell_helper.py`: 2+ resting sells → cancel all + abort cycle
+- `tests/test_session_lock.py` (NEW): same-ticker entry attempt after first fill → blocked
+- `tests/test_session_lock.py`: lock persists across simulated process restart
+
+### Verification
+
+- All tests pass
+- Paper-mode simulation: force a fade scenario (entry, exit, opposite-side signal) → assert second entry blocked
+- Live restart only after: tests pass + paper sim confirms lock + manual review of `_place_capped_side_sell` callers
+
+### Sequencing
+
+This is now the FIRST item in the next coding session. Phases 2/4/5/6/7 stay deferred. Phase 1.5b (BB_PURE attribution write path) can be bundled in this session OR deferred — Codex's discretion.
 
 ---
 

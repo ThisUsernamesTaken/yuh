@@ -3781,3 +3781,109 @@ before flipping the service:
   pending review, regardless of which feature caused it.
 
 ---
+
+## 2026-05-01 23:55 PT - Claude - Live test results + new "one trade per session" directive
+
+### Read
+- Live truth-monitor events 23:45-23:53 PT
+- Direct Kalshi balance + positions + orders queries
+- `polymarket_copy_engine.py` `_place_capped_side_sell` and `_reconcile_residual_position`
+
+### Trigger
+User: "let's test it" → engine started 23:25 PT live with full Phase 0 MVP +
+Phase 3 MFE trail + reduced sizing + −$30 kill-switch.
+
+### Live timeline (one window, 26MAY020300-00)
+
+| Time | Event | BAL | Port | Notes |
+|---|---|---|---|---|
+| 23:45:28 | BUY YES @ 48c, 22ct, taker | $209.07 | $10.56 | Cheap-side entry |
+| 23:45:30 | Protective sell `4fdc35b3` placed | — | — | Single order |
+| 23:45:43 | Protective re-pegged | — | — | Cancel-confirmed |
+| 23:46:01 | Exit YES @ avg ~58.7c, 4 partial fills taker | $221.66 | $0.00 | **+$1.64 net** |
+| 23:47:45 | BUY NO @ 24c, 22ct, maker | $216.38 | $6.60 | **Same-ticker re-entry, opposite side** — fade trade after BTC ripped |
+| 23:52:14 | Sell-cap flatten: 5 taker fills at avg ~7c | $214.71 | $1.32 | NO crashed to 7c |
+| 23:52:17–48 | **11 sell-no orders piled up over 31s** | $214.71 | $0 (FLAT) | Position was already flat; orders kept piling without firing OVERSELL-GUARD |
+| 23:52:55 | User flagged "let's stop." Engine stopped via nssm. | $214.71 | $0 | Kill-switch NOT tripped |
+| 23:53 | Cancelled all 11 stale orders via direct API | $214.71 | $0, 0 resting | Clean state restored |
+
+### Net live-test result
+- Net P&L this restart: **−$5.31** ($220.02 → $214.71)
+- Day P&L from $189.90 floor: **+$24.81** (down from earlier +$30.12)
+- Kill-switch held (would trigger at $190; we stopped at $214)
+- No manual Kalshi-UI flatten needed; only API-side order cancellation
+
+### What worked (confirmed live)
+- Single protective placement on entry (sell-cap helper)
+- Cancel-confirmed re-peg (no naked window between cancel + replace)
+- MFE trail rolled YES exit from 53c → 58c (+$1.64 win)
+- Smaller sizing limited damage on the fade trade ($5 vs prior $36-$56)
+
+### What failed (live exposed gap)
+1. **Same-ticker re-entry was not blocked.** After the YES round-trip closed clean,
+   BB_PURE re-fired on NO (opposite side) within 1.5 minutes on the same ticker.
+   The new sell-cap helper doesn't gate entries — only sell placements.
+2. **Residual-flatten path lacks the >1-orders OVERSELL-GUARD.**
+   `_reconcile_residual_position` calls `_place_capped_side_sell` which has the
+   *cap* but not the *abort-when-many-resting* logic that
+   `_maintain_protective_order` got in commit 168dfd2. With position=0 already,
+   the helper kept allowing placements (saw resting=1 at each individual check
+   due to truth-poll lag), accumulating to 11.
+3. **The fade entry itself is the bad pattern from earlier today.**
+   Phase 6 (asymmetric vol gate, stricter when fading WITH trend) was never
+   shipped — it's the rule that should block exactly this kind of trade.
+
+### NEW USER DIRECTIVE — one trade per session
+
+> User (2026-05-01 23:55 PT): "limit to one trade, per session"
+
+This is now a **hard rule**. Once a ticker has had any fill in the current
+15-min window, no further entries on that ticker for the rest of the window.
+The intent: prevent same-ticker re-entry / opposite-side fade after a clean
+exit, even when fair value flips.
+
+This subsumes some of today's pain:
+- Eliminates the post-exit fade pattern (lost $5 today, $80+ earlier)
+- Eliminates pyramiding on the same ticker (today's manual buy +$30 was
+  legitimate user judgment; for the engine this should be blocked)
+- Simplifies the safety story: ticker locked at first fill, period
+
+### Implementation surface for next session
+
+| Item | Surface | Effort |
+|---|---|---|
+| `MAX_TRADES_PER_SESSION_TICKER = 1` config knob | `user_config.py` | trivial |
+| At every entry placement site, check `_entered_tickers_this_window` BEFORE place_order — abort if ticker already in set | `polymarket_copy_engine.py` BB_PURE preflight site | small |
+| Add ticker to `_entered_tickers_this_window` on FIRST FILL, not on signal eval | engine fill-event handler | small |
+| Persist `_entered_tickers_this_window` across restarts (today's restart cleared the lock and let same-ticker re-enter) | new — `data/session_state.json` or DB row | medium |
+| Extend OVERSELL-GUARD (>1 resting → cancel all + abort) to `_place_capped_side_sell` | `polymarket_copy_engine.py` | small |
+| Gate every sell helper on `position_count > 0` — flat = no new sells | `_place_capped_side_sell` | trivial |
+| Test: position=0 + repeated sell calls → 0 placements | `tests/test_sell_helper.py` | trivial |
+
+### Sequencing for next session
+
+1. Implement the 7 items above (one commit per logical unit per Codex stop conditions)
+2. Run tests
+3. Live restart — same kill-switch posture, same reduced sizing
+4. Validate over 1 stable session
+5. THEN consider Phase 6 (asymmetric vol gate to block the fade pattern at entry)
+
+### Engine state at session end
+- Service: `SERVICE_STOPPED`
+- Bankroll: $214.71
+- Day P&L: +$24.81 from $189.90 floor
+- Resting orders: 0
+- Position: FLAT
+- HEAD: `c83efa6` on `origin/master`
+
+### Guardrails
+- No engine restart until the 7 items above land + tests pass.
+- The "one trade per session" rule must persist across engine restarts
+  (in-memory set was lost during today's restarts and contributed to the
+  re-entry behavior).
+- The 11-orders pile-up did not actually fill — Kalshi caching behavior
+  may have buffered the placements before they hit the book. We got lucky.
+  Next time may not be so kind. Treat this as a near-miss, not a design
+  validation.
+
+---
