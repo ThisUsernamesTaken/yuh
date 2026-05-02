@@ -750,6 +750,22 @@ BB_PURE_TAPE_EXIT_MIN_LARGE          = 2      # ≥ N large opposite buys
 PROTECTIVE_FLAT_CONFIRM_S            = 30.0   # seconds past fill_time
                                               # before trusting Kalshi=0
 
+# 2026-05-02 BB_PURE entry stale-cancel timeout.
+# Live observed 15:04:21 PT: BB_PURE FIRE 42ct YES @ 26c (taker).
+# By the time Kalshi processed our taker order at 26c, the ask had
+# moved up — the unfilled portion sat as a maker bid at 26c. The
+# market then went past 26c twice over the next several seconds
+# without our order matching, and the engine just left it resting
+# until it filled at a stale price minutes later.
+#
+# Fix: schedule a one-shot cancel task after BB_PURE FIRE NOFILL.
+# After this many seconds, if the order is still resting (not
+# filled, not in any terminal state), cancel it. The RECLAIM path
+# still handles late-fills if the order does match within this
+# window. Session-lock stays set (one-trade-per-session honored).
+BB_PURE_ENTRY_NOFILL_TIMEOUT_S       = 8.0    # cancel unfilled BB_PURE
+                                              # entry after N seconds
+
 # ── Post-close residual sweep (Claude 2026-04-29 per user) ────────────────
 # After every TA_FORCED / LATE_DOMINANT / SR_FADE close, poll Kalshi
 # positions every POST_CLOSE_RESIDUAL_POLL_S seconds for

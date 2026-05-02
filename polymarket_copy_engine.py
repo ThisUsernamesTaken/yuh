@@ -9214,6 +9214,51 @@ class PolymarketCopyEngine:
         )
         return sig
 
+    async def _cancel_unfilled_bb_pure_entry(
+        self, order_id: str, ticker: str, entry_px: int
+    ) -> None:
+        """One-shot cancel of a BB_PURE entry order that didn't fill.
+
+        Scheduled via asyncio.create_task right after BB_PURE NOFILL.
+        Sleeps BB_PURE_ENTRY_NOFILL_TIMEOUT_S, then:
+          - Fetches the order's current state
+          - If filled (full or partial): leaves it (RECLAIM handles)
+          - If terminal (canceled/expired): nothing to do
+          - If still resting: cancels to prevent stale-fill risk
+
+        Does NOT unlock the session ticker — the session attempt counts
+        whether or not the order filled.
+        """
+        timeout_s = float(_uc("BB_PURE_ENTRY_NOFILL_TIMEOUT_S", 8.0))
+        try:
+            await asyncio.sleep(max(1.0, timeout_s))
+        except asyncio.CancelledError:
+            return
+        if not order_id:
+            return
+        try:
+            o = await self._client.get_order(order_id)
+            status = (getattr(o, "status", "") or "").lower()
+            filled = int(getattr(o, "filled_count", 0) or 0)
+            if filled > 0:
+                logger.info(
+                    "BB_PURE NOFILL late-fill: %s filled %dct after timeout — "
+                    "RECLAIM path will adopt position",
+                    order_id[:12], filled,
+                )
+                return
+            if status in ("filled", "canceled", "cancelled", "expired", "terminal"):
+                return
+            # Still resting — cancel
+            await self._client.cancel_order(order_id)
+            logger.warning(
+                "BB_PURE NOFILL CANCEL: %s @ %dc unfilled after %.0fs — "
+                "cancelled stale entry to avoid late-fill at bad price",
+                order_id[:12], entry_px, timeout_s,
+            )
+        except Exception as e:
+            logger.warning("BB_PURE NOFILL CANCEL failed: %s", e)
+
     async def _execute_bb_pure_signal(self, sig) -> None:
         """Place an order for a BB_PURE signal + arm position management.
 
@@ -9405,9 +9450,29 @@ class PolymarketCopyEngine:
         if filled <= 0:
             logger.warning(
                 "BB_PURE NOFILL: order=%s placed but not filled — letting "
-                "RECLAIM path handle if Kalshi shows position later",
-                oid[:12],
+                "RECLAIM path handle if Kalshi shows position later "
+                "(stale-entry cancel scheduled in %.0fs)",
+                oid[:12], float(_uc("BB_PURE_ENTRY_NOFILL_TIMEOUT_S", 8.0)),
             )
+            # 2026-05-02 STALE-ENTRY CANCEL: when a taker order doesn't
+            # fully fill (insufficient depth at the ask, ask moved before
+            # Kalshi processed it), the remainder rests as a maker bid
+            # at our entry price. Without intervention it sits there
+            # until window expiry — at risk of filling minutes later
+            # when conditions have changed (the "market went straight
+            # through our bid twice" pattern).
+            #
+            # Solution: schedule a one-shot async task that cancels the
+            # order after BB_PURE_ENTRY_NOFILL_TIMEOUT_S seconds if it's
+            # still resting. The session-lock stays set (per "one trade
+            # per session" rule) — a NOFILL counts as the session's
+            # attempt regardless.
+            try:
+                asyncio.create_task(
+                    self._cancel_unfilled_bb_pure_entry(oid, ticker, entry_px)
+                )
+            except Exception as _ce:
+                logger.warning("BB_PURE schedule-cancel failed: %s", _ce)
             return
 
         # Set _open_position so protective-order mode + safety reconciler
