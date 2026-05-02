@@ -552,10 +552,19 @@ PRE_EXPIRY_CONSOLIDATE_S             = 90.0  # Take ownership at this
 # pattern where engine sells against stale state and Kalshi atomically
 # opens an opposite-side short.
 ORPHAN_FLATTEN_ENABLED               = True
-ORPHAN_FLATTEN_POLL_S                = 5.0   # Poll interval (seconds)
-ORPHAN_FLATTEN_RECENT_S              = 60.0  # Skip tickers placed within
-                                              # this window (let active
-                                              # orders fill normally)
+ORPHAN_FLATTEN_POLL_S                = 3.0   # Poll interval (seconds —
+                                              # tightened from 5s for
+                                              # faster orphan detection)
+ORPHAN_FLATTEN_RECENT_S              = 60.0  # Legacy knob, retained but
+                                              # no longer enforced — see
+                                              # _orphan_flatten_loop
+ORPHAN_FLATTEN_OFFSET_C              = 5     # Cross-spread aggressiveness
+                                              # (cents below bid). Higher
+                                              # = guaranteed fill, more
+                                              # slippage. 5c on a 50c
+                                              # contract = 10% slippage
+                                              # vs unguaranteed exit at
+                                              # bid-1.
 
 # Entry-timing filter (2026-05-01): reject BB_PURE entries when the
 # buy side is at an extreme of the recent mid range. The model's fair

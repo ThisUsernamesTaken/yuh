@@ -15358,13 +15358,16 @@ class PolymarketCopyEngine:
                         continue
                     if ticker == active_ticker:
                         continue  # active engine position; protective_maintain owns it
-                    # Recent placement protection — order may still be filling
-                    placed_ts = float(
-                        self._recent_placement_tickers.get(ticker, 0) or 0
-                    )
-                    if (_now_t - placed_ts) < recent_window_s:
-                        continue
-                    # ORPHAN — flatten via market sell
+                    # 2026-05-01: aggressive orphan kill on non-active tickers.
+                    # Previous 60s recent-placement protection was blocking
+                    # cleanup of side-flip orphans (engine TP fills, then
+                    # 'sell' against stale state opens an opposite-side short
+                    # via Kalshi atomic). Those orphans were stamped as
+                    # recent placements and skipped by the watchdog.
+                    # Now: ANY non-zero position on a non-active ticker gets
+                    # flattened immediately. The active-ticker check above
+                    # is sufficient protection for in-flight orders.
+                    # ORPHAN — flatten via market-cross sell
                     abs_count = abs(pos_int)
                     # Position fields don't tell us yes vs no directly;
                     # we use exposure to infer. If no_price > yes_price
@@ -15395,7 +15398,13 @@ class PolymarketCopyEngine:
                         bid = int(getattr(book, "best_no_bid", 0) or 0)
                     if bid <= 0:
                         bid = 1
-                    sell_px = max(1, int(bid) - 1)
+                    # 2026-05-01: aggressive cross-spread. bid-1 was not
+                    # guaranteeing fills (book moved between query and
+                    # place_order). Use bid-5 (or bid/2 if very thin) to
+                    # GUARANTEE cross. Slippage cost is acceptable for
+                    # immediate exit on orphan positions.
+                    aggressive_off = int(_uc("ORPHAN_FLATTEN_OFFSET_C", 5))
+                    sell_px = max(1, int(bid) - aggressive_off)
                     try:
                         _o = await self._client.place_order(
                             ticker=ticker, side=side,
@@ -15404,9 +15413,10 @@ class PolymarketCopyEngine:
                         )
                         logger.warning(
                             "CopyEngine ORPHAN-FLATTEN: %s %dct on %s @ "
-                            "%dc (bid=%dc) — orphan position auto-cleared",
+                            "%dc (bid=%dc, aggressive cross -%dc) — orphan "
+                            "position auto-cleared",
                             side.upper(), abs_count, ticker[-15:],
-                            sell_px, bid,
+                            sell_px, bid, aggressive_off,
                         )
                     except Exception as _ofe:
                         logger.error(
