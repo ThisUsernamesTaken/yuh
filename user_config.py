@@ -437,6 +437,17 @@ PROTECTIVE_MID_TRADE_ADVERSE_VEL  = 10.0   # $/sec adverse threshold.
                                            # Higher than entry gate
                                            # (5 $/s) — only trips on
                                            # decisive mid-trade reversal.
+
+# Trailing TP for BB_PURE (2026-05-01): re-enabled with smart arming.
+# Trail engages ONLY when bid exceeds the FVG-close target (the
+# preflight TP price). Initial floor = FVG-close target. As bid moves
+# higher, floor ratchets up (bid - BB_PURE_TRAIL_DISTANCE_C). If bid
+# pulls back below floor, fires trail exit.
+# Worst case: trail floor = FVG-close target → exit at planned profit.
+# Best case: bid runs to settlement/100c → ride the move.
+BB_PURE_TRAIL_DISTANCE_C          = 3      # cents below current bid
+                                           # for trail floor (give back
+                                           # at most 3c from peak)
 PROTECTIVE_REPLAN_DEBOUNCE_S     = 2.0    # Min seconds between cancel+replace
 PROTECTIVE_PRE_EXPIRY_FORCE_S    = 60     # Force market sell when remaining < this
 

@@ -19033,43 +19033,82 @@ class PolymarketCopyEngine:
             # Floor only moves UP, never down — bid noise can't trigger it.
             # If bid crosses below floor → market sell (exit at floor).
             # ═══════════════════════════════════════════════════════════════
-            # 2026-05-01: TRAIL disabled for BB_PURE positions. Trail
-            # logic locks in profit on retracement, but BB_PURE's exit
-            # thesis is FVG-close (preflight TP at fair − 1c). Trail
-            # exited a 57x YES @ 42c trade at 45c (-$0.26 net after
-            # fees) when the preflight TP was waiting at fair=86c
-            # (potential +$24). Same gate as SCALP DCA.
+            # 2026-05-01 (v2): TRAIL re-enabled for BB_PURE with smarter
+            # arming. Earlier disable was because the legacy trail armed
+            # at entry+10c, exiting trades at 45c when preflight TP was
+            # at fair=86c. Now: BB_PURE trail arms ONLY when bid exceeds
+            # the FVG-close target (the preflight TP price). At that
+            # point the planned exit has been hit; trail's job is to ride
+            # any further upside and exit if price retraces.
+            #
+            # For non-BB_PURE: legacy trail (arm at entry+10) — preserved
+            # in case any non-BB_PURE positions are still open.
             _trail_strat = pos.get("strategy_name", "")
+            _is_bb_pure_for_trail = (_trail_strat == "BB_PURE")
             if (count > 0 and bid > 0
-                    and not pos.get("_profit_trail_exited", False)
-                    and _trail_strat != "BB_PURE"):
+                    and not pos.get("_profit_trail_exited", False)):
                 _trail_armed = pos.get("_trail_armed", False)
                 _trail_floor = pos.get("_trail_floor", 0)
                 _profit_now = bid - entry
 
-                # Arm when profit >= 10c
-                if not _trail_armed and _profit_now >= 10:
+                # Arming threshold differs by strategy
+                if _is_bb_pure_for_trail:
+                    # BB_PURE: arm only above the FVG-close target.
+                    # _bb_pure_fair_yes_cents_at_entry was stamped at FILL.
+                    _bb_fy = int(pos.get("_bb_pure_fair_yes_cents_at_entry") or 0)
+                    if pos.get("side") == "yes":
+                        _bb_fair_side = _bb_fy
+                    else:
+                        _bb_fair_side = 100 - _bb_fy
+                    _bb_inside = int(_uc("BB_PURE_TP_INSIDE_FAIR_C", 1))
+                    _fvg_target = max(1, min(99, _bb_fair_side - _bb_inside))
+                    _arm_threshold = _fvg_target  # bid must EXCEED this
+                else:
+                    _arm_threshold = entry + 10  # legacy
+
+                if not _trail_armed and bid >= _arm_threshold:
                     pos["_trail_armed"] = True
-                    pos["_trail_floor"] = entry + 5
-                    _trail_floor = entry + 5
-                    logger.info(
-                        "CopyEngine TRAIL ARMED: floor=%dc (entry=%dc bid=%dc +%dc profit)",
-                        _trail_floor, entry, bid, _profit_now,
+                    # Initial floor:
+                    #   BB_PURE: floor at FVG-close target (locks in planned win)
+                    #   Legacy: floor at entry+5
+                    if _is_bb_pure_for_trail:
+                        pos["_trail_floor"] = _arm_threshold
+                        _trail_floor = _arm_threshold
+                    else:
+                        pos["_trail_floor"] = entry + 5
+                        _trail_floor = entry + 5
+                    logger.warning(
+                        "CopyEngine TRAIL ARMED: %s floor=%dc (entry=%dc bid=%dc "
+                        "arm@%dc strat=%s)",
+                        pos.get("side", "?").upper(), _trail_floor, entry, bid,
+                        _arm_threshold, _trail_strat or "?",
                     )
-                # Ratchet floor up: every 5c bid gain past arm, floor moves +3c
+                # Ratchet floor up
                 elif _trail_armed and _trail_floor > 0:
-                    _hwm_profit = hwm - entry
-                    # Expected floor: entry+5 + 3*((hwm_profit - 10)//5)
-                    if _hwm_profit >= 15:
-                        _ratchets = (_hwm_profit - 10) // 5
-                        _new_floor = entry + 5 + (_ratchets * 3)
+                    if _is_bb_pure_for_trail:
+                        # BB_PURE: trail bid by 3c (give back at most 3c)
+                        _trail_distance = int(_uc("BB_PURE_TRAIL_DISTANCE_C", 3))
+                        _new_floor = max(_trail_floor, int(bid) - _trail_distance)
                         if _new_floor > _trail_floor:
                             pos["_trail_floor"] = _new_floor
                             logger.info(
-                                "CopyEngine TRAIL RATCHET: floor %dc → %dc (hwm_profit=%dc)",
-                                _trail_floor, _new_floor, _hwm_profit,
+                                "CopyEngine TRAIL RATCHET: floor %dc → %dc (bid=%dc)",
+                                _trail_floor, _new_floor, bid,
                             )
                             _trail_floor = _new_floor
+                    else:
+                        # Legacy ratchet
+                        _hwm_profit = hwm - entry
+                        if _hwm_profit >= 15:
+                            _ratchets = (_hwm_profit - 10) // 5
+                            _new_floor = entry + 5 + (_ratchets * 3)
+                            if _new_floor > _trail_floor:
+                                pos["_trail_floor"] = _new_floor
+                                logger.info(
+                                    "CopyEngine TRAIL RATCHET: floor %dc → %dc (hwm_profit=%dc)",
+                                    _trail_floor, _new_floor, _hwm_profit,
+                                )
+                                _trail_floor = _new_floor
 
                 # Fire if bid drops below floor
                 if _trail_armed and _trail_floor > 0 and bid < _trail_floor:
