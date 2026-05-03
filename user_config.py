@@ -518,7 +518,9 @@ BB_PURE_MIN_EDGE_PP              = 8.0    # Min mispricing pp to fire (static)
 #
 # DEFAULT OFF until backtested. Caller responsibility: review backtest
 # results before flipping. See scripts/backtest_dual_regime.py.
-BB_TREND_MODE_ENABLED            = False   # default off
+BB_TREND_MODE_ENABLED            = True    # 2026-05-03 15:31 PT: ENABLED for live testing
+                                           # (cross-engine interference cleared,
+                                           # BTC firmly above strike for hours)
 BB_TREND_MIN_STRIKE_DIST_PCT     = 0.0015  # require >= 0.15% from strike
 BB_TREND_MAX_REVERSAL_DOLLARS    = 50.0    # block if 5min move reverts >$50 against trend
 BB_TREND_MAX_ENTRY_CENTS         = 75      # higher cap than mean-rev (55c)
