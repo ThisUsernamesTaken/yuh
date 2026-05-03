@@ -245,10 +245,11 @@ MANUAL_FILLS_POLL_INTERVAL_S  = 8.0     # poll every 8s; ring buffer aligns
 # Each completed pair guarantees ~`100 - sum_ask - fee_winning_side` per ct.
 # Algorithmic version of the user's manual hedge play that netted +$29.40 on
 # 2389 pairs today.
-ARB_DETECTOR_ENABLED          = True    # 2026-04-28 21:03 PT: detector loop
-                                        # KEPT RUNNING for observability —
-                                        # classifier and SCAN logs feed the
-                                        # FVG/TA_FORCED tier as regime input.
+ARB_DETECTOR_ENABLED          = False   # 2026-05-02 reset: was True for
+                                        # observability. TA_FORCED is now
+                                        # disabled so the regime-input use
+                                        # case is gone. Detector logs were
+                                        # noise. Re-enable for research only.
                                         # Trades are gated separately via
                                         # ARB_TRADES_ENABLED below (=False
                                         # currently, after extensive live
@@ -710,7 +711,10 @@ BB_PURE_VOL_LOOSE_WITH_TREND         = 50.0   # looser cap when going
 # a few sessions of data to validate the thresholds before turning the
 # gate on. Once enabled, BB_PURE entries on the side BEING ABSORBED AGAINST
 # will be blocked.
-BB_PURE_TAPE_SHADOW_ENABLED          = True   # log BB_PURE TAPE-SHADOW lines
+BB_PURE_TAPE_SHADOW_ENABLED          = False  # 2026-05-02 reset: was True.
+                                              # Polluted logs (2000+ lines
+                                              # per window). Re-enable when
+                                              # validating signal vs P&L.
 BB_PURE_TAPE_GATE_ENABLED            = False  # actively block on "block"
                                               # decision (start False —
                                               # shadow first)
@@ -743,7 +747,8 @@ KALSHI_TAPE_RETENTION_S              = 360.0  # 6 min — covers 5-min
 # exit." Symmetric to the entry absorption signal but on a 30s reactive
 # window. When smart money aggresses against our side, bail before the
 # bid catches up.
-BB_PURE_TAPE_EXIT_SHADOW_ENABLED     = True   # log shadow decisions
+BB_PURE_TAPE_EXIT_SHADOW_ENABLED     = False  # 2026-05-02 reset: was True.
+                                              # Same log-pollution reason.
 BB_PURE_TAPE_EXIT_GATE_ENABLED       = False  # actually force SL on exit
                                               # (start False — shadow first)
 BB_PURE_TAPE_EXIT_WINDOW_S           = 30.0   # how recent the spike must be
@@ -1559,7 +1564,12 @@ SR_FADE_MIN_EDGE_PP = 5.0
 # ATM_REVERSION_PAPER_ONLY=True (belt + suspenders). Live promotion only after
 # â‰¥7 days of paper validation matches the backtest expectancy under settlement
 # truth.
-ATM_REVERSION_ENABLED = True                   # paper accumulation ON; live blocked by ATM_REVERSION_PAPER_ONLY
+ATM_REVERSION_ENABLED = False                  # 2026-05-02 reset: was True.
+                                                # Paper-only sim was generating
+                                                # 1000s of log lines per session
+                                                # without informing the live
+                                                # BB_PURE strategy. Re-enable
+                                                # for research only.
 ATM_REVERSION_PAPER_ONLY = True                # belt+suspenders: even if ENABLED flips True, live entries blocked until this is False
 ATM_BIAS_ENABLED = False                       # bias-mode entries (proven flat-after-fees) â€” leave OFF
 ATM_ONE_TRADE_PER_TICKER = True                # don't re-enter same window after exit

@@ -2156,10 +2156,13 @@ class PolymarketCopyEngine:
         #     pass
 
         # ── Paper FVG baseline tracker: tests baseline-relative entry/exit ──
-        try:
-            await self._paper_fvg_tick()
-        except Exception:
-            pass
+        # 2026-05-02 strategic reset: gated off by default. Polluted logs
+        # with thousands of lines per session. Re-enable only for research.
+        if bool(_uc("PAPER_FVG_ENABLED", False)):
+            try:
+                await self._paper_fvg_tick()
+            except Exception:
+                pass
 
         # ── ATM Reversion tier (Codex handoff 2026-04-25 + ATM_ONLY plan) ──
         # Runs every cycle. Paper path always runs (with shadow logging).
