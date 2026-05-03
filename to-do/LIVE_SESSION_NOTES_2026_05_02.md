@@ -925,3 +925,37 @@ Hypotheses:
 
 Code committed with flag default OFF — infrastructure in place for
 future revisit, but no live behavior change.
+
+### check-in 09:52 PT — BTC narrowing toward strike
+
+State: BAL $73.12, FLAT, 0 resting, 0 fires (55 min since restart).
+
+BTC has narrowed from $78,735 to $78,720 (strike $78,671). Distance
+0.063% — still above 0.04% cap, STRIKE-DIST-BLOCK still streaming.
+If BTC dips below ~$78,702 the gate releases.
+
+Window 09:45-10:00 PT has ~7 min remaining. Possible first fire of
+the day if BTC drifts back into range and BB sees edge.
+
+Fee-aware edge backtest committed (HEAD f588978); flag default-off.
+
+### check-in 09:58 PT — BTC pressing the gate boundary
+
+State: BAL $73.12, FLAT, 0 resting, 0 fires (61 min since restart).
+
+BTC trajectory across last 4 checks:
+- 09:46: $78,731 (+$60 above strike, 0.077%)
+- 09:52: $78,720 (+$49, 0.063%)
+- 09:58: $78,706 (+$35, 0.045%)
+
+Steady mean-reversion toward strike $78,671. Just $4 below current
+mid puts it inside the 0.04% trading window. Shadow tier shows BB
+edge=+20pp YES-side, conf=0.68 — meaningful signal waiting in the
+wings.
+
+Window 09:45-10:00 closes in ~2 min. If BTC breaks below the gate
+this final stretch, this could be the first fire of the day.
+
+If fire happens between checks: protective layer + per-window lock
++ pre-fire BAL gate (BAL > 2× cost; current cost cap ~$4 = need $8,
+have $73) ensures it's bounded.
