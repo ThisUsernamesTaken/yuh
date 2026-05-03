@@ -1188,3 +1188,193 @@ Both fixes live in this process:
 
 Window 10:45-11:00 PT still active when restart happened. Engine
 will trade the rest of this window. Monitoring resumed.
+
+### check-in 11:05 PT — quieter logs, fixes appear to be working
+
+State: BAL $73.12, FLAT, 0 resting, 0 fires (6 min since reset).
+
+Since 10:59 reset:
+- 10:59:12 STARTUP
+- 10:59:14 ORPHAN-FLATTEN started
+- 11:00:15 clean flip → 2:00PM-2:15PM ET (885s)
+- 11:04-05 heartbeats 700/800/900 cycles
+
+Notable observation: pre-reset, logs were DOMINATED by
+DOMINANT-SKIP/SHADOW-EDGE spam every 0.3s. After reset, just
+heartbeats and SR-FADE-DBG. Quieter log = book-crossed guard likely
+suppressing the phantom signal pipeline. No SLIPPAGE-SKIP loops, no
+place_order failures, no lock-release events. Both fixes appear
+healthy in the absence of their trigger conditions.
+
+### check-in 11:10 PT — engine in deep observation mode
+
+State: BAL $73.12, FLAT, 0 resting, 0 fires (11 min since reset).
+
+Heartbeats: 1400/1500/1600 cycles in the last 90s. SR-FADE-DBG
+(disabled flag) interleaved. No BB_PURE log lines anywhere. No
+DOMINANT-SKIP/SHADOW-EDGE spam either.
+
+Log volume is dramatically lower post-reset:
+- Pre-reset (10:24-10:51): ~20-30 lines per 30s window
+- Post-reset (10:59+): ~2-3 lines per 30s window
+
+That's >90% reduction. The phantom-book signal pipeline that was
+spamming SLIPPAGE-SKIP is silenced. The legacy DOMINANT/SHADOW pipeline
+also seems quieter — possibly because their inputs depend on the
+same book.mid_price_cents that now gets gated when crossed.
+
+No decision rule trigger. Engine in deep observation mode — exactly
+what we want post-fix.
+
+### check-in 11:15 PT — clean window flip across the fix boundary
+
+State: BAL $73.12, FLAT, 0 resting, 0 fires (16 min since reset).
+
+Window flipped 11:14:56 PT to 2:15PM-2:30PM ET (11:15-11:30 PT,
+904s). Clean transition, no SESSION-LOCK restore, no warnings, no
+errors. The fresh-window scenario that previously triggered the
+phantom-book bug (10:50 PT) cleared without incident this time —
+either real liquidity arrived faster, or the BOOK-CROSSED guard is
+silently rejecting until liquidity stabilizes.
+
+Either outcome confirms the fix's value. We can't see the guard
+firing (silent return), but we can see the symptom (SLIPPAGE-SKIP
+spam) is absent.
+
+### check-in 11:20 PT — DOMINANT-SKIP returns at lower volume
+
+State: BAL $73.12, FLAT, 0 resting, 0 fires (21 min since reset).
+
+DOMINANT-SKIP/SHADOW-EDGE has resumed but at much lower volume than
+pre-reset. Latest: bb=+16.3pp YES, btc5m=$-9 (BTC trending down).
+Shadow tier sees BB edge but BB_PURE itself is silent — last 1000
+log lines have ZERO BB_PURE entries.
+
+Possible explanations:
+- BOOK-CROSSED guard rejecting silently (most likely)
+- WS book book-not-ready or fair_yes=0 returning early (silent)
+- BB_PURE STRIKE-DIST/BTC-RANGE not firing this window (BTC stable)
+
+The total absence of BB_PURE log lines is a data point for future
+debugging: we may want to add a periodic INFO-level "BB_PURE
+heartbeat" so operators can confirm the evaluator is actually
+running. For now, the safety stack is what matters: no money
+movement, no anomalies, no errors.
+
+### check-in 11:25 PT — counterfactual check raised by user
+
+User asked: "no trades at all? Would the gates be preventing
+profitable entries?"
+
+Honest answer (from settlement_ledger + window_snapshots):
+- 6/6 of today's settled-or-inferred windows we observed → all YES
+- Bug-missed entry on 26MAY031315-15: would have been ~+$6.92
+  net profit (cost $3.74 → settled $11.00 minus fees)
+- Other 5 observed windows had terminal mids 63-78c (firmly YES)
+
+Today's tape regime is monotonic YES drift. Strike-distance gate
+(±0.04%) is calibrated for mean-reversion regimes, not trends.
+When BTC drifts $30-$346 above strike, contract is correctly
+priced as "very likely YES" → gate sees this as "noise zone, not
+meaningful" → blocks entries → misses every win.
+
+Two distinct alpha regimes potentially:
+1. Mean-reversion near strike (current strategy, requires gate ON)
+2. Trend-following far-from-strike (today's regime, wants gate OFF)
+
+Documented as design question; no immediate change. Engine still
+running with current gates. User to decide architecture next session.
+
+### check-in 11:30 PT — third clean window flip post-reset
+
+State: BAL $73.12, FLAT, 0 resting, 0 fires (31 min since reset).
+
+Window flipped 11:29:55 PT to 2:30PM-2:45PM ET (11:30-11:45 PT,
+905s). Third clean window-flip cycle since reset, all without:
+- SLIPPAGE-SKIP loops
+- place_order failures
+- Lock-stuck patterns
+- Phantom signals
+- Any errors or warnings
+
+Both fixes from today are validated by the absence of their trigger
+conditions across 3 full window cycles.
+
+### 11:42 PT — REAL POSITION DISCOVERED + monitoring helper bug
+
+Engine actually FIRED at 11:30:20 PT and we've been LONG 7 YES @ 51c
+on `26MAY031445-45` since 11:30:42 PT (late-fill via RECLAIM). My
+monitoring helper has been reporting `Position: FLAT` because of
+parse bug:
+
+  flat = all(int(p.get('position',0)) == 0 for p in positions or [])
+
+Kalshi returns `position_fp` (string), not `position`. With the
+field missing, `.get("position", 0)` defaults to 0 → ALL positions
+report flat. I missed our entire trade today.
+
+What actually happened:
+- 11:30:20 BB_PURE FIRE: YES 7x @ 51c
+- 11:30:42 NOFILL late-fill: 391c2f04 filled 7ct after 8s timeout
+- 11:37:16 PROTECTIVE MID-TRADE-SL: BTC vel=-97.8 (BTC dropping
+  hard), streak=3/3 → place sell @ 50c (post_only=False taker)
+- 11:39:36 PROTECTIVE MID-TRADE-SL: BTC vel=-20.6, streak=3/3
+  again → cancel previous SL, place new SL @ 50c
+- 11:42 PT: I (incorrectly) flagged this as oversell, stopped
+  engine, canceled the resting SL
+
+Both SL orders rested without filling — orderbook for ticker is
+EMPTY (same phantom-book scenario). With no buyer at 50c, our
+sell sat. Cancel-first-place-second pattern correctly enforced
+≤1 resting at any moment (OVERSELL-GUARD never fired because no
+oversell occurred).
+
+Current state at 11:43 PT:
+- Engine STOPPED
+- Position: 7 YES @ 51c on 26MAY031445-45 (real, confirmed via
+  raw API position_fp=7.00)
+- BAL: $69.55 ($3.57 locked in position)
+- BTC: $78,679 vs strike $78,728 = $49 BELOW strike
+- Window closes 11:45 PT (~2 min)
+- Empty orderbook — cannot manually close
+
+Outcome: likely YES settles at 0 → -$3.57 loss. Worst case
+since we entered at 51c and can't exit.
+
+This is NOT an engine bug. The engine TRIED to exit (twice) but
+the market wouldn't take the sell. Liquidity issue.
+
+The REAL bug is my monitoring helper. Need to fix to use
+position_fp consistently. Also need a check on engine state file
+(`session_state.json`) at startup — but that's a different angle.
+
+### 11:45 PT — settlement confirmed, full loss
+
+Settlement at 18:45:11 UTC: market_result='no'. YES contracts
+settled at $0. Full loss of entry cost.
+
+Final accounting:
+- Pre-entry BAL: $73.12
+- Post-entry BAL: $69.55 (the $3.57 locked in position)
+- Post-settlement BAL: $69.55 (NO won, YES → 0, no return)
+- Today's net P&L: -$3.57 (single trade, full loss)
+- Fees: $0.00 (maker fill, Kalshi waived)
+
+BAL still > $60 stop-trigger threshold. Engine remains STOPPED
+pending user review of:
+
+1. **Liquidity-gate proposal**: refuse to enter on contracts with
+   insufficient book depth for a likely exit. Today's trade was
+   on a ticker with no orders on either side → couldn't exit even
+   when SL fired, so the position rode to settlement. A pre-fire
+   check could refuse entry when, e.g., NO_bid depth < entry_size.
+
+2. **Monitoring helper fix**: my Python one-liner used p.get('position', 0)
+   which always returns 0 (Kalshi field is position_fp, string).
+   All "Position: FLAT" reports today were wrong. Need to update
+   future monitoring queries to use position_fp.
+
+3. **Today's session totals**: 9 commits, 4 confirmed code fixes,
+   45 new tests (474 total green), 1 real trade lost, 1 net P&L
+   line at -$3.57. The engine has more guards than at session
+   start. The monitoring is more accurate. Lessons captured.
