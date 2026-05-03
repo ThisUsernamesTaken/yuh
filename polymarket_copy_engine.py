@@ -16127,7 +16127,7 @@ class PolymarketCopyEngine:
 
         Reads Kalshi positions directly every N seconds. Any non-zero
         position that's NOT on the active BB_PURE ticker AND NOT from a
-        recent placement (last 60s) is treated as an orphan — flattened
+        recent engine placement is treated as an orphan — flattened
         immediately via market sell.
 
         Targets the side-flip pattern: when a path places 'sell yes' with
@@ -16141,7 +16141,7 @@ class PolymarketCopyEngine:
         if not bool(_uc("ORPHAN_FLATTEN_ENABLED", True)):
             return
         poll_s = float(_uc("ORPHAN_FLATTEN_POLL_S", 5.0))
-        recent_window_s = float(_uc("ORPHAN_FLATTEN_RECENT_S", 60.0))
+        recent_window_s = float(_uc("ORPHAN_FLATTEN_RECENT_S", 90.0))
         logger.info(
             "CopyEngine ORPHAN-FLATTEN: starting, interval=%.1fs "
             "recent-protection=%.0fs", poll_s, recent_window_s,
@@ -16156,6 +16156,26 @@ class PolymarketCopyEngine:
                 active_ticker = ""
                 if self._open_position is not None:
                     active_ticker = self._open_position.get("ticker", "") or ""
+                # 2026-05-02 evening — RECENCY PROTECTION RESTORED.
+                # Postmortem 18:16 PT: FLAT-CONFIRMED falsely cleared
+                # state on Kalshi=0 blip, then orphan-flatten saw the
+                # (still-real) position re-appear and crossed at
+                # bid-5c → -$2.50 loss on a healthy trade. The
+                # `c044d04` "remove recency protection" commit went
+                # too far. Now we re-honor recent placements but with
+                # a tighter window than the original (was 60s, now 90s
+                # default — covers BB_PURE entry at session start +
+                # cache-lag + flat-confirm window).
+                # If a ticker has had a place_order in the last
+                # recent_window_s seconds, ASSUME it's our position
+                # and let protective_maintain handle it.
+                recent_tickers = set()
+                try:
+                    for _t, _ts in (self._recent_placement_tickers or {}).items():
+                        if (_now_t - float(_ts or 0)) <= recent_window_s:
+                            recent_tickers.add(_t)
+                except Exception:
+                    pass
                 for p in positions or []:
                     try:
                         ticker = p.get("ticker", "")
@@ -16167,15 +16187,40 @@ class PolymarketCopyEngine:
                         continue
                     if ticker == active_ticker:
                         continue  # active engine position; protective_maintain owns it
+                    if ticker in recent_tickers:
+                        # 2026-05-02 evening: recently-placed engine ticker.
+                        # Skip orphan-flatten — let _maintain_protective_order
+                        # adopt or close it through the normal path. Logging
+                        # rate-limited to avoid spamming each poll.
+                        _last_skip = self._orphan_skip_log.get(ticker, 0.0) \
+                            if hasattr(self, "_orphan_skip_log") else 0.0
+                        if _now_t - _last_skip > 30.0:
+                            if not hasattr(self, "_orphan_skip_log"):
+                                self._orphan_skip_log = {}
+                            self._orphan_skip_log[ticker] = _now_t
+                            logger.warning(
+                                "CopyEngine ORPHAN-SKIP: %s %dct on %s — "
+                                "ticker had recent engine placement (%.0fs ago, "
+                                "recency_window=%.0fs); deferring to "
+                                "protective_maintain rather than flattening",
+                                "+" if pos_int > 0 else "-",
+                                abs(pos_int), ticker[-15:],
+                                _now_t - float(self._recent_placement_tickers.get(ticker, _now_t) or _now_t),
+                                recent_window_s,
+                            )
+                        continue
                     # 2026-05-01: aggressive orphan kill on non-active tickers.
                     # Previous 60s recent-placement protection was blocking
                     # cleanup of side-flip orphans (engine TP fills, then
                     # 'sell' against stale state opens an opposite-side short
                     # via Kalshi atomic). Those orphans were stamped as
                     # recent placements and skipped by the watchdog.
-                    # Now: ANY non-zero position on a non-active ticker gets
-                    # flattened immediately. The active-ticker check above
-                    # is sufficient protection for in-flight orders.
+                    # 2026-05-02 evening: recency protection restored above
+                    # (recent_tickers check); the side-flip case is now
+                    # handled by FLAT-CONFIRMED multi-reading + protective
+                    # OVERSELL-GUARD. orphan-flatten is the LAST resort
+                    # for non-recent-placement orphans (e.g. user manual
+                    # trades or genuine side-flips that cleared state).
                     # ORPHAN — flatten via market-cross sell
                     abs_count = abs(pos_int)
                     # Position fields don't tell us yes vs no directly;

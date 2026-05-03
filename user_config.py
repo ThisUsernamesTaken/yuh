@@ -612,9 +612,19 @@ ORPHAN_FLATTEN_ENABLED               = True
 ORPHAN_FLATTEN_POLL_S                = 3.0   # Poll interval (seconds —
                                               # tightened from 5s for
                                               # faster orphan detection)
-ORPHAN_FLATTEN_RECENT_S              = 60.0  # Legacy knob, retained but
-                                              # no longer enforced — see
-                                              # _orphan_flatten_loop
+ORPHAN_FLATTEN_RECENT_S              = 90.0  # 2026-05-02 evening: RESTORED
+                                              # after live observed bug:
+                                              # FLAT-CONFIRMED falsely cleared
+                                              # state on Kalshi blip, then
+                                              # orphan-flatten saw position
+                                              # re-appear and crossed at
+                                              # bid-5c locking $2.50 loss.
+                                              # The c044d04 "remove recency
+                                              # protection" commit went too
+                                              # far. Now: tickers with
+                                              # _recent_placement_tickers
+                                              # entry within this window are
+                                              # SKIPPED by orphan-flatten.
 ORPHAN_FLATTEN_OFFSET_C              = 5     # Cross-spread aggressiveness
                                               # (cents below bid). Higher
                                               # = guaranteed fill, more
