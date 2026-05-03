@@ -113,19 +113,78 @@ def _set_uc(monkeypatch, **kwargs):
     monkeypatch.setattr(pce, "_uc", _patched)
 
 
-def test_flat_confirm_clears_when_kalshi_zero_after_window(monkeypatch):
-    """Kalshi truth = 0, fill_age = 60s (>30s window) → clear and return."""
+def test_flat_confirm_clears_after_n_consecutive_zeros(monkeypatch):
+    """Kalshi=0 + fill_age=60s + 3 consecutive 0-readings spaced over 6s
+    → clear. Single 0 is not enough (postmortem fix)."""
     eng = _make_engine(kalshi_count=0, fill_age_s=60.0)
     _set_uc(
         monkeypatch,
         PROTECTIVE_ORDER_MODE=True,
         KALSHI_TAPE_ENABLED=True,
         PROTECTIVE_FLAT_CONFIRM_S=30.0,
+        PROTECTIVE_FLAT_CONFIRM_COUNT=3,
+        PROTECTIVE_FLAT_CONFIRM_SPAN_S=0.0,  # span check disabled in this test
     )
-    result = asyncio.run(eng._maintain_protective_order())
-    assert result is True, "must return True (owned, no action)"
-    assert eng._open_position is None, "engine state must be cleared"
-    assert eng._client.placed_orders == [], "no new sells placed"
+    # First two readings: should NOT clear yet (zero_count < required)
+    asyncio.run(eng._maintain_protective_order())
+    assert eng._open_position is not None, "1st zero must NOT clear"
+    asyncio.run(eng._maintain_protective_order())
+    assert eng._open_position is not None, "2nd zero must NOT clear"
+    # Third reading meets threshold
+    asyncio.run(eng._maintain_protective_order())
+    assert eng._open_position is None, "3rd zero must clear"
+    assert eng._client.placed_orders == []
+
+
+def test_flat_confirm_resets_streak_on_nonzero(monkeypatch):
+    """Single 0 reading followed by a positive reading must reset the
+    streak — Kalshi blipping back and forth (the actual race) should
+    NEVER trigger clear."""
+    eng = _make_engine(kalshi_count=0, fill_age_s=60.0)
+    _set_uc(
+        monkeypatch,
+        PROTECTIVE_ORDER_MODE=True,
+        KALSHI_TAPE_ENABLED=True,
+        PROTECTIVE_FLAT_CONFIRM_S=30.0,
+        PROTECTIVE_FLAT_CONFIRM_COUNT=3,
+        PROTECTIVE_FLAT_CONFIRM_SPAN_S=0.0,
+    )
+    asyncio.run(eng._maintain_protective_order())  # zero #1
+    asyncio.run(eng._maintain_protective_order())  # zero #2 (streak=2)
+    # Kalshi flips back to positive
+    eng._client._kalshi_count = 40
+    asyncio.run(eng._maintain_protective_order())  # streak resets to 0
+    eng._client._kalshi_count = 0
+    asyncio.run(eng._maintain_protective_order())  # zero #1 (post-reset)
+    asyncio.run(eng._maintain_protective_order())  # zero #2
+    # Position should still be open — only 2 consecutive zeros after reset
+    assert eng._open_position is not None, (
+        "non-zero reading must reset the streak; can't clear until N "
+        "consecutive zeros AFTER the reset"
+    )
+    asyncio.run(eng._maintain_protective_order())  # zero #3 → clears
+    assert eng._open_position is None
+
+
+def test_flat_confirm_requires_span_seconds_too(monkeypatch):
+    """Even with N readings, if they happen too fast (within span window),
+    don't clear. Defense against rapid-fire poll false positives."""
+    eng = _make_engine(kalshi_count=0, fill_age_s=60.0)
+    _set_uc(
+        monkeypatch,
+        PROTECTIVE_ORDER_MODE=True,
+        KALSHI_TAPE_ENABLED=True,
+        PROTECTIVE_FLAT_CONFIRM_S=30.0,
+        PROTECTIVE_FLAT_CONFIRM_COUNT=3,
+        PROTECTIVE_FLAT_CONFIRM_SPAN_S=10.0,  # 10s span requirement
+    )
+    # Three rapid readings (well under 10s)
+    for _ in range(5):
+        asyncio.run(eng._maintain_protective_order())
+    # Even with 5 readings, span isn't met yet → don't clear
+    assert eng._open_position is not None, (
+        "rapid-fire zero readings must not clear if span requirement unmet"
+    )
 
 
 def test_no_clear_when_kalshi_zero_inside_lag_window(monkeypatch):
@@ -162,15 +221,23 @@ def test_no_clear_when_kalshi_still_positive(monkeypatch):
 def test_today_actual_scenario_cleared(monkeypatch):
     """The actual scenario from 2026-05-02 13:32 PT, replayed.
     Engine state +40 YES, Kalshi 0, fill_age ~120s. With the fix,
-    engine clears state instead of placing a phantom-flatten sell."""
+    engine clears state instead of placing a phantom-flatten sell.
+
+    Updated 2026-05-02 evening: now requires N consecutive zero
+    readings (3 default) before clearing. Original scenario still
+    clears as long as Kalshi keeps reporting 0 across multiple calls."""
     eng = _make_engine(kalshi_count=0, fill_age_s=120.0, eng_count=40)
     _set_uc(
         monkeypatch,
         PROTECTIVE_ORDER_MODE=True,
         KALSHI_TAPE_ENABLED=True,
         PROTECTIVE_FLAT_CONFIRM_S=30.0,
+        PROTECTIVE_FLAT_CONFIRM_COUNT=3,
+        PROTECTIVE_FLAT_CONFIRM_SPAN_S=0.0,
     )
-    asyncio.run(eng._maintain_protective_order())
+    # Run the loop 3x to satisfy the consecutive-zeros requirement
+    for _ in range(3):
+        asyncio.run(eng._maintain_protective_order())
     assert eng._open_position is None
     assert eng._client.placed_orders == [], (
         "Pre-fix: engine would have placed a sell-yes 40ct that Kalshi "

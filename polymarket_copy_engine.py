@@ -14211,17 +14211,43 @@ class PolymarketCopyEngine:
         # AND we're past the entry cache-lag window, treat the position
         # as closed. Clear engine state and exit. The protective layer
         # is no longer needed for a flat position.
+        #
+        # 2026-05-02 evening — POSTMORTEM hardening (live observed
+        # 18:16 PT: FLAT-CONFIRMED fired on a single Kalshi=0 reading
+        # that turned out to be cache lag, not a real close. Engine
+        # cleared state, then 3s later orphan-flatten saw the position
+        # come back and crossed at bid-5c, locking in $2.50 loss).
+        # Defense: require N consecutive 0-readings spaced over M
+        # seconds before clearing. A single 0-blip no longer trips it.
         flat_confirm_window = float(_uc("PROTECTIVE_FLAT_CONFIRM_S", 30.0))
+        flat_required_count = int(_uc("PROTECTIVE_FLAT_CONFIRM_COUNT", 3))
+        flat_required_span_s = float(_uc("PROTECTIVE_FLAT_CONFIRM_SPAN_S", 6.0))
         fill_time_ts = float(pos.get("fill_time", 0) or 0)
         fill_age_s = (time.time() - fill_time_ts) if fill_time_ts > 0 else 0.0
+        # Track consecutive 0-readings on the position dict
+        if verified_ct == 0:
+            zero_n = int(pos.get("_flat_zero_count", 0) or 0) + 1
+            pos["_flat_zero_count"] = zero_n
+            if not pos.get("_flat_zero_first_ts"):
+                pos["_flat_zero_first_ts"] = time.time()
+        else:
+            pos["_flat_zero_count"] = 0
+            pos["_flat_zero_first_ts"] = None
+        zero_n = int(pos.get("_flat_zero_count", 0) or 0)
+        zero_first_ts = float(pos.get("_flat_zero_first_ts", 0) or 0)
+        zero_span = (time.time() - zero_first_ts) if zero_first_ts > 0 else 0.0
         if (verified_ct == 0
-                and fill_age_s >= flat_confirm_window):
+                and fill_age_s >= flat_confirm_window
+                and zero_n >= flat_required_count
+                and zero_span >= flat_required_span_s):
             logger.warning(
                 "PROTECTIVE FLAT-CONFIRMED: %s side=%s engine_count=%d "
-                "kalshi_count=0 fill_age=%.1fs (≥%.0fs window) — clearing "
-                "engine state, NOT placing further sells. (Likely caused "
-                "by an untracked fill closing the position.)",
-                ticker, side, truth_ct, fill_age_s, flat_confirm_window,
+                "kalshi_count=0 fill_age=%.1fs zero_streak=%d/%d span=%.1fs "
+                "(≥%.0fs window) — clearing engine state, NOT placing "
+                "further sells. (Likely caused by an untracked fill closing "
+                "the position.)",
+                ticker, side, truth_ct, fill_age_s,
+                zero_n, flat_required_count, zero_span, flat_confirm_window,
             )
             try:
                 await self._clear_position(reason="kalshi_truth_flat")

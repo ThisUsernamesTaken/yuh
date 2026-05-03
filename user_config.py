@@ -749,6 +749,13 @@ BB_PURE_TAPE_EXIT_MIN_LARGE          = 2      # ≥ N large opposite buys
 # events from untracked sells.
 PROTECTIVE_FLAT_CONFIRM_S            = 30.0   # seconds past fill_time
                                               # before trusting Kalshi=0
+# 2026-05-02 evening hardening: live observed 18:16 PT a single Kalshi=0
+# blip caused FLAT-CONFIRMED to clear state, then orphan-flatten saw the
+# (still-real) position re-appear and crossed at bid-5c — locked $2.50
+# loss on a healthy trade. Require N consecutive 0-readings spaced over
+# M seconds before clearing; single blips no longer trip it.
+PROTECTIVE_FLAT_CONFIRM_COUNT        = 3      # require N consecutive 0s
+PROTECTIVE_FLAT_CONFIRM_SPAN_S       = 6.0    # AND span across this many s
 
 # 2026-05-02 BB_PURE entry stale-cancel timeout.
 # Live observed 15:04:21 PT: BB_PURE FIRE 42ct YES @ 26c (taker).
