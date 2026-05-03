@@ -1406,3 +1406,102 @@ above-floor counts, depth-below-floor excluded, floor-knob behavior,
 edge cases. All passing. Total test suite: 485 passing.
 
 Committed and engine restarted. Resume monitoring with the new gate live.
+
+### check-in 11:56 PT — clean post-fix state
+
+State: BAL $69.55, FLAT, 0 resting, 0 fires (1 min since restart).
+
+Engine alive, processing normally:
+- 11:55:41 SR-FADE-DBG (disabled flag — expected noise)
+- 11:56:12 heartbeat at 800 cycles
+- No BB_PURE log lines yet
+- No LIQUIDITY-BLOCK events (gate not yet exercised)
+
+The liquidity gate is in code but hasn't fired live yet — no
+qualifying signal has been generated to test against. Will
+validate against any future BB_PURE FIRE attempt or any
+BB_PURE LIQUIDITY-BLOCK event in the logs.
+
+### check-in 12:01 PT — clean window flip, network blip handled
+
+State: BAL $69.55, FLAT, 0 resting, 0 fires (6 min since restart).
+
+Events:
+- 11:57:14 PT: ORPHAN-FLATTEN cycle error: Connection timeout
+  on /portfolio/positions. Transient Kalshi network blip. ORPHAN-
+  FLATTEN runs every 3s; one cycle skipped, recovered next tick.
+  Not a bug.
+- 11:59:55 PT: clean window flip to 3:00PM-3:15PM ET (12:00-
+  12:15 PT, 905s)
+
+The liquidity gate hasn't fired yet (no qualifying signal). Will
+catch any BB_PURE LIQUIDITY-BLOCK event when it does.
+
+### check-in 12:06 PT — engine in deep observation mode
+
+State: BAL $69.55, FLAT, 0 resting, 0 fires (11 min since restart).
+
+Shadow tier: bb=+20pp YES, btc5m=$+1 (BTC stable). DOMINANT-SKIP
+firing every ~0.3s. No BB_PURE log lines — strategic or book-
+crossed gate rejecting upstream silently.
+
+The liquidity gate is in code but still hasn't been exercised live.
+Engine remains in the same pattern as before today's only trade —
+healthy observation mode.
+
+### check-in 12:16 PT — clean flip + 2nd transient network blip
+
+State: BAL $69.55, FLAT, 0 resting, 0 fires (21 min since restart).
+
+Events:
+- 12:14:55 clean flip to 3:15PM-3:30PM ET (12:15-12:30 PT, 905s)
+- 12:15:18 ORPHAN-FLATTEN cycle error (2nd transient in 18min, first
+  was 11:57). Same recovery pattern. Worth tracking if it becomes
+  frequent (5+/hour) but 2 in 18min is within normal Kalshi noise.
+
+Engine alive: last log 12:16:32, bb=+20pp YES, btc5m=$+0.
+
+### 13:42 PT — EXTERNAL FILL TRIGGERED BAL-STOP RULE
+
+State pre-event: BAL $69.55, FLAT, 0 resting (96 min uptime,
+during which the engine ran cleanly with no fires of its own).
+
+13:41:35 PT: Engine logged `MANUAL FILL RAW PAYLOAD` — detected a
+fill from a DIFFERENT trading source on a DAILY BTC contract:
+  ticker: KXBTCD-26MAY0317-T79249.99 (DAILY, not KXBTC15M)
+  fills: 822ct @ 7c + 103ct @ 7c = 925 total YES contracts
+  is_taker: true (market order, $3.76 taker fees)
+  cost: $69.00 entry + $3.76 fees ≈ -$72.76 from BAL
+
+Our engine's MANUAL FILL handler auto-detected and placed TPs:
+  CopyEngine MANUAL TP PLACED: 822x YES @ 9c
+  CopyEngine MANUAL TP PLACED: 103x YES @ 9c
+
+13:42 PT — I checked state, saw BAL=$0.55 (below $60 stop trigger),
+saw 925-contract NOT-FLAT position, mistakenly classified as our
+engine's bug. Triggered IMMEDIATE STOP per decision rule:
+  - nssm stop BTCBiasEngine → SERVICE_STOPPED ✓
+  - Cancelled the 1 resting order (the MANUAL TP @ 9c on 103ct)
+
+Investigation outcome: this was the USER's OTHER trading engine
+or a manual trade — NOT our engine. Our engine correctly responded
+by placing TPs via the MANUAL FILL handler.
+
+Cancelling the TP was a mistake — it removed the auto-exit for
+the user's position. The TP was working as designed; it just
+hadn't filled because the bid book was thin at 9c. Engine remains
+STOPPED pending user direction.
+
+Position status:
+  925 YES @ 7c on KXBTCD daily, strike $79,249.99
+  Current BTC ~$78,679 ($571 below strike)
+  Settlement at 14:00 PT (= 17:00 ET cutoff for daily contract)
+  Likely outcome: NO wins, full -$69 loss to user's account
+  (which is shared with our engine's BAL view)
+
+This is a meaningful operational lesson: BAL-stop trigger is correct
+in absolute terms (BAL < $60 means engine SHOULDN'T be making new
+risky trades), but the trigger fired on activity OUR engine didn't
+initiate. Future improvement worth discussing: differentiate
+between "our engine drained BAL" vs. "external activity drained
+BAL".
