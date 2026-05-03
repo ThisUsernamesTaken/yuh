@@ -433,10 +433,18 @@ PROTECTIVE_SL_OFFSET_C           = 5      # SL price = entry - this
 # Mid-trade BTC velocity SL (2026-05-01): force SL state regardless of
 # bid if BTC is moving sharply against our position. Catches "BTC just
 # reversed" moment before contract bid catches up.
-PROTECTIVE_MID_TRADE_ADVERSE_VEL  = 10.0   # $/sec adverse threshold.
-                                           # Higher than entry gate
-                                           # (5 $/s) — only trips on
-                                           # decisive mid-trade reversal.
+PROTECTIVE_MID_TRADE_ADVERSE_VEL  = 20.0   # 2026-05-02 strategic reset
+                                           # (was 10): doubled to reduce
+                                           # false-fires on routine market
+                                           # noise. Trade 10 today fired
+                                           # SL 15+ times in 6 min at the
+                                           # 10 threshold — costing $11.
+PROTECTIVE_MID_TRADE_PERSIST_COUNT = 3     # 2026-05-02 strategic reset:
+                                           # require N consecutive polls
+                                           # showing adverse vel before
+                                           # forcing SL. ~2-3 sec sustained.
+                                           # Defends against single-poll
+                                           # spikes on a $78k underlying.
 
 # Trailing TP for BB_PURE (2026-05-01): re-enabled with smart arming.
 # Trail engages ONLY when bid exceeds the FVG-close target (the
@@ -625,13 +633,16 @@ ORPHAN_FLATTEN_RECENT_S              = 90.0  # 2026-05-02 evening: RESTORED
                                               # _recent_placement_tickers
                                               # entry within this window are
                                               # SKIPPED by orphan-flatten.
-ORPHAN_FLATTEN_OFFSET_C              = 5     # Cross-spread aggressiveness
-                                              # (cents below bid). Higher
-                                              # = guaranteed fill, more
-                                              # slippage. 5c on a 50c
-                                              # contract = 10% slippage
-                                              # vs unguaranteed exit at
-                                              # bid-1.
+ORPHAN_FLATTEN_OFFSET_C              = 1     # 2026-05-02 strategic reset:
+                                              # was 5c. We're 0.005% of
+                                              # book — bid-1 fills cleanly
+                                              # without paying 5c slippage.
+                                              # 5c was justified when the
+                                              # narrative was "race the
+                                              # market"; user reframe
+                                              # confirmed that's wrong at
+                                              # our size. bid-1 is plenty
+                                              # aggressive enough to fill.
 
 # Entry-timing filter (2026-05-01): reject BB_PURE entries when the
 # buy side is at an extreme of the recent mid range. The model's fair

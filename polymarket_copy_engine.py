@@ -14513,23 +14513,38 @@ class PolymarketCopyEngine:
         # against our position right now (faster than the entry-time
         # velocity gate), force SL state regardless of bid level. This
         # catches the "BTC just turned" moment before bid catches up.
+        #
+        # 2026-05-02 STRATEGIC RESET: require SUSTAINED adverse velocity,
+        # not single-poll trigger. Live observed today: Trade 10 fired
+        # MID-TRADE-SL 15+ times in 6 minutes on a single position because
+        # the threshold (±10 $/s) trips on routine market noise. We're
+        # 0.005% of book — small BTC moves don't warrant bailing on a
+        # screaming-edge BB_PURE entry. Require the adverse-vel condition
+        # to hold for N consecutive polls (~2-3 seconds) before forcing SL.
         try:
             pf_btc = getattr(self, "_price_feed", None)
             tt_btc = getattr(pf_btc, "tick_tracker", None) if pf_btc else None
             if tt_btc is not None and not getattr(tt_btc, "is_stale", True):
                 _btc_vel = float(getattr(tt_btc, "tick_velocity", 0.0) or 0.0)
-                _adverse_thresh = float(_uc("PROTECTIVE_MID_TRADE_ADVERSE_VEL", 10.0))
+                _adverse_thresh = float(_uc("PROTECTIVE_MID_TRADE_ADVERSE_VEL", 20.0))
+                _persist_count = int(_uc("PROTECTIVE_MID_TRADE_PERSIST_COUNT", 3))
                 _adverse = (
                     (side == "yes" and _btc_vel <= -_adverse_thresh)
                     or (side == "no" and _btc_vel >= _adverse_thresh)
                 )
-                if _adverse and target_state != "sl":
+                # Track consecutive adverse polls on the position dict
+                if _adverse:
+                    pos["_mid_sl_streak"] = int(pos.get("_mid_sl_streak", 0) or 0) + 1
+                else:
+                    pos["_mid_sl_streak"] = 0
+                _streak = int(pos.get("_mid_sl_streak", 0) or 0)
+                if _streak >= _persist_count and target_state != "sl":
                     logger.warning(
                         "PROTECTIVE MID-TRADE-SL: BTC vel=%+.1f adverse "
-                        "(threshold=±%.1f) — forcing SL exit on %s "
-                        "position despite bid=%dc above entry-%dc",
-                        _btc_vel, _adverse_thresh, side.upper(),
-                        bid, sl_offset,
+                        "(threshold=±%.1f) streak=%d/%d — forcing SL exit on "
+                        "%s position despite bid=%dc above entry-%dc",
+                        _btc_vel, _adverse_thresh, _streak, _persist_count,
+                        side.upper(), bid, sl_offset,
                     )
                     target_state = "sl"
                     target_px = max(1, min(99, entry - sl_offset))
