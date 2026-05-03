@@ -1173,3 +1173,18 @@ lost** (slippage check did its job). 27 min uptime since 10:24
 restart.
 
 **Engine remains STOPPED** pending review.
+
+### 10:59 PT — engine reset
+
+User authorized reset. Pre-restart Kalshi state verified clean
+(BAL $73.12, FLAT, 0 resting). Disk lock already empty.
+
+nssm start → SERVICE_RUNNING. STARTUP log at 10:59:12 PT, no
+SESSION-LOCK restore (already empty), no errors.
+
+Both fixes live in this process:
+1. Lock-release on place_order failure (5b1a836)
+2. BOOK-CROSSED guard against phantom-bid signals (ba60f53)
+
+Window 10:45-11:00 PT still active when restart happened. Engine
+will trade the rest of this window. Monitoring resumed.
