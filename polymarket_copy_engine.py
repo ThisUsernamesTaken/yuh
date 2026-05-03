@@ -8975,7 +8975,16 @@ class PolymarketCopyEngine:
         # Build config (with conviction-tier knobs, 2026-05-01)
         config = {
             "min_edge_pp":           float(_uc("BB_PURE_MIN_EDGE_PP", 8.0)),
-            "max_entry_cents":       int(_uc("BB_PURE_MAX_ENTRY_CENTS", 70)),
+            # 2026-05-03: pass the MAX of mean-rev and trend caps so
+            # bb_pure doesn't pre-filter entries that would qualify for
+            # trend mode. Regime-specific cap is applied post-eval below
+            # once the strike-distance gate determines which regime applies.
+            "max_entry_cents":       max(
+                int(_uc("BB_PURE_MAX_ENTRY_CENTS", 55)),
+                int(_uc("BB_TREND_MAX_ENTRY_CENTS", 75))
+                if bool(_uc("BB_TREND_MODE_ENABLED", False))
+                else int(_uc("BB_PURE_MAX_ENTRY_CENTS", 55)),
+            ),
             "min_entry_cents":       int(_uc("BB_PURE_MIN_ENTRY_CENTS", 5)),
             "min_time_remaining_s":  float(_uc("BB_PURE_MIN_TIME_REMAINING_S", 60.0)),
             "kelly_fraction":        float(_uc("BB_PURE_KELLY_FRACTION", 0.25)),
@@ -9019,7 +9028,22 @@ class PolymarketCopyEngine:
         # of the older microstructure gates. If we're not in the right
         # market context, no other signal matters.
 
-        # Strike-distance gate
+        # Strike-distance gate (dual-regime, 2026-05-03)
+        # Two distinct alpha regimes:
+        #   MEAN_REVERSION: dist <= MAX_STRIKE_DIST_PCT (default 0.04%)
+        #     Original strategy. Near-strike, gamma is high, BB model is well
+        #     calibrated, prices are meaningful. Trades whichever side is
+        #     underpriced regardless of trend direction.
+        #   TREND: dist >= TREND_MIN_STRIKE_DIST_PCT (default 0.15%)
+        #     New strategy (BB_TREND_MODE_ENABLED). Far-from-strike, BTC has
+        #     drifted firmly in one direction. The contract is priced "very
+        #     likely YES/NO" but BB still sees additional edge from precise
+        #     fair-value math. Trades WITH the trend only (signal direction
+        #     must match BTC's side relative to strike), and only when
+        #     5-min momentum is not strongly reverting.
+        # Between these zones (mid-range): book is noisy, neither thesis
+        # applies → block.
+        sig_regime = "MEAN_REVERSION"  # default; overridden below if trend
         if bool(_uc("BB_PURE_STRIKE_DISTANCE_GATE_ENABLED", True)):
             try:
                 btc_price = float(getattr(self, "_btc_last_price", 0.0) or 0.0)
@@ -9027,12 +9051,94 @@ class PolymarketCopyEngine:
                 if btc_price > 0 and strike > 0:
                     dist_pct = abs(btc_price - strike) / btc_price
                     max_dist_pct = float(_uc("BB_PURE_MAX_STRIKE_DIST_PCT", 0.0004))
-                    if dist_pct > max_dist_pct:
+
+                    in_meanrev_zone = dist_pct <= max_dist_pct
+
+                    trend_mode_on = bool(_uc("BB_TREND_MODE_ENABLED", False))
+                    in_trend_zone = False
+                    trend_match = False
+                    persistence_ok = False
+                    if trend_mode_on:
+                        trend_min_dist = float(
+                            _uc("BB_TREND_MIN_STRIKE_DIST_PCT", 0.0015)
+                        )
+                        in_trend_zone = dist_pct >= trend_min_dist
+                        if in_trend_zone:
+                            btc_above = btc_price > strike
+                            signal_dir_yes = (sig.side == "yes")
+                            trend_match = (btc_above == signal_dir_yes)
+                            # Persistence: 5-min momentum should not be
+                            # strongly reverting against the trend. If BTC is
+                            # above strike but dropped >$50 in last 5min, it
+                            # might revert through strike — block trend entry.
+                            try:
+                                btc_5m_move = float(
+                                    getattr(self._last_pressure,
+                                            "btc_move_300s", 0.0) or 0.0
+                                )
+                            except Exception:
+                                btc_5m_move = 0.0
+                            max_revert = float(
+                                _uc("BB_TREND_MAX_REVERSAL_DOLLARS", 50.0)
+                            )
+                            if btc_above:
+                                # Need: not strongly reverting DOWN
+                                persistence_ok = (btc_5m_move > -max_revert)
+                            else:
+                                # Need: not strongly reverting UP
+                                persistence_ok = (btc_5m_move < max_revert)
+
+                    if in_meanrev_zone:
+                        sig_regime = "MEAN_REVERSION"
+                    elif trend_mode_on and in_trend_zone and trend_match \
+                            and persistence_ok:
+                        sig_regime = "TREND"
+                    else:
+                        # Neither qualifying regime — block
+                        if trend_mode_on and in_trend_zone:
+                            # Diagnostic: in trend zone but failed match/persist
+                            logger.info(
+                                "BB_PURE STRIKE-DIST-BLOCK: BTC $%.0f strike "
+                                "$%.0f dist=%.4f%% in TREND zone but "
+                                "match=%s persist=%s — skipping",
+                                btc_price, strike, dist_pct * 100,
+                                trend_match, persistence_ok,
+                            )
+                        else:
+                            logger.info(
+                                "BB_PURE STRIKE-DIST-BLOCK: BTC $%.0f strike "
+                                "$%.0f dist=%.4f%% > %.4f%% — neither "
+                                "mean-rev nor trend zone (skipping)",
+                                btc_price, strike, dist_pct * 100,
+                                max_dist_pct * 100,
+                            )
+                        return None
+
+                    # Stamp regime for downstream logging / sizing decisions
+                    try:
+                        setattr(sig, "regime", sig_regime)
+                    except Exception:
+                        pass
+
+                    # Regime-specific entry-price cap (after regime decided)
+                    if sig_regime == "MEAN_REVERSION":
+                        regime_cap = int(_uc("BB_PURE_MAX_ENTRY_CENTS", 55))
+                        regime_min = int(_uc("BB_PURE_MIN_ENTRY_CENTS", 5))
+                    else:  # TREND
+                        regime_cap = int(_uc("BB_TREND_MAX_ENTRY_CENTS", 75))
+                        regime_min = int(_uc("BB_TREND_MIN_ENTRY_CENTS", 60))
+                    if sig.suggested_entry_cents > regime_cap:
                         logger.info(
-                            "BB_PURE STRIKE-DIST-BLOCK: BTC $%.0f strike $%.0f "
-                            "dist=%.4f%% > %.4f%% — too far from strike, "
-                            "prices not meaningful (skipping)",
-                            btc_price, strike, dist_pct * 100, max_dist_pct * 100,
+                            "BB_PURE ENTRY-CAP-BLOCK: regime=%s entry=%dc "
+                            "> cap=%dc — skipping",
+                            sig_regime, sig.suggested_entry_cents, regime_cap,
+                        )
+                        return None
+                    if sig.suggested_entry_cents < regime_min:
+                        logger.info(
+                            "BB_PURE ENTRY-MIN-BLOCK: regime=%s entry=%dc "
+                            "< min=%dc — skipping",
+                            sig_regime, sig.suggested_entry_cents, regime_min,
                         )
                         return None
             except Exception as _se:
@@ -9317,8 +9423,10 @@ class PolymarketCopyEngine:
         except Exception:
             pass
         logger.info(
-            "BB_PURE SIGNAL: %s ticker=%s %s",
-            sig.side.upper(), ticker[-15:], sig.reason,
+            "BB_PURE SIGNAL: %s ticker=%s regime=%s %s",
+            sig.side.upper(), ticker[-15:],
+            getattr(sig, "regime", "MEAN_REVERSION"),
+            sig.reason,
         )
         return sig
 

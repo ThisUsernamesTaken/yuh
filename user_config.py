@@ -501,6 +501,34 @@ BB_PURE_MODE                     = True   # 2026-04-30 PM: Session 2 wired
                                           # — bypasses composite cascade,
                                           # trades pure BB mispricing
 BB_PURE_MIN_EDGE_PP              = 8.0    # Min mispricing pp to fire (static)
+# ─── BB_TREND mode (2026-05-03) ─────────────────────────────────────────
+# Sibling alpha to mean-reversion: when BTC has drifted firmly in one
+# direction (>= TREND_MIN_STRIKE_DIST_PCT from strike), the contract is
+# correctly priced as "very likely YES/NO" — but BB still sees additional
+# pp-edge from precise fair-value math. Trades WITH the trend only:
+#   - Signal direction (sig.side) must match BTC's side relative to strike
+#   - 5-min momentum (btc_move_300s) must NOT be strongly reverting
+#     against the trend (capped by MAX_REVERSAL_DOLLARS)
+# Mutex with mean-reversion via per-window ticker lock — only one trade
+# per window regardless of which regime fires.
+#
+# Counterfactual analysis on 2026-05-03 showed all 6 settled windows we
+# observed went YES, but mean-reversion gate (0.04% strike-dist) blocked
+# every entry. Trend mode would have caught those wins.
+#
+# DEFAULT OFF until backtested. Caller responsibility: review backtest
+# results before flipping. See scripts/backtest_dual_regime.py.
+BB_TREND_MODE_ENABLED            = False   # default off
+BB_TREND_MIN_STRIKE_DIST_PCT     = 0.0015  # require >= 0.15% from strike
+BB_TREND_MAX_REVERSAL_DOLLARS    = 50.0    # block if 5min move reverts >$50 against trend
+BB_TREND_MAX_ENTRY_CENTS         = 75      # higher cap than mean-rev (55c)
+# Min entry for trend mode (2026-05-03 backtest finding):
+# Cheap trend entries (30-59c) had 0/5 hit rate → -$18.52 in backtest.
+# Expensive trend entries (60-75c) had 6/7 hit rate → +$9.09. The
+# profitable subset is at high entry prices where the trend is already
+# well-established. Setting MIN at 60c captures the profitable subset
+# only.
+BB_TREND_MIN_ENTRY_CENTS         = 60
 # Post-failure cooldown (2026-05-03): when place_order is rejected by
 # Kalshi (e.g., post_only_cross from book moving between eval and
 # Kalshi-time), back off this ticker for N seconds so we don't spam
