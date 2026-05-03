@@ -8955,6 +8955,61 @@ class PolymarketCopyEngine:
         if sig is None:
             return None
 
+        # ── 2026-05-02 STRATEGIC RESET GATES ──────────────────────────────
+        # User insights validated by manual trading observation:
+        #   1. "Market confidence is far less speculative when < ±0.04% of strike"
+        #      — gamma is high near strike, prices are meaningful. Far from
+        #      strike, contract is mostly settled and book is noise.
+        #   2. Overnight is "ruthless" — pause outside US/EU active hours.
+        #
+        # These gates encode that knowledge as the FIRST filter, before any
+        # of the older microstructure gates. If we're not in the right
+        # market context, no other signal matters.
+
+        # Strike-distance gate
+        if bool(_uc("BB_PURE_STRIKE_DISTANCE_GATE_ENABLED", True)):
+            try:
+                btc_price = float(getattr(self, "_btc_last_price", 0.0) or 0.0)
+                strike = float(getattr(prob, "strike", 0.0) or 0.0)
+                if btc_price > 0 and strike > 0:
+                    dist_pct = abs(btc_price - strike) / btc_price
+                    max_dist_pct = float(_uc("BB_PURE_MAX_STRIKE_DIST_PCT", 0.0004))
+                    if dist_pct > max_dist_pct:
+                        logger.info(
+                            "BB_PURE STRIKE-DIST-BLOCK: BTC $%.0f strike $%.0f "
+                            "dist=%.4f%% > %.4f%% — too far from strike, "
+                            "prices not meaningful (skipping)",
+                            btc_price, strike, dist_pct * 100, max_dist_pct * 100,
+                        )
+                        return None
+            except Exception as _se:
+                logger.debug("BB_PURE strike-distance check failed: %s", _se)
+
+        # Time-of-day gate
+        if bool(_uc("BB_PURE_TRADING_HOURS_GATE_ENABLED", True)):
+            try:
+                from datetime import datetime, timezone, timedelta
+                # Local PT time (UTC-7 PDT or UTC-8 PST)
+                pt_offset_h = float(_uc("BB_PURE_PT_UTC_OFFSET_H", -7.0))
+                now_pt = datetime.now(timezone.utc) + timedelta(hours=pt_offset_h)
+                hour_pt = now_pt.hour
+                start_h = int(_uc("BB_PURE_TRADING_HOUR_START_PT", 6))
+                end_h = int(_uc("BB_PURE_TRADING_HOUR_END_PT", 22))
+                # Window is [start, end). Wraps if start > end.
+                if start_h <= end_h:
+                    in_window = (start_h <= hour_pt < end_h)
+                else:
+                    in_window = (hour_pt >= start_h or hour_pt < end_h)
+                if not in_window:
+                    logger.info(
+                        "BB_PURE HOURS-BLOCK: PT hour %d outside trading window "
+                        "[%d, %d) — overnight tape too ruthless (skipping)",
+                        hour_pt, start_h, end_h,
+                    )
+                    return None
+            except Exception as _he:
+                logger.debug("BB_PURE trading-hours check failed: %s", _he)
+
         # 2026-05-01 BTC STABILITY GATE (added evening of session):
         # MFE/MAE analysis showed: successful entries had small adverse
         # drawdown (~1-2c). Failed entries drew down 8-47c before either

@@ -767,6 +767,28 @@ PROTECTIVE_FLAT_CONFIRM_S            = 30.0   # seconds past fill_time
 PROTECTIVE_FLAT_CONFIRM_COUNT        = 3      # require N consecutive 0s
 PROTECTIVE_FLAT_CONFIRM_SPAN_S       = 6.0    # AND span across this many s
 
+# ─────────────────────────────────────────────────────────────────────────
+# 2026-05-02 STRATEGIC RESET GATES
+# ─────────────────────────────────────────────────────────────────────────
+# These gates encode user-validated alpha conditions. Apply BEFORE the older
+# microstructure gates — if market context is wrong, no signal matters.
+
+# Strike-distance gate: only fire when |BTC - strike| / BTC < threshold.
+# User insight (2026-05-02): "Market confidence is far less speculative when
+# < ±0.04% of strike". At BTC=$78k, that's ~$31. Inside that band gamma is
+# high and prices are meaningful; outside, the contract is mostly settled
+# (probability near 0 or 1) and book noise dominates.
+BB_PURE_STRIKE_DISTANCE_GATE_ENABLED = True
+BB_PURE_MAX_STRIKE_DIST_PCT          = 0.0004  # 0.04% (~$31 at $78k BTC)
+
+# Time-of-day gate: pause during overnight hours where the tape is "ruthless"
+# per user manual-trading observation 2026-05-02. Default 06:00–22:00 PT
+# (= 13:00–05:00 UTC). Window covers US/EU active hours.
+BB_PURE_TRADING_HOURS_GATE_ENABLED   = True
+BB_PURE_TRADING_HOUR_START_PT        = 6
+BB_PURE_TRADING_HOUR_END_PT          = 22
+BB_PURE_PT_UTC_OFFSET_H              = -7.0    # PDT (summer); -8 in winter
+
 # 2026-05-02 BB_PURE entry stale-cancel timeout.
 # Live observed 15:04:21 PT: BB_PURE FIRE 42ct YES @ 26c (taker).
 # By the time Kalshi processed our taker order at 26c, the ask had
