@@ -2239,6 +2239,19 @@ class PolymarketCopyEngine:
             except Exception:
                 logger.exception("CopyEngine BB_PURE evaluator/execute error")
 
+        # 2026-05-03: BB_MOMENTUM — directional-trend strategy, sibling
+        # of BB_PURE. Runs when bb_pure didn't fire. Per-window mutex
+        # via _entered_tickers_this_window prevents double-firing.
+        if not signal and bool(_uc("BB_MOMENTUM_ENABLED", False)):
+            try:
+                mom_sig = await self._evaluate_bb_momentum_signal()
+                if mom_sig is not None:
+                    await self._execute_bb_pure_signal(mom_sig)  # reuse path
+                    self._publish_state()
+                    return
+            except Exception:
+                logger.exception("CopyEngine BB_MOMENTUM evaluator/execute error")
+
         # Wallet tiers DISABLED — data shows they override contract mid direction
         # and reduce accuracy from 77% (paper/mid-only) to 58% (live/wallet-override).
         # Only TA_FORCED with contract mid direction + VWAP timing.
@@ -9431,6 +9444,149 @@ class PolymarketCopyEngine:
         )
         return sig
 
+    async def _evaluate_bb_momentum_signal(self):
+        """Momentum-rider signal evaluator (2026-05-03).
+
+        Calls `bb_momentum.evaluate_entry()` to detect sustained directional
+        BTC movement. Returns an adapted signal that flows through the
+        existing BB_PURE execution path (which is solid — gates, lock,
+        place_order, position-stamping).
+
+        Differences from bb_pure:
+          - No fair-value math; bets on directional persistence
+          - Sizing uses fixed-fractional (NO Kelly)
+          - Stamps position with `strategy="BB_MOMENTUM"`,
+            `entry_velocity_30s`, and `entry_btc_above_strike` so the
+            protective layer can apply momentum-specific exit logic
+            (strike-cross + MFE-trail)
+
+        Returns:
+            BBSignal-compatible object (with `regime="MOMENTUM"` and
+            entry-velocity attached) | None
+        """
+        if not bool(_uc("BB_MOMENTUM_ENABLED", False)):
+            return None
+        try:
+            from bb_momentum import evaluate_entry as mom_evaluate
+            from bb_pure import BBSignal
+        except Exception as e:
+            logger.error("BB_MOMENTUM: import failed: %s", e)
+            return None
+        # Need an active ticker
+        ticker = getattr(self, "_current_kalshi_ticker", "") or ""
+        if not ticker:
+            return None
+        # Need WS book for current YES mid
+        ws = getattr(self, "_kalshi_ws", None)
+        book = ws.get_book(ticker) if ws and hasattr(ws, "get_book") else None
+        if book is None or not book.is_ready:
+            return None
+        # Reuse BB_PURE's book-crossed guard
+        try:
+            _yb = int(getattr(book, "best_yes_bid", 0) or 0)
+            _nb = int(getattr(book, "best_no_bid", 0) or 0)
+            if _yb > 0 and _nb > 0 and (_yb + _nb) > 100:
+                return None  # crossed/stale book
+        except Exception:
+            pass
+        market_mid_cents = int(book.mid_price_cents)
+        if market_mid_cents <= 0:
+            return None
+        # Time to expiry
+        ws_start = float(getattr(self, "_window_start_time", 0) or 0)
+        if ws_start <= 0:
+            return None
+        secs_to_exp = max(0.0, 900.0 - (time.time() - ws_start))
+        # Balance
+        bal_dollars = float(_LIVE_BALANCE_DOLLARS or 0.0)
+        if bal_dollars <= 0:
+            return None
+        # Velocity inputs from PressureScore
+        try:
+            btc_30s = float(getattr(
+                self._last_pressure, "btc_move_30s", 0.0) or 0.0)
+            btc_300s = float(getattr(
+                self._last_pressure, "btc_move_300s", 0.0) or 0.0)
+        except Exception:
+            return None
+
+        config = {
+            "min_btc_move_300s_dollars": float(
+                _uc("BB_MOMENTUM_MIN_BTC_MOVE_300S", 30.0)),
+            "min_btc_move_30s_dollars": float(
+                _uc("BB_MOMENTUM_MIN_BTC_MOVE_30S", 10.0)),
+            "require_same_direction": bool(
+                _uc("BB_MOMENTUM_REQUIRE_SAME_DIRECTION", True)),
+            "max_entry_cents": int(
+                _uc("BB_MOMENTUM_MAX_ENTRY_CENTS", 50)),
+            "min_entry_cents": int(
+                _uc("BB_MOMENTUM_MIN_ENTRY_CENTS", 5)),
+            "min_time_remaining_s": float(
+                _uc("BB_MOMENTUM_MIN_TIME_REMAINING_S", 90.0)),
+            "kelly_fraction": float(
+                _uc("BB_MOMENTUM_KELLY_FRACTION", 0.20)),
+            "kelly_max_frac": float(
+                _uc("BB_MOMENTUM_KELLY_MAX_FRAC", 0.05)),
+            "max_contracts": int(_get_sizing_cap()),
+        }
+
+        try:
+            mom_sig = mom_evaluate(
+                btc_move_30s=btc_30s,
+                btc_move_300s=btc_300s,
+                yes_mid_cents=market_mid_cents,
+                seconds_to_expiry=secs_to_exp,
+                balance_dollars=bal_dollars,
+                config=config,
+            )
+        except Exception as e:
+            logger.error("BB_MOMENTUM evaluate error: %s", e)
+            return None
+        if mom_sig is None:
+            return None
+
+        # Track strike for post-entry strike-cross detection
+        try:
+            btc_now = float(getattr(self, "_btc_last_price", 0.0) or 0.0)
+            prob = getattr(self._price_feed, "prob_engine", None)
+            strike = float(getattr(prob, "strike", 0.0) or 0.0)
+            entry_btc_above = btc_now > strike if strike > 0 else None
+        except Exception:
+            entry_btc_above = None
+
+        # Adapt to BBSignal shape so existing execute path handles it.
+        # fair_yes_cents and edge_pp are placeholders — momentum doesn't
+        # use them. The post-entry exit logic uses extra fields stamped
+        # below.
+        adapted = BBSignal(
+            side=mom_sig.side,
+            edge_pp=10.0,  # placeholder — protective layer ignores for momentum
+            fair_yes_cents=int(market_mid_cents
+                               + (10 if mom_sig.side == "yes" else -10)),
+            market_mid_cents=int(market_mid_cents),
+            suggested_entry_cents=int(mom_sig.suggested_entry_cents),
+            win_probability=float(mom_sig.suggested_entry_cents) / 100.0,
+            kelly_fraction=float(mom_sig.kelly_fraction),
+            contracts=int(mom_sig.contracts),
+            seconds_to_expiry=float(mom_sig.seconds_to_expiry),
+            reason=mom_sig.reason,
+            conviction_tier=1,
+        )
+        # Stamp momentum-specific fields for the protective layer
+        try:
+            setattr(adapted, "regime", "MOMENTUM")
+            setattr(adapted, "entry_velocity_30s", float(mom_sig.velocity_30s))
+            setattr(adapted, "entry_btc_above_strike", entry_btc_above)
+            setattr(adapted, "_is_momentum", True)
+        except Exception:
+            pass
+
+        logger.warning(
+            "BB_MOMENTUM SIGNAL: %s ticker=%s %s",
+            mom_sig.side.upper(), ticker[-15:], mom_sig.reason,
+        )
+        return adapted
+
     async def _cancel_unfilled_bb_pure_entry(
         self, order_id: str, ticker: str, entry_px: int
     ) -> None:
@@ -9851,6 +10007,10 @@ class PolymarketCopyEngine:
                 logger.warning("BB_PURE schedule-cancel failed: %s", _ce)
             return
 
+        # 2026-05-03: detect momentum signal vs bb_pure for post-entry logic
+        is_momentum = bool(getattr(sig, "_is_momentum", False))
+        strategy_name = "BB_MOMENTUM" if is_momentum else "BB_PURE"
+
         # Set _open_position so protective-order mode + safety reconciler
         # take over from here.
         self._open_position = {
@@ -9860,11 +10020,11 @@ class PolymarketCopyEngine:
             "original_entry_cents": entry_px,
             "original_count": filled,
             "ticker": ticker,
-            "tier": "BB_PURE",
-            "strategy_name": "BB_PURE",
+            "tier": strategy_name,
+            "strategy_name": strategy_name,
             "count": filled,
             "fill_time": time.time(),
-            "_dca_maxed": True,  # BB_PURE doesn't DCA — Kelly sized it once
+            "_dca_maxed": True,  # neither tier DCAs
             "entry_conviction": min(1.0, sig.edge_pp / 30.0),
             "entry_wallets": 0,
             "entry_wallet_count_at_last_scale": 0,
@@ -9885,6 +10045,14 @@ class PolymarketCopyEngine:
             "_bb_pure_market_mid_at_entry": sig.market_mid_cents,
             "_bb_pure_edge_pp_at_entry": sig.edge_pp,
             "_bb_pure_conviction_tier": int(getattr(sig, "conviction_tier", 1)),
+            # 2026-05-03 BB_MOMENTUM post-entry tracking (used for
+            # strike-cross + MFE-trail exit logic in protective layer).
+            # Defaults are no-ops when strategy is not BB_MOMENTUM.
+            "_mom_entry_velocity_30s": float(
+                getattr(sig, "entry_velocity_30s", 0.0) or 0.0),
+            "_mom_entry_btc_above_strike": getattr(
+                sig, "entry_btc_above_strike", None),
+            "_mom_best_seen_cents": int(entry_px),  # MFE tracker
         }
         # 2026-05-02 Phase 0.1.2: defensive re-add via persist helper.
         self._add_session_lock(ticker)
@@ -14556,6 +14724,113 @@ class PolymarketCopyEngine:
         side = (pos.get("side") or "").lower()
         if not ticker or side not in ("yes", "no"):
             return False
+
+        # ── BB_MOMENTUM POST-ENTRY EXIT SIGNALS (2026-05-03) ──────────
+        # Backtest validated +$19.86 vs +$9.99 hold-to-settle baseline.
+        # Two exit conditions checked per protective tick:
+        #   STRIKE-CROSS: BTC has structurally crossed against our entry
+        #                 side relative to strike. Binary contract is
+        #                 resolving against us. Exit immediately.
+        #   MFE-TRAIL:    once we've seen +trigger profit, exit on the
+        #                 first trail-cents retracement. Catches "failed
+        #                 breakouts" — 81-91% hit rate in backtest.
+        # Only applies when this position was opened by BB_MOMENTUM.
+        if pos.get("strategy_name") == "BB_MOMENTUM":
+            try:
+                ws = getattr(self, "_kalshi_ws", None)
+                book = ws.get_book(ticker) if ws and hasattr(
+                    ws, "get_book") else None
+                if book is not None and book.is_ready:
+                    # Compute current our-side mid
+                    if side == "yes":
+                        our_mid = int(book.mid_price_cents)
+                    else:
+                        our_mid = 100 - int(book.mid_price_cents)
+                    # Update MFE
+                    best_seen = int(pos.get("_mom_best_seen_cents",
+                                              pos.get("entry_cents", 0)))
+                    if our_mid > best_seen:
+                        pos["_mom_best_seen_cents"] = our_mid
+                        best_seen = our_mid
+
+                    entry_px = int(pos.get("entry_cents", 0))
+                    exit_now = False
+                    exit_reason = ""
+
+                    # Strike-cross check
+                    if bool(_uc("BB_MOMENTUM_STRIKE_CROSS_EXIT_ENABLED", True)):
+                        try:
+                            btc_now = float(getattr(
+                                self, "_btc_last_price", 0.0) or 0.0)
+                            prob = getattr(
+                                self._price_feed, "prob_engine", None)
+                            strike = float(getattr(
+                                prob, "strike", 0.0) or 0.0)
+                            entry_above = pos.get(
+                                "_mom_entry_btc_above_strike")
+                            if (btc_now > 0 and strike > 0
+                                    and entry_above is not None):
+                                btc_above_now = btc_now > strike
+                                if side == "yes":
+                                    if (entry_above and not btc_above_now):
+                                        exit_now = True
+                                        exit_reason = "STRIKE-CROSS"
+                                else:  # no
+                                    if (not entry_above) and btc_above_now:
+                                        exit_now = True
+                                        exit_reason = "STRIKE-CROSS"
+                        except Exception:
+                            pass
+
+                    # MFE-trail check
+                    if not exit_now and bool(_uc(
+                            "BB_MOMENTUM_MFE_TRAIL_ENABLED", True)):
+                        trigger = int(_uc(
+                            "BB_MOMENTUM_MFE_TRIGGER_CENTS", 3))
+                        trail = int(_uc(
+                            "BB_MOMENTUM_MFE_TRAIL_CENTS", 1))
+                        if best_seen - entry_px >= trigger:
+                            if our_mid <= best_seen - trail:
+                                exit_now = True
+                                exit_reason = (
+                                    f"MFE-TRAIL best={best_seen} "
+                                    f"now={our_mid} trail={trail}"
+                                )
+
+                    if exit_now:
+                        # Trigger immediate exit via cross-spread sell.
+                        # Use the sell_safety helper to place a taker
+                        # sell at the current bid for our position size.
+                        try:
+                            count = int(pos.get("count", 0))
+                            if count > 0:
+                                if side == "yes":
+                                    bid = int(getattr(
+                                        book, "best_yes_bid", 0) or 0)
+                                else:
+                                    bid = int(getattr(
+                                        book, "best_no_bid", 0) or 0)
+                                if bid > 0:
+                                    logger.warning(
+                                        "BB_MOMENTUM POST-ENTRY EXIT: %s "
+                                        "%dct @ %dc reason=%s "
+                                        "(entry=%dc best=%dc)",
+                                        side.upper(), count, bid,
+                                        exit_reason, entry_px, best_seen,
+                                    )
+                                    await self._client.place_order(
+                                        ticker=ticker,
+                                        side=side,
+                                        action="sell",
+                                        price=bid,
+                                        count=count,
+                                        post_only=False,
+                                    )
+                        except Exception as _ee:
+                            logger.warning(
+                                "BB_MOMENTUM exit-place failed: %s", _ee)
+            except Exception as _me:
+                logger.debug("BB_MOMENTUM post-entry check error: %s", _me)
         # Truth count from Kalshi (with brief retry to defeat cache lag).
         # Cache-lag has TWO directions:
         #   1. Right after BUY fill, Kalshi may briefly show 0 before the

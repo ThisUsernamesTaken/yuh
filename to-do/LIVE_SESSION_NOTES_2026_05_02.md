@@ -1540,3 +1540,38 @@ For $0.55 bankroll (current): neither viable until refund.
 
 Strategy is built, default OFF, ready when user refunds and decides
 which mode (stall vs hold).
+
+### 14:30 PT — bb_momentum WIRED INTO ENGINE, default ON
+
+User directive: "Let's test it live"
+
+Integration shipped:
+1. _evaluate_bb_momentum_signal() — new evaluator method, calls
+   bb_momentum.evaluate_entry(), adapts MomentumSignal to BBSignal
+   shape so existing execute path handles it. Stamps regime="MOMENTUM"
+   and entry_velocity_30s + entry_btc_above_strike for post-entry use.
+2. Cascade integration: runs after BB_PURE in the cascade, only when
+   BB_MOMENTUM_ENABLED=True. Per-window mutex via session_lock prevents
+   double-firing.
+3. Position-dict stamping: detects _is_momentum flag on signal and
+   sets strategy_name="BB_MOMENTUM" + _mom_entry_velocity_30s +
+   _mom_entry_btc_above_strike + _mom_best_seen_cents on the
+   _open_position dict.
+4. Post-entry exit logic in _maintain_protective_order:
+   - STRIKE-CROSS: if BTC structurally crosses against entry side,
+     immediate cross-spread sell at current bid
+   - MFE-TRAIL: track best-seen price, when profit >= trigger (3c)
+     and current price retraces by trail (1c), exit at current bid
+   - Both gated by BB_MOMENTUM_STRIKE_CROSS_EXIT_ENABLED and
+     BB_MOMENTUM_MFE_TRAIL_ENABLED (default True when momentum on)
+
+Config defaults set to ENABLE the strategy (BB_MOMENTUM_ENABLED=True)
+since user explicitly authorized live testing.
+
+Caveat: BAL is $0.55 — pre-fire BAL gate (2× cost mult) means the
+strategy can fire only on entries costing < $0.27. With min entry
+5c and 1ct minimum, that's $0.05 cost per entry × 2 = $0.10
+required BAL. So entries up to ~5ct will fire.
+
+Test suite: 506 passing, 2 pre-existing unrelated failures.
+Engine restart pending for activation.

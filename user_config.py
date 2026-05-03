@@ -893,6 +893,36 @@ BB_PURE_BAL_GATE_ENABLED             = True
 BB_PURE_LIQUIDITY_GATE_ENABLED        = True
 BB_PURE_MIN_EXIT_BID_DEPTH_CONTRACTS  = 1     # require >= entry_size or this floor
 BB_PURE_MAX_EXIT_LOSS_CENTS           = 25    # exit must be available within 25c of entry
+
+# ─── BB_MOMENTUM (2026-05-03) ───────────────────────────────────────────
+# Directional-trend strategy. Sibling of BB_PURE — runs after BB_PURE in
+# the cascade. Per-window mutex via _entered_tickers_this_window prevents
+# both from firing on the same ticker.
+#
+# Detection: btc_move_300s + btc_move_30s same direction, magnitude
+#            above thresholds. Buys WITH the trend at cheap-side prices.
+# Exits:     STRIKE-CROSS (BTC structurally crosses against us) +
+#            MFE-TRAIL (lock profits after seeing trigger cents above
+#            entry, exit on first trail-cents retracement).
+#
+# Backtest on 273 settled tickers: +$19.86 with combined exits vs
+# +$9.99 hold-to-settle baseline. MFE-TRAIL exits hit 81-91%.
+#
+# Default OFF — flip to True to enable live.
+BB_MOMENTUM_ENABLED                  = True   # ENABLE bb_momentum cascade
+BB_MOMENTUM_MIN_BTC_MOVE_300S        = 30.0   # require >=$30 over 5min
+BB_MOMENTUM_MIN_BTC_MOVE_30S         = 10.0   # confirmation: >=$10 in last 30s
+BB_MOMENTUM_REQUIRE_SAME_DIRECTION   = True   # 30s + 300s must agree
+BB_MOMENTUM_MAX_ENTRY_CENTS          = 50     # only buy when our-side mid <= 50c
+BB_MOMENTUM_MIN_ENTRY_CENTS          = 5
+BB_MOMENTUM_MIN_TIME_REMAINING_S     = 90.0
+BB_MOMENTUM_KELLY_FRACTION           = 0.20   # fixed-fractional sizing
+BB_MOMENTUM_KELLY_MAX_FRAC           = 0.05
+# Post-entry exit signals
+BB_MOMENTUM_STRIKE_CROSS_EXIT_ENABLED = True
+BB_MOMENTUM_MFE_TRAIL_ENABLED         = True
+BB_MOMENTUM_MFE_TRIGGER_CENTS         = 3     # +3c profit before trailing
+BB_MOMENTUM_MFE_TRAIL_CENTS           = 1     # exit on 1c retracement
 BB_PURE_BAL_HEADROOM_MULT            = 2.0
 
 # 2026-05-02 BB_PURE entry stale-cancel timeout.
