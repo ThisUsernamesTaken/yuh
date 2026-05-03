@@ -45,7 +45,11 @@ DAILY_LOSS_FRACTION = 0.20          # 2026-04-29 NEW: live daily-loss limit
 #   $200 × 0.30 = 60ct,      $200 × 0.10 = 20ct
 #   $500 × 0.30 = 150ct,     $500 × 0.10 = 50ct
 #   $1000 × 0.30 = 300ct,    $1000 × 0.10 = 100ct
-SIZING_HARD_CAP_CONTRACTS_DAY   = 10   # 2026-05-01 safety retune (was 25)
+SIZING_HARD_CAP_CONTRACTS_DAY   = 8    # 2026-05-02 strategic reset (was 10):
+                                       # tighter while shaking out the new
+                                       # architecture. Goal is one clean
+                                       # closure-attributed session before
+                                       # raising any caps.
 SIZING_HARD_CAP_CONTRACTS_NIGHT = 10   # 2026-04-29 (was 100): static fallback
 SIZING_CAP_BALANCE_FRAC_DAY     = 0.30 # 2026-04-29 NEW: live day-cap fraction
 SIZING_CAP_BALANCE_FRAC_NIGHT   = 0.10 # 2026-04-29 NEW: live night-cap fraction
@@ -516,7 +520,14 @@ BB_PURE_MIN_ENTRY_CENTS          = 5      # Don't fire on dust prices
 BB_PURE_MIN_TIME_REMAINING_S     = 60.0   # No new entries within last minute
 BB_PURE_KELLY_FRACTION           = 0.25   # Quarter-Kelly base (matches existing
                                           # KELLY_FRACTION default)
-BB_PURE_KELLY_MAX_FRAC           = 0.10   # 2026-05-01 safety retune
+BB_PURE_KELLY_MAX_FRAC           = 0.05   # 2026-05-02 strategic reset
+                                          # (was 0.10): halved while shaking
+                                          # out the new architecture (maker-
+                                          # bid entry, strategic gates,
+                                          # softer cleanup). Goal is one
+                                          # clean session of close-handler
+                                          # logs before re-raising. At $200
+                                          # bankroll = $10 max per trade.
                                           # (was 0.30): cap any BB_PURE
                                           # position at 10% of bankroll.
 BB_PURE_VOLATILITY_LOOKBACK      = 15     # Mirrors founding-doc default
