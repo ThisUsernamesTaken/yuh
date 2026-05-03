@@ -45,11 +45,12 @@ DAILY_LOSS_FRACTION = 0.20          # 2026-04-29 NEW: live daily-loss limit
 #   $200 × 0.30 = 60ct,      $200 × 0.10 = 20ct
 #   $500 × 0.30 = 150ct,     $500 × 0.10 = 50ct
 #   $1000 × 0.30 = 300ct,    $1000 × 0.10 = 100ct
-SIZING_HARD_CAP_CONTRACTS_DAY   = 8    # 2026-05-02 strategic reset (was 10):
-                                       # tighter while shaking out the new
-                                       # architecture. Goal is one clean
-                                       # closure-attributed session before
-                                       # raising any caps.
+SIZING_HARD_CAP_CONTRACTS_DAY   = 15   # 2026-05-03 PoC: bumped from 8 → 15.
+                                       # At $40 bankroll, 0.10 Kelly cap × $40 = $4
+                                       # max bet → ~10-25ct depending on entry
+                                       # price. Need at least 15ct hard cap to
+                                       # let cheap-side entries (5-15c) actually
+                                       # size meaningfully.
 SIZING_HARD_CAP_CONTRACTS_NIGHT = 10   # 2026-04-29 (was 100): static fallback
 SIZING_CAP_BALANCE_FRAC_DAY     = 0.30 # 2026-04-29 NEW: live day-cap fraction
 SIZING_CAP_BALANCE_FRAC_NIGHT   = 0.10 # 2026-04-29 NEW: live night-cap fraction
@@ -564,13 +565,19 @@ BB_PURE_MAX_ENTRY_CENTS          = 55     # 2026-05-02 Phase 0.1.5 (was 70):
                                           # table didn't have data for).
 BB_PURE_MIN_ENTRY_CENTS          = 5      # Don't fire on dust prices
 BB_PURE_MIN_TIME_REMAINING_S     = 60.0   # No new entries within last minute
+# 2026-05-03 PoC sizing: bumped Kelly cap from 0.05 to 0.10 to allow
+# meaningful trade sizes at $40 bankroll. Per-trade max ~$4 cost.
 BB_PURE_KELLY_FRACTION           = 0.25   # Quarter-Kelly base (matches existing
                                           # KELLY_FRACTION default)
-BB_PURE_KELLY_MAX_FRAC           = 0.05   # 2026-05-02 strategic reset
+BB_PURE_KELLY_MAX_FRAC           = 0.10   # 2026-05-03 PoC: bumped from 0.05
+                                          # back to 0.10. At $40 BAL, max
+                                          # trade = $4 cost. Engine needs
+                                          # this to overcome fees and produce
+                                          # measurable per-trade alpha. Will
+                                          # scale up further as BAL grows.
+                                          # 2026-05-02 strategic reset
                                           # (was 0.10): halved while shaking
-                                          # out the new architecture (maker-
-                                          # bid entry, strategic gates,
-                                          # softer cleanup). Goal is one
+                                          # out the new architecture. Goal is one
                                           # clean session of close-handler
                                           # logs before re-raising. At $200
                                           # bankroll = $10 max per trade.
