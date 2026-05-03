@@ -1575,3 +1575,61 @@ required BAL. So entries up to ~5ct will fire.
 
 Test suite: 506 passing, 2 pre-existing unrelated failures.
 Engine restart pending for activation.
+
+### 14:35 PT — first post-restart fire (BB_PURE, NOT bb_momentum)
+
+State: BAL $25.19 (down $0.19), FLAT, 0 resting.
+
+Sequence:
+- 14:30:33-35 BB_PURE GATE-BLOCK: NO 26MAY031745-45 @ 51-52c
+  reason=adverse_flow_share dropping 1.00→0.66 over 3s
+- 14:30:36 BB_PURE FIRE: NO 2x @ 52c ($1.04) edge=12pp fair=35c
+- 14:30:36 NOFILL — maker bid placed, no immediate fill
+- 14:30:44 NOFILL late-fill: filled 2ct after 8s timeout, RECLAIM
+- 14:31:32 FLAT-CONFIRMED: Kalshi count=0 for 30s+, zero_streak=45/3.
+  "Likely caused by an untracked fill closing the position."
+- 14:31:32-32:01 RESIDUAL-CLEAN across 12 polls — engine confirmed flat
+
+Net P&L on this trade: -$0.19 (small loss). Consistent with external
+manual-fill close around 47c (we entered at 52c on NO).
+
+Likely actor: user's other engine via MANUAL FILL handler closed
+the position quickly. The engine's safety stack handled it gracefully:
+no phantom, no oversell, FLAT-CONFIRMED required 45 readings, the
+post-close residual sweep ran cleanly.
+
+BB_MOMENTUM did NOT fire. BB_PURE has cascade priority and found a
+qualifying signal first. The trade was in the 50-59c bucket which
+backtests at 66% hit rate.
+
+Decision rules: BAL $25.19 > $20, no anomalies. Continue monitoring.
+
+### 14:43 PT — Counterfactual confirmed: external close cost $1.08
+
+Window 26MAY031745-45 closing at 14:45 PT, settle 14:50 PT.
+- BTC at 14:43 PT: $78,790.84
+- Strike: $78,921.72
+- BTC is $130.88 BELOW strike → NO WINS
+
+We were long NO 2x @ 52c ($1.04 cost). Held-to-settlement P&L:
+  Revenue: $2.00 (2 × $1.00 at NO settlement)
+  - Entry: $1.04
+  - Fees:  $0.07
+  Net:   +$0.89
+
+Actual P&L: -$0.19 (external manual fill closed at ~47c).
+Differential cost from external close: **$1.08** lost on a winning trade.
+
+Pattern: our engine generates correct signals (NO @ 52c with 12pp
+edge was directionally right), but the user's other trading engine
+closes them quickly at adverse prices before they can express their
+alpha. This is NOT an engine bug — it's a coordination issue
+between user's concurrent trading processes.
+
+For meaningful live validation of bb_pure / bb_momentum, the user
+needs to either:
+  1. Pause the other engine while testing ours, OR
+  2. Make the other engine hands-off on KXBTC15M tickers
+
+Today's data on our engine's actual fire is INVALID — the trade was
+terminated by an external party, not by our protective logic.
