@@ -96,14 +96,23 @@ def simulate_ticker(
     cooldown_s: int = 30,
     max_cycles: int = 3,
     balance: float = 100.0,
+    use_strike_cross: bool = False,
+    use_mfe_trail: bool = False,
+    mfe_trigger_cents: int = 5,
+    mfe_trail_cents: int = 2,
 ) -> list[dict]:
     """Simulate momentum-cycle trading on a single ticker.
-    Returns list of cycle records (one dict per fire/exit pair).
+
+    Optional post-entry exit modes:
+        use_strike_cross: exit if BTC crosses to wrong side of strike
+        use_mfe_trail:    exit on best-bid drop after reaching mfe_trigger_cents
     """
     cycles = []
     next_eligible_t = 0
     cycle_count = 0
-    in_position = None  # dict with entry info or None
+    in_position = None
+    # Strike proxy = BTC price at t_offset=0
+    strike = snapshots[0]["btc"] if snapshots else 0.0
 
     for idx, snap in enumerate(snapshots):
         t = snap["t_offset_sec"]
@@ -137,19 +146,64 @@ def simulate_ticker(
                 "entry_cents": sig.suggested_entry_cents,
                 "contracts": sig.contracts,
                 "entry_velocity_30s": sig.velocity_30s,
+                "entry_btc_above_strike": snap["btc"] > strike,
+                "best_seen_cents": sig.suggested_entry_cents,
                 "cycle_idx": cycle_count,
             }
             cycle_count += 1
             continue
 
-        # In position — check for stall
-        mv_30_now = btc_move_at(snapshots, idx, 30)
-        verdict = evaluate_stall(
-            entry_velocity_30s=in_position["entry_velocity_30s"],
-            current_velocity_30s=mv_30_now,
-            config=stall_cfg,
-        )
-        if not verdict.should_exit:
+        # Update best-seen price (MFE tracking)
+        if in_position["side"] == "yes":
+            our_side_mid = snap["yes_mid"]
+        else:
+            our_side_mid = 100 - snap["yes_mid"]
+        if our_side_mid > in_position["best_seen_cents"]:
+            in_position["best_seen_cents"] = our_side_mid
+
+        # ── Strike-cross exit ──────────────────────────────────────
+        # If BTC crossed against our entry-side relative to strike,
+        # the contract is structurally losing. Exit immediately.
+        exit_now = False
+        exit_reason = None
+        if use_strike_cross:
+            btc_above_now = snap["btc"] > strike
+            if in_position["side"] == "yes":
+                # We bet BTC stays above strike. If now below, lose.
+                if not btc_above_now and in_position["entry_btc_above_strike"]:
+                    exit_now = True
+                    exit_reason = "STRIKE-CROSS-AGAINST"
+            else:  # no
+                if btc_above_now and not in_position["entry_btc_above_strike"]:
+                    exit_now = True
+                    exit_reason = "STRIKE-CROSS-AGAINST"
+
+        # ── MFE-trail exit ──────────────────────────────────────────
+        if use_mfe_trail and not exit_now:
+            best = in_position["best_seen_cents"]
+            entry = in_position["entry_cents"]
+            if best - entry >= mfe_trigger_cents:
+                # We've seen +trigger cents of profit. Trail at best - trail.
+                if our_side_mid <= best - mfe_trail_cents:
+                    exit_now = True
+                    exit_reason = (
+                        f"MFE-TRAIL best={best} now={our_side_mid} "
+                        f"(trigger={mfe_trigger_cents} trail={mfe_trail_cents})"
+                    )
+
+        # ── Standard stall check ──────────────────────────────────
+        if not exit_now:
+            mv_30_now = btc_move_at(snapshots, idx, 30)
+            verdict = evaluate_stall(
+                entry_velocity_30s=in_position["entry_velocity_30s"],
+                current_velocity_30s=mv_30_now,
+                config=stall_cfg,
+            )
+            if verdict.should_exit:
+                exit_now = True
+                exit_reason = verdict.reason
+
+        if not exit_now:
             continue
 
         # Exit at current opposite-side bid (approximated as our-side mid)
@@ -177,7 +231,7 @@ def simulate_ticker(
             "entry_cents": in_position["entry_cents"],
             "exit_cents": exit_cents,
             "contracts": in_position["contracts"],
-            "stall_reason": verdict.reason,
+            "stall_reason": exit_reason or "STALL",
             "net_pnl_cents": net_pnl,
             "settled_held": False,
             "outcome": "WIN" if net_pnl > 0 else "LOSS",
@@ -320,23 +374,43 @@ def main() -> int:
     }
     base_stall = {"stall_decay_ratio": 0.5, "stall_min_entry_velocity": 5.0}
 
+    # Disable stall logic for the "post-entry signal" tests — we want
+    # the new signals (strike-cross, MFE-trail) to be the only exit
+    # mechanism alongside settlement.
+    no_stall = {"stall_decay_ratio": 0.0, "stall_min_entry_velocity": 99999.0}
+
     configs = [
-        ("DEFAULT (300s>$30, 30s>$10, decay=0.5)",
-         dict(base_entry), dict(base_stall)),
-        ("HOLD TO SETTLEMENT (decay=0 disables stall)",
-         dict(base_entry),
-         {**base_stall, "stall_decay_ratio": 0.0,
-          "stall_min_entry_velocity": 99999.0}),  # never triggers
-        ("CHEAP-ONLY entry 30-39c (max_entry=39)",
-         {**base_entry, "max_entry_cents": 39},
-         dict(base_stall)),
-        ("CHEAP+HOLD (max_entry=39, hold to settle)",
-         {**base_entry, "max_entry_cents": 39},
-         {**base_stall, "stall_decay_ratio": 0.0,
-          "stall_min_entry_velocity": 99999.0}),
+        # Baseline
+        ("DEFAULT (with stall@0.5)",
+         dict(base_entry), dict(base_stall),
+         {"use_strike_cross": False, "use_mfe_trail": False}),
+        ("HOLD TO SETTLEMENT (no stall)",
+         dict(base_entry), dict(no_stall),
+         {"use_strike_cross": False, "use_mfe_trail": False}),
+        # New post-entry signals
+        ("STRIKE-CROSS only (no stall, no MFE)",
+         dict(base_entry), dict(no_stall),
+         {"use_strike_cross": True, "use_mfe_trail": False}),
+        ("MFE-TRAIL only (trigger=5 trail=2)",
+         dict(base_entry), dict(no_stall),
+         {"use_strike_cross": False, "use_mfe_trail": True,
+          "mfe_trigger_cents": 5, "mfe_trail_cents": 2}),
+        ("STRIKE-CROSS + MFE-TRAIL (combined)",
+         dict(base_entry), dict(no_stall),
+         {"use_strike_cross": True, "use_mfe_trail": True,
+          "mfe_trigger_cents": 5, "mfe_trail_cents": 2}),
+        ("STRIKE-CROSS + tight MFE (trigger=3 trail=1)",
+         dict(base_entry), dict(no_stall),
+         {"use_strike_cross": True, "use_mfe_trail": True,
+          "mfe_trigger_cents": 3, "mfe_trail_cents": 1}),
     ]
 
-    for label, entry_cfg, stall_cfg in configs:
+    for cfg_tuple in configs:
+        if len(cfg_tuple) == 4:
+            label, entry_cfg, stall_cfg, exit_kwargs = cfg_tuple
+        else:
+            label, entry_cfg, stall_cfg = cfg_tuple
+            exit_kwargs = {}
         all_cycles = []
         for ticker, snaps in load_snapshots(con):
             if not snaps:
@@ -347,6 +421,7 @@ def main() -> int:
                 cooldown_s=args.cooldown,
                 max_cycles=args.max_cycles,
                 balance=args.balance,
+                **exit_kwargs,
             )
             all_cycles.extend(cycles)
         print_result(label, aggregate(all_cycles))
