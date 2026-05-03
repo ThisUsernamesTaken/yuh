@@ -9382,31 +9382,76 @@ class PolymarketCopyEngine:
 
         # Read live book to get the actual ask we'd cross. The BB_PURE
         # signal's `suggested_entry_cents` is from market mid; live ask
-        # may have moved. Pay up to 2c above suggested for slippage.
+        # 2026-05-02 STRATEGIC RESET: maker-bid entry by default.
+        #
+        # Old behavior: read best ask, place limit-buy at ask with
+        # post_only=False. This was MISCLASSIFIED as a taker — it's just a
+        # limit order that crosses *if* Kalshi's matching engine still sees
+        # ask ≤ our price by the time it processes us. WS book lag means
+        # the ask has often moved up by then → 60% NOFILL rate observed live.
+        #
+        # New behavior: read best bid, place limit-buy at bid+1 with
+        # post_only=True. We're 0.005% of session volume — we're not racing
+        # for liquidity, we're a passive maker that market participants
+        # will deal with. Pair with the existing 8s stale-entry cancel for
+        # cleanup if the bid moves away.
         ws = getattr(self, "_kalshi_ws", None)
         book = ws.get_book(ticker) if ws and hasattr(ws, "get_book") else None
         if book is None or not book.is_ready:
             logger.warning("BB_PURE SKIP: book not ready for %s", ticker[-15:])
             return
         if sig.side == "yes":
+            bid_cents = int(getattr(book, "best_yes_bid", 0) or 0)
             ask_cents = int(getattr(book, "best_yes_ask", 0) or 0)
         else:
+            bid_cents = int(getattr(book, "best_no_bid", 0) or 0)
             ask_cents = int(getattr(book, "best_no_ask", 0) or 0)
-        if ask_cents <= 0:
+        if bid_cents <= 0 and ask_cents <= 0:
             logger.warning(
-                "BB_PURE SKIP: no ask available for %s side=%s",
+                "BB_PURE SKIP: no bid/ask available for %s side=%s",
                 ticker[-15:], sig.side,
             )
             return
-        # Don't pay more than the suggested entry + 2c
-        max_pay = sig.suggested_entry_cents + 2
-        if ask_cents > max_pay:
+
+        entry_mode = str(_uc("BB_PURE_ENTRY_MODE", "maker_bid_plus_1")).lower()
+        if entry_mode == "maker_bid_plus_1":
+            # Place at bid+1 (post-only). If ask is bid+1, this would
+            # cross — Kalshi rejects post_only that crosses, so cap at
+            # ask-1 if ask exists. If ask is at our price, fall back to
+            # bid (passive resting).
+            if bid_cents <= 0:
+                # No bid; try resting at ask-1 if ask available
+                entry_px = max(1, ask_cents - 1) if ask_cents > 0 else 0
+            elif ask_cents > 0 and bid_cents + 1 >= ask_cents:
+                # bid+1 would cross the ask → Kalshi rejects post_only
+                entry_px = bid_cents
+            else:
+                entry_px = bid_cents + 1
+            place_post_only = True
+        elif entry_mode == "taker_ask":
+            # Legacy "taker" behavior (kept for fallback / testing).
+            entry_px = ask_cents
+            place_post_only = False
+        else:
+            # Default safe fallback
+            entry_px = max(1, ask_cents - 1) if ask_cents > 0 else bid_cents
+            place_post_only = True
+
+        if entry_px <= 0:
             logger.warning(
-                "BB_PURE SLIPPAGE-SKIP: ask=%dc > suggested=%dc + 2c (slippage), skipping",
-                ask_cents, sig.suggested_entry_cents,
+                "BB_PURE SKIP: computed entry_px=0 (mode=%s bid=%dc ask=%dc)",
+                entry_mode, bid_cents, ask_cents,
             )
             return
-        entry_px = ask_cents
+
+        # Don't pay more than the suggested entry + 2c (slippage cap)
+        max_pay = sig.suggested_entry_cents + 2
+        if entry_px > max_pay:
+            logger.warning(
+                "BB_PURE SLIPPAGE-SKIP: entry=%dc > suggested=%dc + 2c (mode=%s)",
+                entry_px, sig.suggested_entry_cents, entry_mode,
+            )
+            return
 
         # Microstructure gates (execution quality)
         gate_allow, gate_reason, gate_snap = self._evaluate_entry_filter(
@@ -9484,10 +9529,12 @@ class PolymarketCopyEngine:
         )
 
         try:
+            # 2026-05-02 STRATEGIC RESET: post_only is set by entry_mode
+            # logic above (default maker_bid_plus_1 → post_only=True).
             order = await self._client.place_order(
                 ticker=ticker, side=sig.side,
                 price=entry_px, count=contracts,
-                post_only=False,  # cross the spread; BB edge justifies cost
+                post_only=place_post_only,
             )
         except Exception as e:
             logger.error("BB_PURE place_order failed: %s", e)

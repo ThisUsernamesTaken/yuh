@@ -789,6 +789,21 @@ BB_PURE_TRADING_HOUR_START_PT        = 6
 BB_PURE_TRADING_HOUR_END_PT          = 22
 BB_PURE_PT_UTC_OFFSET_H              = -7.0    # PDT (summer); -8 in winter
 
+# Entry execution mode (2026-05-02 strategic reset).
+# Old "taker_ask" pattern: place limit-buy at best_ask with post_only=False.
+# Live observed 60% NOFILL rate because limit-at-ask is NOT a true taker —
+# it's a limit that crosses only if Kalshi still sees ask ≤ our price by
+# processing time (WS book lag often invalidates this).
+#
+# New default "maker_bid_plus_1": place limit-buy at bid+1 with post_only=True.
+# We're 0.005% of session volume — we're a passive maker; counterparties
+# come to us. Pair with the existing 8s stale-entry cancel for cleanup.
+#
+# Modes:
+#   "maker_bid_plus_1" (default) — passive maker at bid+1
+#   "taker_ask"        — legacy aggressive taker (use for fallback testing)
+BB_PURE_ENTRY_MODE                   = "maker_bid_plus_1"
+
 # 2026-05-02 BB_PURE entry stale-cancel timeout.
 # Live observed 15:04:21 PT: BB_PURE FIRE 42ct YES @ 26c (taker).
 # By the time Kalshi processed our taker order at 26c, the ask had
