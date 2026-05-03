@@ -1505,3 +1505,38 @@ risky trades), but the trigger fired on activity OUR engine didn't
 initiate. Future improvement worth discussing: differentiate
 between "our engine drained BAL" vs. "external activity drained
 BAL".
+
+### 14:00 PT — Momentum-rider strategy built (default OFF)
+
+User pivot directive: "find a way to simply buy the direction BTC is
+going at the time. buy with sustain directionality one way, sell at
+the stall, rebuy when next directional move is confirmed"
+
+Built infrastructure:
+- bb_momentum.py: pure-logic module with evaluate_entry() and
+  evaluate_stall(). Detects 5-min + 30s confirmation, picks side
+  WITH the trend, sizes via fractional bankroll (NOT Kelly — no
+  separate model probability).
+- tests/test_bb_momentum.py: 21 tests, all passing
+- scripts/backtest_momentum.py: full simulation with cycle counting,
+  cooldown, stall-exit + hold-to-settle modes
+
+Backtest results on 273 settled tickers:
+
+| Config | cycles | hit | P&L | /cycle |
+|---|---|---|---|---|
+| DEFAULT stall@0.5 | 135 | 23.7% | +$7.53 | $0.06 |
+| HOLD TO SETTLEMENT | 24 | **45.8%** | **+$9.99** | **$0.42** |
+| CHEAP-ONLY 30-39c | 80 | 20.0% | +$9.05 | $0.11 |
+| CHEAP + HOLD | 11 | 36.4% | +$2.19 | $0.20 |
+
+**Key finding**: stall-exit logic destroys per-trade alpha. Hold-
+to-settlement has 7× per-cycle P&L. But hold-to-settle requires
+liquid books (today's $69 loss was empty-book exit failure), while
+stall-exit caps individual losses.
+
+For $200+ bankroll: hold-to-settle wins (best per-cycle alpha).
+For $0.55 bankroll (current): neither viable until refund.
+
+Strategy is built, default OFF, ready when user refunds and decides
+which mode (stall vs hold).
