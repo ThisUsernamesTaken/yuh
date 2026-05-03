@@ -1050,3 +1050,18 @@ Tests: 450 passing, 2 pre-existing LATE_DOMINANT failures unrelated.
 
 **Engine remains STOPPED** pending user review of the fix. Disk lock
 will auto-expire by ~10:15 PT (15-min window age limit) regardless.
+
+### 10:24 PT — engine restarted with fix live
+
+User authorized restart. Pre-restart steps:
+1. Cleared stale disk lock at `data/session_state.json` (empty tickers)
+2. Verified Kalshi state still clean (BAL $73.12, FLAT, 0 resting)
+
+Restart sequence (HEAD 5b1a836):
+- nssm start → SERVICE_RUNNING
+- STARTUP log at 10:24:28 PT, no SESSION-LOCK restore (cleared file
+  → empty set), no errors
+- Resumed in new window (10:15-30 PT), fresh lock state
+- Lock-release + spread-margin + cooldown all live
+
+Monitoring resumed.
