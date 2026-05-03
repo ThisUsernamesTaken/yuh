@@ -831,6 +831,16 @@ BB_PURE_PT_UTC_OFFSET_H              = -7.0    # PDT (summer); -8 in winter
 #   "taker_ask"        — legacy aggressive taker (use for fallback testing)
 BB_PURE_ENTRY_MODE                   = "maker_bid_plus_1"
 
+# Pre-fire balance gate (2026-05-03). Block new BB_PURE entries when
+# live BAL doesn't have headroom to cover (entry_cost × multiplier).
+# Defends against the "insufficient_balance" cascade observed 2026-05-02:
+# once BAL drained, ORPHAN-FLATTEN couldn't unwind a wayward phantom
+# position via cross-spread sell, and the position rode to expiry.
+# 2x multiplier means: if entry costs $5, require BAL ≥ $10. Leaves
+# headroom for cleanup at adverse prices.
+BB_PURE_BAL_GATE_ENABLED             = True
+BB_PURE_BAL_HEADROOM_MULT            = 2.0
+
 # 2026-05-02 BB_PURE entry stale-cancel timeout.
 # Live observed 15:04:21 PT: BB_PURE FIRE 42ct YES @ 26c (taker).
 # By the time Kalshi processed our taker order at 26c, the ask had

@@ -9484,6 +9484,30 @@ class PolymarketCopyEngine:
 
         contracts = max(1, int(sig.contracts))
         cost_dollars = contracts * entry_px / 100.0
+
+        # 2026-05-03 PRE-FIRE BALANCE GATE.
+        # Block the entry if our current BAL is too low to cover the cost
+        # AND a reasonable cleanup margin. Live observed 2026-05-02:
+        # ORPHAN-FLATTEN failed repeatedly with `insufficient_balance`
+        # because BAL was already drained from prior bleed. Once that
+        # happens, an unwanted phantom position rides to expiry and we
+        # eat the full entry cost.
+        #
+        # Rule: BAL must cover (entry_cost × multiplier). Multiplier
+        # default 2.0 ensures we have headroom to flatten via cross-spread
+        # if cleanup is needed.
+        bal_dollars_now = float(_LIVE_BALANCE_DOLLARS or 0.0)
+        bal_multiplier = float(_uc("BB_PURE_BAL_HEADROOM_MULT", 2.0))
+        required_bal = cost_dollars * bal_multiplier
+        if bool(_uc("BB_PURE_BAL_GATE_ENABLED", True)) and bal_dollars_now > 0 and required_bal > 0:
+            if bal_dollars_now < required_bal:
+                logger.warning(
+                    "BB_PURE BAL-GATE-BLOCK: cost=$%.2f × %.1f = $%.2f required, "
+                    "live_bal=$%.2f — skipping entry (insufficient cleanup headroom)",
+                    cost_dollars, bal_multiplier, required_bal, bal_dollars_now,
+                )
+                return
+
         # 2026-04-30 RACE-FIX: lock the ticker NOW (after gate passes,
         # before await place_order). Set BEFORE the await so subsequent
         # cycles see the lock immediately. Set AFTER gate-blocks so a
