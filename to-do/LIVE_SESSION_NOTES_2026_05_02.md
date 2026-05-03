@@ -1065,3 +1065,111 @@ Restart sequence (HEAD 5b1a836):
 - Lock-release + spread-margin + cooldown all live
 
 Monitoring resumed.
+
+### check-in 10:30 PT — clean restart, fresh window flipped
+
+State: BAL $73.12, FLAT, 0 resting, 0 fires since restart (6 min ago).
+
+Restart sequence verified clean:
+- 10:24:28 STARTUP (skip-window disabled, trading current window)
+- 10:24:30 ORPHAN-FLATTEN restarted (3s, 90s recent-protection)
+- 10:25:30 attached to 1:15PM-1:30PM ET window (269s left)
+- 10:29:55 clean flip to 1:30PM-1:45PM ET window (905s)
+
+Zero place_order failures, zero session-lock releases. The fix
+didn't get exercised in this interval because no signals fired.
+Can't validate the live behavior yet, but unit tests cover the
+helper contract and the integration path is small.
+
+BTC presumably stabilized post-crash but BB hasn't seen edge yet.
+Or strategic gates (STRIKE-DIST, BTC-RANGE) blocking pre-eval.
+
+### check-in 10:34 PT (ad-hoc) — strike rally pushes gate wide
+
+State: BAL $73.12, FLAT, 0 resting, 0 fires.
+
+BTC at $78,747 vs new-window strike $78,401 = **0.44% distance**
+(11× the 0.04% cap). BB_PURE STRIKE-DIST-BLOCK firing constantly.
+Shadow tier shows BB edge=+20pp YES conf=1.00, but gate correctly
+blocks pre-eval — at this trajectory the contract is essentially
+"100% YES" already and there's no mean-reversion edge.
+
+Engine alive and processing ticks (last log 10:34:21). The
+lock-release fix code path remains un-exercised (no place_order
+calls because no fires).
+
+### check-in 10:35 PT — BB_PURE silent, engine healthy
+
+State: BAL $73.12, FLAT, 0 resting, 0 fires.
+
+BB_PURE last log line at 10:33:06 (STRIKE-DIST-BLOCK). After that,
+silent. Main flow loop healthy (DOMINANT-SKIP / SHADOW-EDGE firing
+every ~0.3s with bb=+20.0). No warnings, no errors in 10:33-10:39 PT.
+
+Pre-existing pattern (observed 09:25-09:29 and 09:33-09:39 today).
+Likely transient WS book-not-ready or null fair_yes condition that
+the BB_PURE evaluator returns from silently. Not a new bug class,
+not lock-release related.
+
+### check-in 10:41 PT — calm, BTC mean-reverting
+
+State: BAL $73.12, FLAT, 0 resting, 0 fires (17 min since restart).
+
+Window 10:30-10:45 still active (~4 min left). BTC rally has
+reversed: shadow tier shows btc5m=$-2 (down $2 in 5 min), bb=+20pp
+YES still standing. No window flip yet, no warnings, no errors.
+BB_PURE evaluator silent.
+
+This is the calmest observation window of the day. Engine sitting
+cleanly on its hands.
+
+### check-in 10:46 PT — window flipped, fresh strike
+
+State: BAL $73.12, FLAT, 0 resting, 0 fires (22 min since restart).
+
+Window flipped 10:44:55 PT to 1:45PM-2:00PM ET (10:45-11:00 PT, 904s
+left). Clean transition. No BB_PURE signals yet in new window.
+Fresh strike means STRIKE-DIST gate now starts from current BTC
+price; will see whether engine sees edge in the new window.
+
+### 10:51 PT — SECOND BUG FOUND, AUTONOMOUS STOP
+
+**Symptom**: BB_PURE SIGNAL firing every ~300ms on ticker
+`26MAY031400-00` with edge=23-25pp YES, market_mid=31c. Each signal
+followed immediately by `BB_PURE SLIPPAGE-SKIP: entry=48c >
+suggested=31c + 2c`. Hundreds of these loops in 60 seconds.
+
+**Investigation**: queried Kalshi REST orderbook for the ticker —
+EMPTY (yes_bid=None, yes_ask=None, no_bid=None, no_ask=None,
+last_price=None, status=active). Yet WS book in engine memory was
+reporting bid+1=48c. So the WS book had phantom/stale state.
+
+**Root cause**: kalshi_ws book invariants:
+  YES_ask = 100 - NO_bid
+  mid_price_cents = (YES_bid + YES_ask) // 2
+
+If YES_bid + NO_bid > 100, then YES_ask < YES_bid (crossed/inverted
+book). For our case mid=31 with entry=48 implies YES_bid≈47,
+NO_bid≈87 (sum=134). bb_pure.evaluate consumes mid_price_cents and
+produces a phantom signal; the engine's downstream pricing logic
+hits the actual book and gets a real bid+1=48 that doesn't match the
+fake mid=31.
+
+**Why crossed**: market just opened (~5 min ago at 10:45 PT) with no
+real liquidity. WS book likely seeded with stale state across window
+transition, or with an off-market test order that hasn't been
+matched. REST API confirms no real orderbook.
+
+**Fix shipped**:
+- BOOK-CROSSED guard in `_evaluate_bb_pure_signal`: reject signal
+  when YES_bid > 0, NO_bid > 0, and sum > 100. This catches the
+  inverted-book case before bb_pure math runs.
+- 7 unit tests in tests/test_book_crossed_guard.py covering normal
+  / tight-normal / exactly-100 / crossed / marginally crossed /
+  empty / extreme-one-sided.
+
+**Engine state at stop**: BAL $73.12, FLAT, 0 resting. **No money
+lost** (slippage check did its job). 27 min uptime since 10:24
+restart.
+
+**Engine remains STOPPED** pending review.

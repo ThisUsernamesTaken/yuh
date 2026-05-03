@@ -8943,6 +8943,23 @@ class PolymarketCopyEngine:
         book = ws.get_book(ticker) if ws and hasattr(ws, "get_book") else None
         if book is None or not book.is_ready:
             return None
+        # 2026-05-03 BOOK-CROSSED GUARD: reject signal if YES_bid + NO_bid > 100.
+        # On Kalshi, YES_ask = 100 - NO_bid, so YES_bid + NO_bid > 100 implies
+        # YES_ask < YES_bid (an inverted/crossed book). This shouldn't happen
+        # on a healthy market but does occur when the WS book carries stale
+        # state across window transitions or when a fresh market has off-
+        # market orders before makers arrive. Live observed 2026-05-03 ~10:50
+        # PT: ticker 26MAY031400-00 had empty REST orderbook but WS book
+        # reported phantom bids producing mid=31 vs real-book entry=48 (17c
+        # gap). bb_pure.evaluate would have produced phantom signals; the
+        # downstream slippage check caught it but spammed logs at ~3-4/sec.
+        try:
+            _yb = int(getattr(book, "best_yes_bid", 0) or 0)
+            _nb = int(getattr(book, "best_no_bid", 0) or 0)
+            if _yb > 0 and _nb > 0 and (_yb + _nb) > 100:
+                return None
+        except Exception:
+            pass
         market_mid_cents = int(book.mid_price_cents)
         if market_mid_cents <= 0:
             return None
