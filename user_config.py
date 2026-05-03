@@ -674,7 +674,15 @@ PRE_EXPIRY_CONSOLIDATE_S             = 90.0  # Take ownership at this
 # recent placement gets market-sold immediately. Targets the side-flip
 # pattern where engine sells against stale state and Kalshi atomically
 # opens an opposite-side short.
-ORPHAN_FLATTEN_ENABLED               = True
+ORPHAN_FLATTEN_ENABLED               = False  # 2026-05-03 15:35 PT: DISABLED.
+                                              # Was incorrectly flattening the
+                                              # user's manual trades (treated
+                                              # as "untracked positions").
+                                              # Re-enable only after adding a
+                                              # user-position-whitelist or
+                                              # session-tag detection so it
+                                              # only flattens positions the
+                                              # engine itself opened.
 ORPHAN_FLATTEN_POLL_S                = 3.0   # Poll interval (seconds —
                                               # tightened from 5s for
                                               # faster orphan detection)
