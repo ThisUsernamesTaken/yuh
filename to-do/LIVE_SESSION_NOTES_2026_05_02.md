@@ -988,3 +988,65 @@ conditions, do not fight the tape.
 Also notable: BAL has been EXACTLY $73.12 across 11+ checks across 66
 min. No spurious activity, no phantom fills, no balance drift. The
 safety stack is rock-solid in observation mode.
+
+### 10:09 PT — BUG FOUND, AUTONOMOUS STOP TRIGGERED
+
+**What happened**:
+
+10:00:42.204 — BB_PURE SIGNAL fired. ticker=`-26MAY031315-15` (current
+window, names the close-time in ET → 1:00–1:15 PM ET = 10:00–10:15 PT).
+Edge=30pp, fair=64c, market=34c, side=YES, kelly=0.05, contracts=11.
+**This was a textbook setup**: cheap entry @ 34c, large edge, deep
+in cheap-side bias zone.
+
+10:00:42.268 — BB_PURE FIRE log emitted (warning).
+
+10:00:42.323 — `place_order` raised `Kalshi API 400: invalid_order /
+post only cross`. The maker-bid-plus-1 entry crossed the ask between
+price computation (eval-time) and Kalshi's processing (~120ms later).
+
+**Root cause**:
+- Eval-time: bid=33c, ask=35c (spread=2c) → engine chose bid+1=34c
+- ~120ms later at Kalshi: ask had dropped to 34c → bid+1=34c = cross
+- Kalshi rejects post_only that crosses
+- The pre-await session-lock (race-prevention) was set, but the
+  exception handler returned without clearing it
+- Subsequent signals (~3-4/sec for 8+ minutes) all hit
+  `BB_PURE SKIP: already entered this window` and never retry
+
+**Net effect**: engine functionally disabled for ~8 minutes.
+Position remained FLAT, BAL unchanged at $73.12. **No money lost,
+opportunity cost only.** Missed a 30pp YES @ 34c entry that would
+likely have settled at $1.00 → +$7.26 profit on $3.74 cost.
+
+**Engine stopped at 10:09 PT** per "new bug class" decision rule.
+
+### Fix (committed):
+
+1. **`_remove_session_lock` helper** — clears in-mem set + persists
+   empty state. Mirror of `_add_session_lock`.
+
+2. **Lock release on place_order exception** — when the API call
+   raises (post_only_cross, network, etc.), call
+   `_remove_session_lock(ticker)` so subsequent signals can retry.
+   NOFILL keeps the lock (per "one attempt per session"). Only
+   exceptions release it.
+
+3. **Pricing safety margin** — bid+1 only when spread ≥ 3c (i.e.,
+   bid+1 < ask-1). Spread of 2c → use bid (still post-only safe,
+   doesn't cross even if ask drops 1c). Trades fewer +1c improvements
+   for zero rejections under normal book churn.
+
+4. **Post-failure cooldown** (5s default, configurable via
+   `BB_PURE_POST_FAIL_COOLDOWN_S`) — if place_order still fails despite
+   safety margin, back off the ticker for 5s. Belt-and-suspenders
+   against rapid-retry spam at Kalshi.
+
+5. **5 unit tests** for the lock helper covering: in-mem clear, disk
+   persist, idempotent on unknown ticker, preserves other locked
+   tickers, add-then-remove returns clean.
+
+Tests: 450 passing, 2 pre-existing LATE_DOMINANT failures unrelated.
+
+**Engine remains STOPPED** pending user review of the fix. Disk lock
+will auto-expire by ~10:15 PT (15-min window age limit) regardless.

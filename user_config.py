@@ -501,6 +501,11 @@ BB_PURE_MODE                     = True   # 2026-04-30 PM: Session 2 wired
                                           # — bypasses composite cascade,
                                           # trades pure BB mispricing
 BB_PURE_MIN_EDGE_PP              = 8.0    # Min mispricing pp to fire (static)
+# Post-failure cooldown (2026-05-03): when place_order is rejected by
+# Kalshi (e.g., post_only_cross from book moving between eval and
+# Kalshi-time), back off this ticker for N seconds so we don't spam
+# the same failing order at every signal cycle (~3-4× per second).
+BB_PURE_POST_FAIL_COOLDOWN_S     = 5.0
 # ── Fee-aware dynamic edge threshold (2026-05-03) ────────────────────────
 # When enabled, replaces the static BB_PURE_MIN_EDGE_PP floor with a
 # per-entry-price threshold derived from Kalshi fees:

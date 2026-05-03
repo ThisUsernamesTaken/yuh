@@ -625,6 +625,23 @@ class PolymarketCopyEngine:
         except Exception:
             pass
 
+    def _remove_session_lock(self, ticker: str) -> None:
+        """Remove a ticker from the window-lock set AND persist to disk.
+
+        Used when a place_order call FAILS (e.g., post_only_cross from
+        Kalshi rejecting a maker-bid that crossed the spread). The lock
+        was set pre-await for race-prevention; if the order never
+        landed at Kalshi, we should not block subsequent retries on
+        the same ticker. Distinct from NOFILL (where the order DID land
+        but didn't fill — that case keeps the lock per "one attempt
+        per session" rule).
+        """
+        try:
+            self._entered_tickers_this_window.discard(ticker)
+            self._persist_session_lock()
+        except Exception:
+            pass
+
     def __init__(
         self,
         kalshi_client,
@@ -8898,6 +8915,18 @@ class PolymarketCopyEngine:
         ticker = getattr(self, "_current_kalshi_ticker", "") or ""
         if not ticker:
             return None
+        # 2026-05-03 POST-FAILURE COOLDOWN: if a previous place_order on
+        # this ticker was rejected (post_only_cross or other), back off
+        # briefly so we don't spam Kalshi with the same failing order.
+        # Belt-and-suspenders behind the spread-margin pricing fix.
+        try:
+            cooldown_map = getattr(self, "_bb_pure_post_fail_cooldown", None)
+            if cooldown_map is not None:
+                cooldown_until = cooldown_map.get(ticker, 0.0)
+                if cooldown_until and time.time() < cooldown_until:
+                    return None
+        except Exception:
+            pass
         # BB model
         pf = getattr(self, "_price_feed", None)
         prob = getattr(pf, "prob_engine", None) if pf is not None else None
@@ -9422,15 +9451,27 @@ class PolymarketCopyEngine:
 
         entry_mode = str(_uc("BB_PURE_ENTRY_MODE", "maker_bid_plus_1")).lower()
         if entry_mode == "maker_bid_plus_1":
-            # Place at bid+1 (post-only). If ask is bid+1, this would
-            # cross — Kalshi rejects post_only that crosses, so cap at
-            # ask-1 if ask exists. If ask is at our price, fall back to
-            # bid (passive resting).
+            # Place at bid+1 (post-only) ONLY when there's a 1c safety
+            # margin (i.e., spread ≥ 3c, so bid+1 < ask−1). Without
+            # the margin, a single tick of book movement during the
+            # ~100ms between price computation and Kalshi acceptance
+            # can turn the order into a cross — Kalshi then rejects
+            # with post_only_cross. (Live observed 2026-05-03 10:00:42
+            # PT: spread was 2c at eval, ask dropped 1c by Kalshi-time,
+            # bid+1 became a cross, post_only rejected.)
+            #
+            # Spread layout decisions:
+            #   spread ≥ 3c: entry = bid + 1 (improves position by 1c)
+            #   spread = 2c: entry = bid     (still post-only safe)
+            #   spread = 1c: entry = bid     (still post-only safe;
+            #                                 worth attempting — could
+            #                                 fill if a market sell
+            #                                 hits the bid)
+            #   no bid:      entry = ask - 1 (resting at ask−1)
             if bid_cents <= 0:
-                # No bid; try resting at ask-1 if ask available
                 entry_px = max(1, ask_cents - 1) if ask_cents > 0 else 0
-            elif ask_cents > 0 and bid_cents + 1 >= ask_cents:
-                # bid+1 would cross the ask → Kalshi rejects post_only
+            elif ask_cents > 0 and bid_cents + 1 >= ask_cents - 1:
+                # Spread < 3c → use bid (1c safety against book moves)
                 entry_px = bid_cents
             else:
                 entry_px = bid_cents + 1
@@ -9568,7 +9609,32 @@ class PolymarketCopyEngine:
                 post_only=place_post_only,
             )
         except Exception as e:
-            logger.error("BB_PURE place_order failed: %s", e)
+            # 2026-05-03 LOCK-RELEASE: the lock was set pre-await for
+            # race prevention. If place_order FAILS (e.g., Kalshi
+            # rejects with `post only cross` when bid+1 ≥ ask), no
+            # order ever landed — release the lock so subsequent
+            # signals can retry. This is distinct from NOFILL (order
+            # placed but unfilled) which keeps the lock.
+            logger.error(
+                "BB_PURE place_order failed: %s — releasing session lock for %s",
+                e, ticker,
+            )
+            self._remove_session_lock(ticker)
+            try:
+                self._recent_placement_tickers.pop(ticker, None)
+                self._recent_bb_pure_placements.pop(ticker, None)
+            except Exception:
+                pass
+            # 2026-05-03 POST-FAILURE COOLDOWN: brief backoff on this
+            # ticker so the eval loop doesn't fire the same condition
+            # at every cycle (~3-4× per second) until the book moves.
+            try:
+                if not hasattr(self, "_bb_pure_post_fail_cooldown"):
+                    self._bb_pure_post_fail_cooldown = {}
+                cooldown_s = float(_uc("BB_PURE_POST_FAIL_COOLDOWN_S", 5.0))
+                self._bb_pure_post_fail_cooldown[ticker] = time.time() + cooldown_s
+            except Exception:
+                pass
             return
         # Stamp placement for RECLAIM/cache-lag handling (already stamped
         # above pre-await; this is a defensive re-stamp to refresh the
