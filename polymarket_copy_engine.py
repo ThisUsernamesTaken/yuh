@@ -8943,6 +8943,10 @@ class PolymarketCopyEngine:
             "kelly_tier3_min_edge_pp":      float(_uc("BB_PURE_KELLY_TIER3_MIN_EDGE_PP", 40.0)),
             "kelly_tier3_min_fair_extreme": float(_uc("BB_PURE_KELLY_TIER3_MIN_FAIR_EXTREME", 95.0)),
             "kelly_tier3_max_frac":         float(_uc("BB_PURE_KELLY_TIER3_MAX_FRAC", 0.50)),
+            # Fee-aware dynamic edge threshold (2026-05-03; off until backtested)
+            "fee_aware_edge_enabled":  bool(_uc("BB_PURE_FEE_AWARE_EDGE_ENABLED", False)),
+            "fee_aware_edge_mult":     float(_uc("BB_PURE_FEE_AWARE_EDGE_MULT", 2.0)),
+            "fee_aware_edge_floor_pp": float(_uc("BB_PURE_FEE_AWARE_EDGE_FLOOR_PP", 4.0)),
         }
         try:
             sig = bb_evaluate(

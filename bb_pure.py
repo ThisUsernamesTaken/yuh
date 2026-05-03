@@ -74,6 +74,14 @@ def evaluate(
     kelly_frac = float(config.get("kelly_fraction", 0.25))
     kelly_max = float(config.get("kelly_max_frac", 0.15))
     max_contracts = int(config.get("max_contracts", 200))
+    # Fee-aware dynamic edge threshold (2026-05-03)
+    # Kalshi fee ≈ 0.07 × P × (1−P) × 100¢ per contract (bell-shaped, peaks at 50c).
+    # Round-trip breakeven edge_pp = 2 × fee = 0.14 × P × (1−P).
+    # We require K × breakeven margin of safety, floored at FLOOR_PP.
+    # When disabled, falls back to the static `min_edge_pp` floor.
+    fee_aware_enabled = bool(config.get("fee_aware_edge_enabled", False))
+    fee_aware_mult = float(config.get("fee_aware_edge_mult", 2.0))
+    fee_aware_floor = float(config.get("fee_aware_edge_floor_pp", 4.0))
 
     # Conviction-tier sizing thresholds (2026-05-01 INVERTED late PM)
     # Original framing: extreme-confidence trades (fair >= 95c) are the
@@ -108,7 +116,11 @@ def evaluate(
     # If fair < market: NO is underpriced (model says YES is less likely
     # than market) → BUY NO.
     edge_yes_pp = float(fair_yes_cents) - float(market_mid_cents)
-    if abs(edge_yes_pp) < min_edge_pp:
+    # Static-threshold pre-gate: cheap rejection of obvious zero-edge cases.
+    # Even with fee-aware enabled, we keep a small fixed floor (1pp) so
+    # numerical noise around fair=mid doesn't trigger eval. The real gate
+    # is computed below after entry_cents is known.
+    if abs(edge_yes_pp) < min(1.0, min_edge_pp):
         return None
 
     if edge_yes_pp > 0:
@@ -126,6 +138,19 @@ def evaluate(
     if entry_cents > max_entry:
         return None
     if entry_cents < min_entry:
+        return None
+
+    # ── Edge gate (static or fee-aware dynamic) ───────────────────────
+    if fee_aware_enabled:
+        # Kalshi-fee-derived breakeven edge per round-trip.
+        # fee_per_contract = 0.07 × P × (1−P) × 100¢   (P in [0,1])
+        # round_trip_breakeven_pp = 2 × fee = 0.14 × p × (100−p)/100
+        p = float(entry_cents)
+        breakeven_pp = 0.14 * p * (100.0 - p) / 100.0
+        effective_edge_floor = max(fee_aware_floor, fee_aware_mult * breakeven_pp)
+    else:
+        effective_edge_floor = min_edge_pp
+    if abs(edge_yes_pp) < effective_edge_floor:
         return None
 
     # ── Kelly sizing ──────────────────────────────────────────────────

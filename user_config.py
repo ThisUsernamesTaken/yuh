@@ -500,7 +500,18 @@ SESSION_STOP_PERSIST_BUCKETS_S   = [
 BB_PURE_MODE                     = True   # 2026-04-30 PM: Session 2 wired
                                           # — bypasses composite cascade,
                                           # trades pure BB mispricing
-BB_PURE_MIN_EDGE_PP              = 8.0    # Min mispricing pp to fire
+BB_PURE_MIN_EDGE_PP              = 8.0    # Min mispricing pp to fire (static)
+# ── Fee-aware dynamic edge threshold (2026-05-03) ────────────────────────
+# When enabled, replaces the static BB_PURE_MIN_EDGE_PP floor with a
+# per-entry-price threshold derived from Kalshi fees:
+#     fee_per_contract  ≈ 0.07 × P × (1−P) × 100¢   (P in [0,1])
+#     breakeven_edge_pp = 2 × fee  (round-trip)
+#     effective_floor   = max(FEE_AWARE_FLOOR_PP, FEE_AWARE_MULT × breakeven)
+# Result: looser at cheap entries (15c→3.6pp at K=2), tighter at 50c (7pp).
+# Off by default — flip on only after backtest validates fire-rate vs PnL.
+BB_PURE_FEE_AWARE_EDGE_ENABLED   = False  # default off
+BB_PURE_FEE_AWARE_EDGE_MULT      = 2.0    # K = safety multiplier on breakeven
+BB_PURE_FEE_AWARE_EDGE_FLOOR_PP  = 4.0    # absolute pp floor regardless of P
 BB_PURE_MAX_ENTRY_CENTS          = 55     # 2026-05-02 Phase 0.1.5 (was 70):
                                           # data-driven cap. Tonight's
                                           # clean wins: 48c, 51c. Today's
