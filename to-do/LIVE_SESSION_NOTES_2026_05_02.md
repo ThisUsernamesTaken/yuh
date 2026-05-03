@@ -959,3 +959,32 @@ this final stretch, this could be the first fire of the day.
 If fire happens between checks: protective layer + per-window lock
 + pre-fire BAL gate (BAL > 2× cost; current cost cap ~$4 = need $8,
 have $73) ensures it's bounded.
+
+### check-in 10:03 PT — gate validated by violent reversal
+
+State: BAL $73.12, FLAT, 0 resting, 0 fires (66 min since restart).
+
+**What happened**: BTC trajectory across 17 min:
+- 09:46: $78,731 (+$60 above strike)
+- 09:52: $78,720 (+$49)
+- 09:58: $78,706 (+$35) — at gate boundary
+- 10:00: window flip
+- 10:01: BTC crashed $98-102 in 30s
+
+If we'd entered YES on the strike-touch at 09:58 (which the +20pp BB
+edge would have suggested), the position would have been catastrophic:
+$78,706 → $78,604 puts BTC well BELOW strike $78,671 → YES settles at
+$0. Full loss of entry capital.
+
+The asymmetric vol gate prevented this. Across two windows it has
+caught:
+- Old window: counter-trend NO (BTC drifting up while wanting NO)
+- New window: counter-trend YES (BTC crashing down while wanting YES)
+
+**This is the strategic-reset thesis working in real-time.** Filter
+aggressively, accept that fire-rate goes to zero in unfavorable
+conditions, do not fight the tape.
+
+Also notable: BAL has been EXACTLY $73.12 across 11+ checks across 66
+min. No spurious activity, no phantom fills, no balance drift. The
+safety stack is rock-solid in observation mode.

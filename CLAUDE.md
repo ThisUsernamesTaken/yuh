@@ -7,6 +7,8 @@
 
 This document is the operator-facing source of truth. **If this doc and code disagree, the code wins.** Update this doc whenever signal logic or config defaults materially change.
 
+> **Setting up the engine on a new machine?** See [`docs/NEW_INSTANCE_SETUP.md`](docs/NEW_INSTANCE_SETUP.md) for the clean-install walkthrough (clone → venv → credentials → NSSM → smoke test → flip-to-live checklist).
+
 ---
 
 ## What the engine does
