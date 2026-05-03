@@ -1378,3 +1378,31 @@ pending user review of:
    45 new tests (474 total green), 1 real trade lost, 1 net P&L
    line at -$3.57. The engine has more guards than at session
    start. The monitoring is more accurate. Lessons captured.
+
+### 11:55 PT — autonomous fix #3: pre-fire liquidity gate
+
+User directive: "as you watch the data implement the changes you
+find most relevant to the strategy"
+
+Highest-leverage change identified: a pre-fire EXIT-LIQUIDITY gate.
+Today's $3.57 loss came from entering a contract with no exit
+liquidity. The gate refuses entry when the opposite-side bid book
+has insufficient depth at acceptable exit prices.
+
+Logic:
+- For YES entries: check yes_bids depth at price >= (entry_bid - max_loss)
+- For NO entries: check no_bids depth similarly
+- Required depth = max(entry_size, MIN_FLOOR=1)
+- Default MAX_EXIT_LOSS_CENTS = 25 (entry at 51c, exit at 26c+ acceptable)
+
+Bundled fixes:
+- Engine position-parser bugs at lines 4072 + 12824 (used p.get('position', 0)
+  which always returns 0 because Kalshi returns position_fp). These paths
+  are POS RECONCILE and ATM_REVERSION_DISCOUNT — both could have
+  silently mis-evaluated position state. Fixed to use position_fp.
+
+11 new unit tests for the liquidity gate covering: empty book, depth-
+above-floor counts, depth-below-floor excluded, floor-knob behavior,
+edge cases. All passing. Total test suite: 485 passing.
+
+Committed and engine restarted. Resume monitoring with the new gate live.

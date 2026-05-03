@@ -4069,7 +4069,8 @@ class PolymarketCopyEngine:
         positions = []  # legacy loop below retained as a no-op for minimal patching
         for p in positions:
             if p.get("ticker") == ticker:
-                pos_count = int(p.get("position", 0) or 0)
+                # 2026-05-03: Kalshi returns position_fp (string) not position
+                pos_count = int(float(p.get("position_fp", "0") or "0"))
                 yes_count = int(p.get("yes_count", 0) or 0)
                 no_count = int(p.get("no_count", 0) or 0)
                 if pos_count != 0 or yes_count > 0 or no_count > 0:
@@ -9574,6 +9575,57 @@ class PolymarketCopyEngine:
             )
             return
 
+        # ── Pre-fire EXIT-LIQUIDITY gate (2026-05-03) ──────────────────
+        # Live regression observed 2026-05-03 11:30 PT: BB_PURE FIRE on
+        # ticker 26MAY031445-45 (YES 7x @ 51c) entered cleanly, but when
+        # PROTECTIVE [SL] fired at 11:37 PT and 11:39 PT, the orderbook
+        # had NO bidders at any reasonable price. Both SL orders rested
+        # without filling; position rode to settlement and lost the full
+        # entry cost (-$3.57).
+        #
+        # The book had liquidity AT entry but evaporated during the trade.
+        # A pre-fire gate alone can't catch that, but it CAN catch the
+        # obvious case: thin or empty books at entry time. If the
+        # opposite-side bid depth at exit-acceptable prices is below
+        # our entry size, the trade is a one-way street — the engine
+        # CAN enter but might not be able to EXIT.
+        #
+        # Logic: when buying YES, we'll later need to sell YES, which
+        # fills against yes_bids. Need yes_bids depth >= contracts at
+        # price >= (entry - MAX_EXIT_LOSS_CENTS). Similar for NO entries
+        # (no_bids must support the exit).
+        if bool(_uc("BB_PURE_LIQUIDITY_GATE_ENABLED", True)):
+            try:
+                req_depth = max(
+                    int(sig.contracts),
+                    int(_uc("BB_PURE_MIN_EXIT_BID_DEPTH_CONTRACTS", 1)),
+                )
+                max_loss = int(_uc("BB_PURE_MAX_EXIT_LOSS_CENTS", 25))
+                # We don't know the exact entry_px yet (set below by
+                # entry_mode logic), but bid_cents is its lower bound
+                # for a maker-bid entry. Use bid_cents as a proxy.
+                exit_floor_px = max(1, bid_cents - max_loss)
+                if sig.side == "yes":
+                    bid_book = getattr(book, "yes_bids", {}) or {}
+                else:
+                    bid_book = getattr(book, "no_bids", {}) or {}
+                depth_at_or_above = sum(
+                    int(qty) for px, qty in bid_book.items()
+                    if int(px) >= exit_floor_px
+                )
+                if depth_at_or_above < req_depth:
+                    logger.warning(
+                        "BB_PURE LIQUIDITY-BLOCK: %s %s exit-side depth "
+                        "%dct < required %dct at price >= %dc (bid=%dc, "
+                        "max_loss=%dc) — refusing entry on illiquid book",
+                        sig.side.upper(), ticker[-15:],
+                        depth_at_or_above, req_depth, exit_floor_px,
+                        bid_cents, max_loss,
+                    )
+                    return
+            except Exception as _le:
+                logger.debug("BB_PURE liquidity check failed: %s", _le)
+
         entry_mode = str(_uc("BB_PURE_ENTRY_MODE", "maker_bid_plus_1")).lower()
         if entry_mode == "maker_bid_plus_1":
             # Place at bid+1 (post-only) ONLY when there's a 1c safety
@@ -12821,7 +12873,8 @@ class PolymarketCopyEngine:
                         _actual_now = 0
                         for _p in _pos_api:
                             if _p.get("ticker") == contract.ticker:
-                                _actual_now = abs(int(_p.get("position", 0)))
+                                # 2026-05-03: Kalshi field is position_fp (string), not position
+                                _actual_now = abs(int(float(_p.get("position_fp", "0") or "0")))
                                 break
                         # Stable when same non-zero reading twice in a row
                         if _actual_now > 0 and _actual_now == _last_actual:
