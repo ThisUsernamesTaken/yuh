@@ -411,7 +411,11 @@ STOP_DEFER_ON_THICK_BID          = True   # If thick bid below trigger, defer st
 STOP_DEFER_THICK_BID_VOLUME_CT   = 100    # Threshold for "thick" support
 
 # ── Phase 3a: Entry flow gate ──────────────────────────────────────────
-ENTRY_FLOW_GATE_ENABLED          = True
+# 2026-05-03 Option A: DISABLED. This gate blocked entries when the
+# OPPOSITE side had strong taker flow — which is exactly the condition
+# of momentum chasers piling into the wrong side, creating the cheap
+# entry the user manually trades. We were filtering OUT our own alpha.
+ENTRY_FLOW_GATE_ENABLED          = False
 ENTRY_FLOW_WINDOW_S              = 5.0    # Recent flow window
 ENTRY_FLOW_BASELINE_S            = 15.0   # Baseline for deceleration check
 ENTRY_FLOW_MAX_ADVERSE_SHARE     = 0.60   # Block if adverse flow > 60%
@@ -420,7 +424,10 @@ ENTRY_FLOW_REQUIRE_DECEL         = True   # Require adverse-side deceleration
                                           # OR same-side dominance
 
 # ── Phase 3b: Book density gate ────────────────────────────────────────
-BOOK_DENSITY_GATE_ENABLED        = True
+# 2026-05-03 Option A: DISABLED. Same reasoning — opp-side density
+# means chasers built the wrong-side book, creating mispricing on the
+# thin side. Engine should fade INTO that, not refuse entry.
+BOOK_DENSITY_GATE_ENABLED        = False
 BOOK_DENSITY_DEPTH_LEVELS        = 5      # Top N price levels to sum
 BOOK_DENSITY_MIN_SAME_SIDE       = 50     # Min ct on our bid stack
 BOOK_DENSITY_MAX_OPP_DOMINANCE   = 4.0    # Block if opp_density > X * same_density
@@ -753,6 +760,14 @@ BB_PURE_BTC_STABILITY_WINDOW_S       = 30.0   # Window to scan
 BB_PURE_BTC_STABILITY_MAX_RANGE      = 30.0   # Max BTC range ($) in
                                               # the window. If exceeded,
                                               # BTC is trending; skip.
+# 2026-05-03 Option A: DISABLE the momentum-following gates that were
+# blocking BB_PURE's mean-reversion thesis. User confirmed their actual
+# profitable strategy is counter-trend (buy cheap side after BTC moves),
+# but these gates assumed BTC velocity continues — explicitly blocking
+# entry into the counter-trend opportunity. See full diagnosis in
+# session notes 2026-05-03 16:00 PT.
+BB_PURE_BTC_STABILITY_GATE_ENABLED   = False  # was the BTC-RANGE-BLOCK trigger
+BB_PURE_BTC_VELOCITY_GATE_ENABLED    = False  # was the BTC-ADVERSE-BLOCK
 
 # 2026-05-02 Phase 0.1.6 — ASYMMETRIC vol gate by trend orientation.
 # Tonight's loser pattern: -$5 fade trade fired NO at 24c right after BTC

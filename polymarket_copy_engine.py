@@ -9202,9 +9202,18 @@ class PolymarketCopyEngine:
         # Counter-trend fade: stricter vol cap (only fire if trend is
         #                     visibly exhausting → low recent range)
         # With-trend / no-trend: default or looser cap
+        # 2026-05-03 Option A: gate the entire BTC stability check behind
+        # a config flag. User's profitable strategy is counter-trend, but
+        # this gate blocks counter-trend entries during the very volatility
+        # that creates the cheap-side opportunity.
+        if not bool(_uc("BB_PURE_BTC_STABILITY_GATE_ENABLED", True)):
+            tt_btc = None  # signals the block below to skip
         try:
-            pf_btc = getattr(self, "_price_feed", None)
-            tt_btc = getattr(pf_btc, "tick_tracker", None) if pf_btc else None
+            if bool(_uc("BB_PURE_BTC_STABILITY_GATE_ENABLED", True)):
+                pf_btc = getattr(self, "_price_feed", None)
+                tt_btc = getattr(pf_btc, "tick_tracker", None) if pf_btc else None
+            else:
+                tt_btc = None
             stab_window = float(_uc("BB_PURE_BTC_STABILITY_WINDOW_S", 30.0))
             stab_max_range = float(_uc("BB_PURE_BTC_STABILITY_MAX_RANGE", 30.0))
             trend_window = float(_uc("BB_PURE_TREND_WINDOW_S", 300.0))
@@ -9259,15 +9268,14 @@ class PolymarketCopyEngine:
             logger.debug("BB_PURE BTC stability check failed: %s", _se)
 
         # 2026-05-01 BTC VELOCITY GATE:
-        # Contract price on Kalshi BTC binaries is pegged to BTC spot.
-        # When BTC is moving AGAINST our FVG position (e.g. BTC dropping
-        # while we want to buy YES = bullish bet), we're entering into
-        # an active adverse move. The model's fair value lags BTC by
-        # seconds; entering during the move means buying just before
-        # the bid drops further. User's diagnosis after watching trades
-        # all day: every entry goes negative first because we're
-        # entering into the BTC move, not after it stabilizes.
+        # 2026-05-03 Option A: gated behind BB_PURE_BTC_VELOCITY_GATE_ENABLED.
+        # User's actual edge is FADING the move, so blocking entries during
+        # adverse-velocity is blocking the alpha. Disabled by default after
+        # diagnosis showed this gate filtered the user's profitable manual
+        # strategy.
         try:
+            if not bool(_uc("BB_PURE_BTC_VELOCITY_GATE_ENABLED", True)):
+                raise StopIteration  # skip the entire block via except
             pf_btc = getattr(self, "_price_feed", None)
             tt_btc = getattr(pf_btc, "tick_tracker", None) if pf_btc else None
             adverse_thresh = float(_uc("BB_PURE_BTC_ADVERSE_VEL", 5.0))
