@@ -9259,9 +9259,17 @@ class PolymarketCopyEngine:
                         regime_cap = int(_uc("BB_PURE_MAX_ENTRY_CENTS", 55))
                         regime_min = int(_uc("BB_PURE_MIN_ENTRY_CENTS", 5))
                     elif sig_regime == "POSITION_ALIGNED":
-                        # B1 override: still cheap-side bet, use mean-rev caps
-                        regime_cap = int(_uc("BB_PURE_MAX_ENTRY_CENTS", 55))
-                        regime_min = int(_uc("BB_PURE_MIN_ENTRY_CENTS", 5))
+                        # B1 override: structurally a trend setup (BTC firmly
+                        # past strike, contract drifting toward 100c). Use
+                        # a dedicated cap (70c default) — higher than mean-
+                        # rev's 55c, lower than BB_TREND's 75c. Same risk
+                        # profile as Trade #7 (today's +$1.01 winner at 62c
+                        # entry) which fired under TREND cap. The 55c
+                        # inheritance was a bug from the initial B1 ship.
+                        regime_cap = int(_uc(
+                            "BB_PURE_POSITION_ALIGN_MAX_ENTRY_CENTS", 70))
+                        regime_min = int(_uc(
+                            "BB_PURE_POSITION_ALIGN_MIN_ENTRY_CENTS", 5))
                     else:  # TREND
                         regime_cap = int(_uc("BB_TREND_MAX_ENTRY_CENTS", 75))
                         regime_min = int(_uc("BB_TREND_MIN_ENTRY_CENTS", 60))

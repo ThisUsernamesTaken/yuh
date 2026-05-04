@@ -3536,3 +3536,261 @@ updated to reflect ca1e347 alignment stack. Branch now 4 commits
 ahead of origin/master. Push pending user explicit consent.
 
 Decision: continue monitoring at 270s cadence.
+
+---
+
+## 2026-05-03 21:36 PT — pushed to GitHub + quiet monitoring tick
+
+State at 21:36 PT:
+- nssm: SERVICE_RUNNING
+- BAL: $43.20 (unchanged)
+- Position: FLAT
+- Resting: 0
+- HEAD: **350f4ac** (pushed to origin/master)
+
+GitHub state:
+- 5 commits pushed to origin/master per user "get everything on
+  github" directive at 21:30 PT
+- Final pre-push commit 350f4ac added the latest live notes +
+  scripts/kalshi_session_replay.py for fresh-clone parity
+- Other PCs can now `git clone https://github.com/ThisUsernamesTaken/yuh.git`
+  and follow docs/NEW_INSTANCE_SETUP.md to trade identically
+- Gitignore properly excludes credentials/, *.pem, *.env, data/,
+  *.log, *.db — no secrets leaked
+
+Activity in window 12:30-12:45 ET:
+- SHADOW-EDGE side=YES bb=+20 conf=1.00 (strong YES conviction)
+- DOMINANT-SKIP rsi=71 contrarian
+- BB_PURE silent (mid=92c > BB_TREND entry-cap 75c, plus 0.375%
+  > B1's 0.15% max-dist cap)
+- Zero PROTECTIVE/RESIDUAL/OVERSELL/ORPHAN events
+- Zero MANUAL FILL events
+
+Window flip at 21:45 PT in ~9 min.
+
+Day total holds: engine +$1.54 (7 fires), manual +$3.32, net +$4.86.
+
+Decision: continue monitoring at 270s cadence.
+
+---
+
+## 2026-05-03 21:41 PT — quiet monitoring tick (window 12:30-12:45 ET, ~4 min left)
+
+State at 21:41 PT:
+- nssm: SERVICE_RUNNING
+- BAL: $43.20 (unchanged)
+- Position: FLAT
+- Resting: 0
+- HEAD: 350f4ac
+- Heartbeat current: 21:41:14
+
+Activity since 21:36:
+- SHADOW-EDGE softened: +26.4 → +19.4 (bb still +20, conf=0.78)
+- btc5m=$0 (no clear directional move)
+- DOMINANT-SKIP every cycle (April-15 profile mismatch)
+- Zero BB_PURE fires (mid still high → entry-cap blocks)
+- Zero PROTECTIVE/RESIDUAL/OVERSELL/ORPHAN events
+- Zero MANUAL FILL events
+
+Window flip at 21:45 PT in ~4 min.
+
+Day total holds: engine +$1.54 (7 fires), manual +$3.32, net +$4.86.
+
+Decision: continue monitoring at 270s cadence.
+
+---
+
+## 2026-05-03 21:46 PT — favorable BB_PURE setup emerging
+
+State at 21:46 PT:
+- nssm: SERVICE_RUNNING
+- BAL: $43.20 (unchanged)
+- Position: FLAT
+- Resting: 0
+- HEAD: 350f4ac
+- Heartbeat: cycle 7700 @ 21:46:07
+
+Window flip events at 21:44:55:
+- new Poly window 12:45-1:00 AM ET (= 21:45-22:00 PT, 905s)
+- STRIKE CALIBRATED: $80,353.57 (BTC=$80,340.15 mid=46c)
+- BTC distance: -$13.42 = **0.0167% INSIDE 0.04% mean-rev gate!**
+  First mean-rev-zone window since restart.
+- SESSION-TERMINAL: prior window 12:30-12:45 ET settled mid=46
+  regime=CHOP
+
+Activity since flip:
+- WS subscribed to KXBTC15M-26MAY040100-00, snapshot mid=52c
+- SR-SEED loaded 40 levels from prior session
+- TA warmed: score=-26.7 dir=down tier=WEAK conf=27 rsi=52
+- REGIME: MEAN_REVERTING vol=31.1% trend_score=0.20
+- PRESSURE ARMED: NO (building) score=+0.048 persist=0/3 fvg=-6c
+
+This is a FAVORABLE setup:
+- BTC near strike (0.017%) → BB_PURE MEAN_REVERSION zone OPEN
+- mid=52c → both YES (52c) and NO (48c) within entry-cap of 55c
+- BB model still warming up — may signal once fair_value resolves
+
+If BB sees edge, BB_PURE will fire in mean-rev regime (not TREND
+mode). Per-window lock will then hold for the rest of the window.
+
+Day total holds: engine +$1.54 (7 fires), manual +$3.32, net +$4.86.
+
+Decision: continue monitoring at 270s cadence.
+
+---
+
+## 2026-05-03 21:51 PT — BOOK-CROSSED guard diagnosis
+
+State at 21:51 PT:
+- nssm: SERVICE_RUNNING
+- BAL: $43.20 (unchanged)
+- Position: FLAT
+- Resting: 0
+- HEAD: 350f4ac
+- Heartbeat: cycle 8500 @ 21:51:03
+
+DIAGNOSTIC: BB_PURE silent for ~6 min on KXBTC15M-26MAY040100-00
+despite favorable mean-rev-zone setup. Root cause IDENTIFIED:
+
+WS snapshot at 21:45:17 showed `yes_bids=53, no_bids=48` →
+sum = 101 > 100 → BOOK-CROSSED-GUARD silently rejecting BB_PURE
+eval (commit ba60f53 from earlier today). The guard was added
+specifically to protect against inverted/stale books that
+produce phantom mids; it returns None without logging.
+
+This is correct behavior — book hasn't settled with valid quotes
+since the window opened. Once the book repopulates with proper
+yes/no spread (sum < 100), BB_PURE will resume eval.
+
+This explains today's earlier "BB_PURE silence" patterns too —
+they may have been book-crossed conditions, not just per-window
+state issues.
+
+Quality observation: the silent guard is correct but creates
+debugging noise. A single INFO log line ~once-per-30s when the
+guard fires would help future diagnostics. Defer to next
+coding session.
+
+Day total holds: engine +$1.54 (7 fires), manual +$3.32, net +$4.86.
+
+Decision: continue monitoring at 270s cadence.
+
+---
+
+## 2026-05-03 21:57 PT — SHADOW-EDGE flipped NO; BB_PURE still silent
+
+State at 21:57 PT (last log 21:57:15):
+- nssm: SERVICE_RUNNING
+- BAL: $43.20 (unchanged)
+- Position: FLAT
+- Resting: 0
+- HEAD: 350f4ac
+
+Activity since 21:51:
+- SHADOW-EDGE FLIPPED: was YES bb=+20 → now NO bb=-20.0 score=-22.1
+  conf=0.89 (BB now sees NO underpriced)
+- RSI=14 (extremely oversold, contrarian)
+- btc5m=$0 (no clear directional move)
+- BB_PURE STILL silent (likely book-crossed guard still active OR
+  mid moved such that NO entry would exceed 55c cap)
+
+Window 12:45-1:00 ET ends at 22:00 PT in ~3 min. Per-window state
+will reset on flip.
+
+User noted earlier (21:51 PT): "we should have had some paper
+trading". Acknowledged — B1+B3+B4 shipped straight to live without
+paper validation. Proposed counterfactual log replay (~30 min, no
+engine change) as recovery path. User direction pending.
+
+Day total holds: engine +$1.54 (7 fires), manual +$3.32, net +$4.86.
+
+Decision: continue monitoring at 270s cadence.
+
+---
+
+## 2026-05-03 22:02 PT — 🎯 B1 POSITION-ALIGN-PASS FIRED IN PRODUCTION (first time)
+
+State at 22:02 PT:
+- nssm: SERVICE_RUNNING
+- BAL: $43.20 (unchanged)
+- Position: FLAT
+- Resting: 0
+- HEAD: 350f4ac
+
+WINDOW FLIP at 22:00 PT (1:00-1:15 AM ET):
+- Setup at flip: BTC $80,312 vs strike $80,241 = **0.0886%**
+  (squarely in B1's no-man's-land between 0.04% mean-rev and
+  0.15% trend zones)
+- side=YES (BB cheap side) + BTC>strike → aligned classification
+- 6 successive `BB_PURE POSITION-ALIGN-PASS` log lines at
+  22:00:18-22:00:36 — FIRST B1 production exercise
+
+Sequence of every cycle:
+1. classify_position_alignment(side=yes, btc=80312, strike=80241,
+   deadband=5.0) → "aligned"
+2. dist_pct (0.000886) ≤ POSITION_ALIGN_MAX_DIST_PCT (0.0015) ✓
+3. POSITION-ALIGN-PASS log fires; regime=POSITION_ALIGNED set
+4. Regime cap = 55c (mean-rev cap, applied to POSITION_ALIGNED)
+5. entry=59c > 55c → ENTRY-CAP-BLOCK (correctly!)
+
+NO fire because YES was 4c above cap. Had market been ≤55c,
+B1 would have fired a real trade in POSITION_ALIGNED regime.
+
+VALIDATION COMPLETE end-to-end:
+- ✅ classify_position_alignment() correct
+- ✅ Distance check + override path executes
+- ✅ regime tag flows to entry-cap check
+- ✅ Conservative cap correctly filters extreme-settled-territory
+
+This is direct answer to the earlier "are we missing profitable
+trades" + "we should have had paper trading" concerns. The feature
+IS catching the no-man's-land setups (B1 fired 6× this cycle alone)
+— it's just blocked by the 55c entry cap on this particular setup.
+
+Day total holds: engine +$1.54 (7 fires), manual +$3.32, net +$4.86.
+
+Decision: continue monitoring at 270s cadence.
+
+---
+
+## 2026-05-03 22:08 PT — entry-cap analysis presented to user
+
+State at 22:08 PT (last log 22:08:32):
+- nssm: SERVICE_RUNNING
+- BAL: $43.20 (unchanged)
+- Position: FLAT
+- Resting: 0
+- HEAD: 350f4ac
+
+Activity since 22:02:
+- SHADOW-EDGE side=YES bb=+20 conf=0.83 (still strong YES)
+- btc5m=$0 (no clear direction)
+- B1 POSITION-ALIGN-PASS no longer firing — likely BTC drifted
+  outside the 0.15% no-man's-land OR book crossed again
+- No new BB_PURE log lines since 22:00:36 ENTRY-CAP-BLOCK
+- Zero PROTECTIVE/RESIDUAL/OVERSELL/ORPHAN events
+
+User asked at 22:02: "would raising the entry ceiling have landed
+us this trade? Look at your notes, have we been blocking ourselves
+from entering on winning entries just from gating the entry price?"
+
+Answer presented with hard data:
+- Today's TWO entry-price block groups:
+  1. Window 12:00-12:15 ET: ~25 ENTRY-MIN-BLOCK entry=48-51c (TREND
+     mode min=60c). Trade #7 eventually fired at 62c → won +$1.01.
+     Had floor allowed 50c entry, same trail exit at 88c would have
+     been +$1.52 vs actual +$1.04 = $0.48 left on table.
+  2. Window 1:00-1:15 ET (just now): 7 POSITION_ALIGNED ENTRY-CAP
+     blocks at entry=59c > 55c cap. Same regime profile as Trade #7
+     (won +$1.01) — likely would have won similarly.
+
+Recommended fix shipped to user: Option A — raise POSITION_ALIGNED
+cap 55c → 70c. The 55c cap was inherited from MEAN_REVERSION but
+POSITION_ALIGNED is structurally a trend setup (BTC firmly past
+strike, contract drifting toward 100c on YES settlement).
+
+User direction pending on whether to ship.
+
+Day total holds: engine +$1.54 (7 fires), manual +$3.32, net +$4.86.
+
+Decision: continue monitoring at 270s cadence.

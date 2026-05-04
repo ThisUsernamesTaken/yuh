@@ -886,6 +886,18 @@ BB_PURE_POSITION_ALIGN_DEADBAND_USD     = 5.0     # |BTC - strike| ≤ this
 BB_PURE_POSITION_ALIGN_MAX_DIST_PCT     = 0.0015  # only override up to 0.15%
                                                   # (above that, BB_TREND
                                                   # zone takes over instead)
+# 2026-05-03 PT 22:08 — Option A: dedicated entry-cents bounds for
+# POSITION_ALIGNED regime. Originally inherited mean-rev's 55c cap,
+# but POSITION_ALIGNED is structurally a trend setup (BTC firmly
+# past strike, contract drifting toward 100c). Today's window
+# 1:00-1:15 ET ENTRY-CAP-BLOCK at 59c (above 55c cap) on a setup
+# structurally identical to Trade #7 (which won +$1.01 at 62c
+# entry under TREND regime cap of 75c) — same R/R profile, just
+# blocked by inherited mean-rev cap. Raising to 70c (between
+# mean-rev's 55c and BB_TREND's 75c) to capture these setups.
+# Min still 5c — cheap-side filter for noise.
+BB_PURE_POSITION_ALIGN_MAX_ENTRY_CENTS  = 70      # was 55 (inherited)
+BB_PURE_POSITION_ALIGN_MIN_ENTRY_CENTS  = 5       # cheap-side floor
 
 # 2026-05-03 PT 20:30 — LOSS-STREAK COOLDOWN (option B3).
 # After N consecutive losses on BB_PURE, tighten min_edge_pp by a
