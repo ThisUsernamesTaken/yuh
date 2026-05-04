@@ -1,9 +1,17 @@
 # BTC Bias Engine — Current System Reference
 
-**Last updated**: 2026-05-02 PT (strategic reset)
+**Last updated**: 2026-05-03 17:18 PT (post Option A + 3 strategies live)
 **Entry point**: `run_copy_engine.py` (NSSM service `BTCBiasEngine` on Windows)
-**Live primary signal**: `BB_PURE` (Brownian-Bridge fair-value engine)
-**Status**: Live trading enabled (`PAPER_TRADING = False`); engine currently STOPPED pending operator restart.
+**Live primary signals**: `BB_PURE`, `BB_TREND`, `BB_MOMENTUM` (all 3 enabled)
+**Status**: SERVICE_RUNNING. BAL $38.63. Today's engine-only P&L: +$0.29 (3 fires).
+
+> **For the AI agent inheriting this session:** today's key finding is that
+> the momentum-following gates (BTC-RANGE, BTC-ADVERSE, ENTRY_FLOW,
+> BOOK_DENSITY) were blocking BB_PURE's mean-reversion alpha. Option A
+> disabled them via config, and the engine produced 3 fires with net +$0.29
+> after a full day of zero fires under the prior config. Next iteration
+> ships the 3c-bounce reversal-confirmation gate to fix entries that
+> still fire too early (Trade #3 lost on stale fair-value snapshot).
 
 This document is the operator-facing source of truth. **If this doc and code disagree, the code wins.** Update this doc whenever signal logic or config defaults materially change.
 
