@@ -2252,6 +2252,25 @@ class PolymarketCopyEngine:
             except Exception:
                 logger.exception("CopyEngine BB_MOMENTUM evaluator/execute error")
 
+        # 2026-05-03 Option C — ALIGNMENT-FALLBACK TIER. Fires a small
+        # with-trend bet when BB_PURE and BB_MOMENTUM both passed. Default-
+        # off behind BB_PURE_ALIGNMENT_FALLBACK_TIER_ENABLED; when off, the
+        # evaluator returns None immediately and this branch is a no-op.
+        # Reuses the BB_PURE execution path (per-window lock, place_order,
+        # protective layer all behave identically).
+        if not signal and bool(_uc("BB_PURE_MODE", False)) \
+                and bool(_uc("BB_PURE_ALIGNMENT_FALLBACK_TIER_ENABLED", False)):
+            try:
+                af_sig = await self._evaluate_alignment_fallback_signal()
+                if af_sig is not None:
+                    await self._execute_bb_pure_signal(af_sig)  # reuse path
+                    self._publish_state()
+                    return
+            except Exception:
+                logger.exception(
+                    "CopyEngine alignment-fallback evaluator/execute error"
+                )
+
         # Wallet tiers DISABLED — data shows they override contract mid direction
         # and reduce accuracy from 77% (paper/mid-only) to 58% (live/wallet-override).
         # Only TA_FORCED with contract mid direction + VWAP timing.
@@ -9424,6 +9443,50 @@ class PolymarketCopyEngine:
                             return None
         except Exception as _re:
             logger.debug("BB_PURE range-block check failed: %s", _re)
+
+        # 2026-05-03 Option C — ALIGNMENT CLASSIFICATION + GATE.
+        # Stamp every BB_PURE signal with its alignment vs BTC's 5-min
+        # trend direction. When BB_PURE_ALIGNMENT_GATE_ENABLED=True,
+        # BLOCK contrarian fires (cheap side opposes BTC trend) — those
+        # are the "buying into a falling knife" bets that need a separate
+        # reversal-confirmation gate (e.g. 3c-bounce; not yet wired).
+        # When the flag is False (default), this block is observe-only:
+        # it stamps `sig.alignment` so downstream code can read it but
+        # doesn't change behavior.
+        try:
+            from bb_pure import classify_alignment
+            _btc_5m_for_align = 0.0
+            try:
+                _btc_5m_for_align = float(
+                    getattr(self._last_pressure, "btc_move_300s", 0.0) or 0.0
+                )
+            except Exception:
+                _btc_5m_for_align = 0.0
+            _align_dead_zone = float(
+                _uc("BB_PURE_ALIGNMENT_BTC_DEAD_ZONE_USD", 20.0)
+            )
+            _alignment = classify_alignment(
+                side=sig.side,
+                btc_5m_change_usd=_btc_5m_for_align,
+                dead_zone_usd=_align_dead_zone,
+            )
+            try:
+                setattr(sig, "alignment", _alignment)
+            except Exception:
+                pass
+            if (_alignment == "contrarian"
+                    and bool(_uc("BB_PURE_ALIGNMENT_GATE_ENABLED", False))):
+                logger.warning(
+                    "BB_PURE ALIGNMENT-CONTRARIAN-BLOCK: %s side=%s "
+                    "btc_5m=$%+.0f (dead_zone=$%.0f) — contrarian fires "
+                    "require reversal-confirmation (not yet wired); skipping",
+                    ticker[-15:], sig.side.upper(), _btc_5m_for_align,
+                    _align_dead_zone,
+                )
+                return None
+        except Exception as _ae:
+            logger.debug("BB_PURE alignment classification failed: %s", _ae)
+
         # Log the signal so we can correlate with outcomes via gate_decisions
         try:
             if self._signal_logger:
@@ -9445,10 +9508,134 @@ class PolymarketCopyEngine:
         except Exception:
             pass
         logger.info(
-            "BB_PURE SIGNAL: %s ticker=%s regime=%s %s",
+            "BB_PURE SIGNAL: %s ticker=%s regime=%s alignment=%s %s",
             sig.side.upper(), ticker[-15:],
             getattr(sig, "regime", "MEAN_REVERSION"),
+            getattr(sig, "alignment", "neutral"),
             sig.reason,
+        )
+        return sig
+
+    async def _evaluate_alignment_fallback_signal(self):
+        """Alignment-fallback tier (Option A, 2026-05-03).
+
+        Fires a small with-trend bet on cycles where BB_PURE produced no
+        qualifying mispricing but BTC has a clear directional trend. The
+        thesis: when no contrarian setup is apparent, default to riding
+        the trend at the cheap-aligned price rather than sitting out.
+
+        Gated entirely behind BB_PURE_ALIGNMENT_FALLBACK_TIER_ENABLED
+        (default False). Returns a synthetic BBSignal so the existing
+        BB_PURE execution path handles placement, protection, and exit.
+
+        Sizing is conservative (fixed fraction, not Kelly) — this is a
+        default-action bet, not an edge bet.
+
+        Returns:
+            BBSignal with `alignment="aligned_fallback"` | None.
+        """
+        if not bool(_uc("BB_PURE_ALIGNMENT_FALLBACK_TIER_ENABLED", False)):
+            return None
+        try:
+            from bb_pure import (
+                aligned_side_from_btc,
+                build_alignment_fallback_signal,
+            )
+        except Exception as e:
+            logger.error("BB_PURE alignment-fallback import failed: %s", e)
+            return None
+        ticker = getattr(self, "_current_kalshi_ticker", "") or ""
+        if not ticker:
+            return None
+        # Reuse the post-failure cooldown to avoid spamming after a
+        # rejected order on this ticker.
+        try:
+            cooldown_map = getattr(self, "_bb_pure_post_fail_cooldown", None)
+            if cooldown_map is not None:
+                cooldown_until = cooldown_map.get(ticker, 0.0)
+                if cooldown_until and time.time() < cooldown_until:
+                    return None
+        except Exception:
+            pass
+        # WS book for current YES mid
+        ws = getattr(self, "_kalshi_ws", None)
+        book = ws.get_book(ticker) if ws and hasattr(ws, "get_book") else None
+        if book is None or not book.is_ready:
+            return None
+        # Reuse BB_PURE's book-crossed guard
+        try:
+            _yb = int(getattr(book, "best_yes_bid", 0) or 0)
+            _nb = int(getattr(book, "best_no_bid", 0) or 0)
+            if _yb > 0 and _nb > 0 and (_yb + _nb) > 100:
+                return None
+        except Exception:
+            pass
+        market_mid_cents = int(book.mid_price_cents)
+        if market_mid_cents <= 0:
+            return None
+        # Time to expiry
+        ws_start = float(getattr(self, "_window_start_time", 0) or 0)
+        if ws_start <= 0:
+            return None
+        secs_to_exp = max(0.0, 900.0 - (time.time() - ws_start))
+        # Balance
+        bal_dollars = float(_LIVE_BALANCE_DOLLARS or 0.0)
+        if bal_dollars <= 0:
+            return None
+        # BTC 5-min move via the engine's pressure cache (same source as
+        # the alignment classifier above).
+        try:
+            btc_5m = float(
+                getattr(self._last_pressure, "btc_move_300s", 0.0) or 0.0
+            )
+        except Exception:
+            return None
+        dead_zone = float(_uc("BB_PURE_ALIGNMENT_BTC_DEAD_ZONE_USD", 20.0))
+        side = aligned_side_from_btc(
+            btc_5m_change_usd=btc_5m,
+            dead_zone_usd=dead_zone,
+        )
+        if side is None:
+            return None  # neutral — no clear trend, no fallback
+        config = {
+            "max_entry_cents": int(
+                _uc("BB_PURE_ALIGNMENT_FALLBACK_MAX_ENTRY_CENTS", 55)),
+            "min_entry_cents": int(
+                _uc("BB_PURE_ALIGNMENT_FALLBACK_MIN_ENTRY_CENTS", 5)),
+            "min_time_remaining_s": float(
+                _uc("BB_PURE_ALIGNMENT_FALLBACK_MIN_TIME_S", 90.0)),
+            "kelly_fraction": float(
+                _uc("BB_PURE_ALIGNMENT_FALLBACK_KELLY_FRACTION", 0.10)),
+            "kelly_max_frac": float(
+                _uc("BB_PURE_ALIGNMENT_FALLBACK_KELLY_MAX_FRAC", 0.05)),
+            "max_contracts": int(_get_sizing_cap()),
+        }
+        try:
+            sig = build_alignment_fallback_signal(
+                side=side,
+                market_mid_cents=market_mid_cents,
+                seconds_to_expiry=secs_to_exp,
+                balance_dollars=bal_dollars,
+                config=config,
+            )
+        except Exception as e:
+            logger.error("BB_PURE alignment-fallback build error: %s", e)
+            return None
+        if sig is None:
+            return None
+        # Stamp regime so downstream logging is consistent. Reuse the
+        # MEAN_REVERSION regime so the existing protective layer treats
+        # this like a normal cheap-side BB_PURE entry. (The alignment
+        # field on the signal already differentiates it.)
+        try:
+            setattr(sig, "regime", "MEAN_REVERSION")
+        except Exception:
+            pass
+        logger.warning(
+            "BB_PURE ALIGNMENT-FALLBACK SIGNAL: %s ticker=%s "
+            "btc_5m=$%+.0f side=%s entry=%dc contracts=%d %s",
+            sig.side.upper(), ticker[-15:], btc_5m, side,
+            sig.suggested_entry_cents, sig.contracts, sig.reason,
         )
         return sig
 

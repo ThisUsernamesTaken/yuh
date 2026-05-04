@@ -824,6 +824,50 @@ BB_PURE_TAPE_MIN_CONSISTENCY         = 3      # ≥ N large buys on inverse
 BB_PURE_TAPE_BTC_DEAD_ZONE_USD       = 20.0   # |BTC 5m change| ≤ this
                                               # → no trend, no decision
 
+# 2026-05-03 Option C — ALIGNMENT GATE + ALIGNMENT-FALLBACK TIER.
+# User insight: BB_PURE's profitable edge is counter-trend (buy the cheap
+# side after BTC moves against it, hold for mean-reversion bounce). But
+# when no clear contrarian setup exists, sitting out costs opportunity —
+# default to a small WITH-TREND bet at the aligned-side cheap price.
+#
+# Two independent flags, both default OFF (opt-in deployment):
+#   _GATE_ENABLED:          when ON, BB_PURE BLOCKS contrarian fires
+#                           (cheap side opposes BTC trend) unless a
+#                           reversal-confirmation gate is satisfied.
+#                           Aligned fires pass through unchanged.
+#                           NOTE: the reversal-confirmation gate (e.g.
+#                           3c-bounce) is NOT yet wired — when this flag
+#                           is True, contrarian is hard-blocked. Wire
+#                           the confirmation gate separately and gate
+#                           the block on (not confirmation_ok).
+#   _FALLBACK_TIER_ENABLED: when ON, on cycles where BB_PURE found no
+#                           qualifying mispricing, the engine fires a
+#                           small with-trend bet on the aligned side
+#                           (cheap-side cap, fixed-fraction sizing, no
+#                           Kelly math). Independent of the gate above.
+#
+# Both flags default OFF: shipping the code, not the behavior. Flip to
+# True per the deploy review checklist (paper validate → live).
+BB_PURE_ALIGNMENT_GATE_ENABLED            = False  # block contrarian BB fires
+BB_PURE_ALIGNMENT_FALLBACK_TIER_ENABLED   = False  # add a with-trend tier
+BB_PURE_ALIGNMENT_BTC_DEAD_ZONE_USD       = 20.0   # |BTC 5m change| ≤ this
+                                                   # = no clear trend → no
+                                                   # alignment classification
+                                                   # (mirrors tape dead zone)
+# Alignment-fallback tier sizing/price gates (only used when
+# _FALLBACK_TIER_ENABLED=True). Conservative by design — this is a
+# "default action" bet, not a thesis bet, so it sizes smaller than
+# BB_PURE's regular Kelly path.
+BB_PURE_ALIGNMENT_FALLBACK_MAX_ENTRY_CENTS  = 55    # cheap-side cap, mirrors
+                                                    # BB_PURE_MAX_ENTRY_CENTS
+BB_PURE_ALIGNMENT_FALLBACK_MIN_ENTRY_CENTS  = 5     # don't fire on dust
+BB_PURE_ALIGNMENT_FALLBACK_MIN_TIME_S       = 90.0  # min seconds-to-expiry
+                                                    # (stricter than 60s
+                                                    # BB_PURE default — no
+                                                    # edge to lean on)
+BB_PURE_ALIGNMENT_FALLBACK_KELLY_FRACTION   = 0.10  # fixed fraction (no Kelly)
+BB_PURE_ALIGNMENT_FALLBACK_KELLY_MAX_FRAC   = 0.05  # absolute ceiling
+
 # Bump KalshiTape retention to 5 min so the absorption window has
 # enough trade history. Default in kalshi_tape.py is 120s.
 KALSHI_TAPE_RETENTION_S              = 360.0  # 6 min — covers 5-min

@@ -1727,3 +1727,357 @@ position activity. Engine STAYS STOPPED pending user clarification:
 2. Or was the position-cycling reactionary to our orphan-flatten?
 3. Either way, we cannot validate strategy alpha while another
    actor is creating positions.
+
+---
+
+## 2026-05-03 17:35 PT — monitoring tick (window 17:30-17:45)
+
+State at 17:35 PT:
+- nssm: SERVICE_RUNNING
+- BAL: $39.55 (was $38.63 pre-Trade-#4 → +$0.92 net realized this fire)
+- Position: FLAT
+- Resting: 0
+- HEAD: 24e6e4e
+
+Trade #4 lifecycle (17:30:33 → 17:31:46, ~73s):
+- BB_PURE SIGNAL: YES -26MAY032045-45 edge=18pp fair=56c market=38c
+  kelly=0.0726 contracts=7 tier=1 regime=MEAN_REVERSION
+- BB_PURE FIRE: YES 7x @ 38c ($2.66 cost). NOFILL warning (RECLAIM
+  scheduled). Then NOFILL late-fill 7ct after timeout — RECLAIM
+  adopted the position cleanly.
+- MFE-TRAIL chase: bid climbed 38c → 56c. Trail target re-priced
+  every cycle (43c → 49c). ~12 PROTECTIVE place_order failures
+  ('post only cross') as bid moved faster than re-price.
+- TRAIL ARMED at 55c floor (bid=56c). TIER RETRY cancelled stale
+  55c sell, re-issued. TRAIL FIRED 7x @ ~53c.
+- engine_ct=7, kalshi_pre=7, kalshi_post=0. Clean exit.
+- Reported gross: $+1.05. Actual BAL delta: $+0.92 net (likely fees).
+- MFE/MAE row logged: entry=38c mfe=56c mae=37c spread=18c/1c
+  exit=trail_ratchet pnl=$1.05.
+
+Per-window lock now held; no new BB_PURE fires this window. Engine
+heartbeating cleanly, awaiting next 15-min window or other signal
+tier (BB_TREND/BB_MOMENTUM).
+
+Engine-only P&L today: +$1.21 net (4 fires; 1 small loss + 3 wins).
+First sustained profitable streak under Option A's gate-disabled
+config.
+
+Quality issue (non-blocking, log to next-session todo):
+The MFE-TRAIL re-issue loop fires every poll cycle (~600ms) without
+checking if a place_order is already in flight — generated ~12
+post-only-cross errors back-to-back during the bid-climb. The
+TIER RETRY path eventually cancelled+re-issued at the right level
+so the exit DID land, but the loud error log is misleading. Fix:
+gate MFE-TRAIL re-issue on (a) prior attempt completed and (b)
+target price has moved >= 1c since last attempt. Defer fix.
+
+No oversell, no REENTRY-BLOCK, no STUCK-RESIDUAL, no orphan-flatten
+of user trades. Decision: continue monitoring at 270s cadence.
+
+---
+
+## 2026-05-03 17:40 PT — monitoring tick (window 17:30-17:45, ~5 min left)
+
+State at 17:40 PT:
+- nssm: SERVICE_RUNNING
+- BAL: $39.55 (unchanged since Trade #4 close)
+- Position: FLAT
+- Resting: 0
+- HEAD: 24e6e4e
+
+Activity since last check (17:35 → 17:40):
+- 17:35:49 whale_monitor: KRAKEN INFLOW 58.16 BTC (MEMPOOL) — log-only
+- 17:35:50 → 17:38:07: heartbeat-only (cycles 12200 → 12600)
+- No BB_PURE SIGNAL, no BB_MOMENTUM SIGNAL, no place_order failures,
+  no PROTECTIVE events, no RESIDUAL/OVERSELL/ORPHAN events
+
+Per-window lock for -26MAY032045-45 still held; window closes ~17:45.
+
+P&L unchanged: +$1.21 net day.
+
+Decision: continue monitoring at 270s cadence. Next window opens
+~17:45 PT — watch for new BB_PURE SIGNAL on the fresh ticker.
+
+---
+
+## 2026-05-03 17:40 PT — monitoring tick (window 17:30-17:45, ~5 min left)
+
+State at 17:40 PT:
+- nssm: SERVICE_RUNNING
+- BAL: $39.55 (unchanged)
+- Position: FLAT
+- Resting: 0
+- HEAD: 24e6e4e
+- Heartbeat current: 17:40:24 cycle 13000
+
+Activity since last check (17:35 → 17:40):
+- 100% heartbeat-only (cycles 12300 → 13000, ~34s per 100 cycles)
+- No BB_PURE SIGNAL, no new fires, no place_order failures
+- No PROTECTIVE/RESIDUAL/OVERSELL/ORPHAN/REENTRY events
+
+Per-window lock still held; window flip ~17:45 PT. Next wake-up
+covers the flip — should observe `new Poly window` log + first
+SIGNAL/SKIP cascade on the fresh ticker.
+
+P&L unchanged: +$1.21 net day.
+
+Decision: continue monitoring at 270s cadence.
+
+---
+
+## 2026-05-03 17:43 PT — monitoring tick (window 17:30-17:45, ~2 min left)
+
+State at 17:43 PT:
+- nssm: SERVICE_RUNNING
+- BAL: $39.55 (unchanged)
+- Position: FLAT
+- Resting: 0
+- HEAD: 24e6e4e
+- Heartbeat current: 17:42:42 cycle 13400
+
+Activity since last check (17:40 → 17:43):
+- 100% heartbeat-only (cycles 13000 → 13400)
+- No SIGNAL/FIRE/PROTECTIVE/RESIDUAL/OVERSELL/ORPHAN/REENTRY events
+
+Window 17:30-17:45 PT: lock still held on -26MAY032045-45.
+Window flip in ~2 min. Next wake-up should observe `new Poly window`
+log + fresh-ticker first-fire cascade.
+
+P&L unchanged: +$1.21 net day.
+
+Decision: continue monitoring at 270s cadence.
+
+---
+
+## 2026-05-03 17:45 PT — monitoring tick (window flip just occurred)
+
+State at 17:45 PT:
+- nssm: SERVICE_RUNNING
+- BAL: $39.55 (unchanged)
+- Position: FLAT
+- Resting: 0
+- HEAD: 24e6e4e
+- Heartbeat current: 17:45:15 (PAPER LEVEL SETUP processing)
+
+Window flip events at 17:44:55:
+- `new Poly window` — Bitcoin Up or Down - May 3, 8:45PM-9:00PM ET
+  (904s = 15min window; covers 17:45-18:00 PT)
+- `STRIKE CALIBRATED: $78428.90` from BTC=$78384.62 mid=35c
+  (calibration accounts for mid drift; old method would have used
+  pure BTC = $78384.62)
+- `SESSION-TERMINAL: KXBTC15M-26MAY032045-45 mid=35 regime=chop levels=40`
+  (prior window terminal data persisted; SR-SEED on new window will
+  read this back per Phase D cross-session priors)
+- Whale alert at 17:43:49: KRAKEN OUTFLOW 226 BTC (log-only)
+
+Per-window ticker lock RESET — new window is fresh; first BB_PURE
+SIGNAL eligible on new ticker (likely KXBTC15M-26MAY032100-XX once
+WS subscribes to it).
+
+P&L unchanged: +$1.21 net day.
+
+No SIGNAL/FIRE yet on new window. Will catch first signal cascade
+in next wake-up.
+
+Decision: continue monitoring at 270s cadence.
+
+---
+
+## 2026-05-03 17:48 PT — monitoring tick (window 17:45-18:00, ~3 min in)
+
+State at 17:48 PT:
+- nssm: SERVICE_RUNNING
+- BAL: $39.55 (unchanged)
+- Position: FLAT
+- Resting: 0
+- HEAD: 24e6e4e
+- Heartbeat current: 17:48:19 (engine processing DOMINANT-SKIP loop)
+
+Activity since 17:45 (window flip):
+- BB_PURE: ZERO fires/signals. STRIKE-DIST-BLOCK firing every cycle.
+  BTC $78385 vs strike $78429 = 0.0565% > 0.04% threshold.
+  Strategic gate correctly blocking — BB_PURE only fires when BTC
+  is in the gamma-rich zone near strike.
+- DOMINANT tier evaluating but skipping (`DOMINANT-SKIP: NO not
+  dominant-direction`) — April-15 profile not matching, expected
+  for legacy tier.
+- SHADOW-EDGE logging only (informational).
+- No PROTECTIVE/RESIDUAL/OVERSELL/ORPHAN/REENTRY events.
+
+Strike-distance gate is doing exactly what it's designed for:
+preventing entries when contract pricing is dominated by drift not
+gamma. This is healthy behavior — wait for BTC to move closer to
+$78429 before BB_PURE will signal.
+
+Engine-only P&L today: +$1.21 net (unchanged).
+
+Decision: continue monitoring at 270s cadence. BB_PURE may not
+fire this window unless BTC drifts within $32 of strike (0.04%).
+
+---
+
+## 2026-05-03 17:50 PT — monitoring tick (window 17:45-18:00, ~5 min in)
+
+State at 17:50 PT:
+- nssm: SERVICE_RUNNING
+- BAL: $39.55 (unchanged)
+- Position: FLAT
+- Resting: 0
+- HEAD: 24e6e4e
+- Heartbeat current: 17:50:09 (DOMINANT-SKIP loop)
+
+Activity since 17:48:
+- BB_PURE: ZERO fires/signals on the new window. STRIKE-DIST-BLOCK
+  log went silent after 17:45:38 (eval likely re-skipping silently
+  on unchanged conditions, log throttle on repeated state).
+- SHADOW-EDGE flipped from NO (score=-15.5 bb=-17.6) at 17:48 to
+  YES (score=+13.6 bb=+5.9) at 17:50. RSI=89 (overbought).
+- DOMINANT tier evaluating but skipping on rsi=89 contrarian.
+- No PROTECTIVE/RESIDUAL/OVERSELL/ORPHAN/REENTRY events.
+- No place_order failures.
+
+Health checks:
+- Service running
+- Heartbeat fresh
+- Account state matches engine state (FLAT, 0 resting, $39.55)
+- No bug signatures
+
+Engine-only P&L today: +$1.21 net (unchanged).
+
+Decision: continue monitoring at 270s cadence.
+
+---
+
+## 2026-05-03 17:54 PT — monitoring tick (window 17:45-18:00, ~6 min left)
+
+State at 17:54 PT:
+- nssm: SERVICE_RUNNING
+- BAL: $39.55 (unchanged)
+- Position: FLAT
+- Resting: 0
+- HEAD: 24e6e4e
+- Heartbeat current: 17:54:10 (DOMINANT-SKIP loop active)
+
+Activity since 17:50:
+- Zero BB_PURE fires/signals in this window. STRIKE-DIST-BLOCK still
+  silent (log throttle on unchanged-state).
+- SHADOW-EDGE flipped again: YES (+13.6) at 17:50 → NO (-25.0
+  bb=-20.0) at 17:54. Mean-reverting tape.
+- DOMINANT-SKIP continues firing on every cycle (April-15 profile
+  not matching).
+- Zero PROTECTIVE/RESIDUAL/OVERSELL/ORPHAN/REENTRY events.
+- Zero place_order failures.
+
+This window looks no-fire so far. ~6 min until 18:00 PT flip. If
+BB_PURE were going to fire it likely would have by now — strike-
+distance gate has held throughout.
+
+Engine-only P&L today: +$1.21 net (unchanged).
+
+Decision: continue monitoring at 270s cadence. Next wake should
+either catch a late-window fire or the 18:00 window flip event.
+
+---
+
+## 2026-05-03 17:57 PT — monitoring tick (window 17:45-18:00, ~3 min left)
+
+State at 17:57 PT:
+- nssm: SERVICE_RUNNING
+- BAL: $39.55 (unchanged — confirmed via Kalshi API)
+- Position: FLAT (confirmed via Kalshi API)
+- Resting: 0
+- HEAD: 24e6e4e
+- Heartbeat current: 17:57:33 cycle 15900
+
+NEW activity since 17:54: shadow-tier signal cascade (informational
+only, no actual orders placed):
+- 17:57:15+ DOMINANT now PASSING (fvg_side=YES, score=+25.6→26.3)
+- PRESSURE ENTRY: YES score=+0.041 conf=1.00 persist=0
+  fvg=+31c prob=97-98% edge=+19-20c
+- SHADOW-ARM: YES @mid=78c fvg=+31c pressure=+0.04/none rsi=70
+  awaiting |score|>=0.15 flip (max 120s)
+- "ENTRY: YES src=microstructure" log lines at every cycle
+  (~3/sec) — these are candidate evaluations, NOT actual fires
+
+Confirmed state: FLAT, BAL $39.55 unchanged, 0 resting → no orders
+placed. The "ENTRY: YES" + "PRESSURE ENTRY" logs are shadow-tier /
+microstructure observation. mid=78c is well above
+BB_PURE_MAX_ENTRY_CENTS=55c so BB_PURE wouldn't fire YES at this
+price anyway (cheap-side cap correctly enforced).
+
+Health: zero PROTECTIVE/RESIDUAL/OVERSELL/ORPHAN/REENTRY events.
+Zero place_order failures. Zero actual fires.
+
+Engine-only P&L today: +$1.21 net (unchanged).
+
+Worth noting (low-priority observation): the shadow-tier eval is
+high-volume — ~3 PRESSURE ENTRY + 3 ENTRY: YES + 3 SHADOW-EDGE log
+lines per second now that DOMINANT is PASS. Not a problem (logs
+only), but if log volume gets aggressive could rate-limit. Not
+acting on it.
+
+Decision: continue monitoring at 270s cadence. Window flip at
+18:00 PT in ~3 min.
+
+---
+
+## 2026-05-03 17:59 PT — monitoring tick (window 17:45-18:00, ~30s left)
+
+State at 17:59 PT:
+- nssm: SERVICE_RUNNING
+- BAL: $39.55 (unchanged — confirmed via Kalshi)
+- Position: FLAT (confirmed via Kalshi)
+- Resting: 0
+- HEAD: 24e6e4e
+- Heartbeat current: 17:59:24
+
+Activity since 17:57:
+- DOMINANT flipped back PASS → SKIP. Latest at 17:59:23
+  shows SKIP on `rsi=82(contrarian)` — RSI elevated.
+- SHADOW-EDGE: side=YES score=+27.2 bb=+20.0 (strong shadow edge,
+  but DOMINANT not acting)
+- ZERO BB_PURE fires, ZERO actual entries placed in this window.
+- Zero PROTECTIVE/RESIDUAL/OVERSELL/ORPHAN/REENTRY events.
+- Zero place_order failures.
+
+This window confirmed no-fire from end-to-end. Strike-distance
+gate held throughout, BB_PURE refused all fire opportunities.
+
+Engine-only P&L today: +$1.21 net (unchanged).
+
+Decision: continue monitoring at 270s cadence. Window flip at
+~18:00 PT in 30 seconds; next wake-up catches new-window cascade.
+
+---
+
+## 2026-05-03 18:04 PT — monitoring tick (window 18:00-18:15, ~4 min in)
+
+State at 18:04 PT:
+- nssm: SERVICE_RUNNING
+- BAL: $39.55 (unchanged — confirmed via Kalshi)
+- Position: FLAT (confirmed via Kalshi)
+- Resting: 0
+- HEAD: 24e6e4e
+- Heartbeat current: 18:04:15 cycle 16900
+
+Window flip events at 17:59:55:
+- new Poly window — 9:00PM-9:15PM ET (904s)
+- STRIKE CALIBRATED: $78492.99 (BTC=$78569.72 mid=78c)
+- SESSION-TERMINAL: KXBTC15M-26MAY032100-00 mid=78 regime=chop
+  levels=40 (prior window 8:45-9:00 ET terminal saved)
+
+BTC-vs-strike distance now ~$76.73 = 0.0977% — still outside 0.04%
+gate. STRIKE-DIST-BLOCK likely active but log throttled.
+
+Activity since flip:
+- SHADOW-EDGE much weaker now: side=NO score=-5.7 conf=0.23
+  bb=-0.6 (vs prior window's bb=+20.0 strong YES). BB fair value
+  has converged with market — no screaming edge.
+- DOMINANT-SKIP every cycle (April-15 profile not matching).
+- ZERO BB_PURE fires/signals.
+- ZERO PROTECTIVE/RESIDUAL/OVERSELL/ORPHAN/REENTRY events.
+
+Engine healthy. P&L unchanged: +$1.21 net day.
+
+Decision: continue monitoring at 270s cadence.

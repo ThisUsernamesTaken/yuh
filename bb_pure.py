@@ -40,6 +40,145 @@ class BBSignal:
     seconds_to_expiry: float
     reason: str                     # diagnostic for logs / DB
     conviction_tier: int = 1        # 1=clean, 2=high, 3=extreme
+    # 2026-05-03 Option C: alignment classification of the BB cheap side
+    # vs BTC 5-min trend direction. Set by the caller after bb_evaluate
+    # returns; pure module doesn't see BTC trend. Values:
+    #   "aligned"      — cheap side matches BTC trend (with-trend bet)
+    #   "contrarian"   — cheap side opposes BTC trend (counter-trend bet)
+    #   "neutral"      — BTC trend within dead zone, no clear direction
+    #   "aligned_fallback" — synthesized by the alignment-fallback tier
+    #                        when BB had no contrarian setup
+    alignment: str = "neutral"
+
+
+def classify_alignment(
+    side: str,
+    btc_5m_change_usd: float,
+    dead_zone_usd: float = 20.0,
+) -> str:
+    """Classify a BB cheap-side signal as aligned/contrarian/neutral.
+
+    Pure helper, no I/O. Used by the engine's alignment gate (option B)
+    and by the alignment-fallback tier (option A) shipped 2026-05-03.
+
+    Args:
+        side: "yes" or "no" — the side BB_PURE wants to buy (cheap side).
+        btc_5m_change_usd: BTC's 5-minute price change in $.
+            Positive = BTC rising = YES is the with-trend side.
+            Negative = BTC falling = NO is the with-trend side.
+        dead_zone_usd: |change| ≤ this is treated as no clear trend.
+            Default $20, mirrors `BB_PURE_TAPE_BTC_DEAD_ZONE_USD`.
+
+    Returns:
+        "aligned" if `side` matches BTC trend direction.
+        "contrarian" if `side` opposes BTC trend direction.
+        "neutral" if |btc_5m_change_usd| ≤ dead_zone_usd.
+    """
+    if abs(float(btc_5m_change_usd)) <= float(dead_zone_usd):
+        return "neutral"
+    s = (side or "").lower()
+    if btc_5m_change_usd > 0:  # BTC up — YES is with-trend
+        return "aligned" if s == "yes" else "contrarian"
+    else:  # BTC down — NO is with-trend
+        return "aligned" if s == "no" else "contrarian"
+
+
+def aligned_side_from_btc(
+    btc_5m_change_usd: float,
+    dead_zone_usd: float = 20.0,
+) -> Optional[str]:
+    """Return the trend-aligned side ("yes"/"no") or None if neutral.
+
+    Companion helper to `classify_alignment` for the alignment-fallback
+    tier: when BB_PURE has no contrarian setup, the fallback fires on
+    the with-trend side returned here.
+    """
+    if abs(float(btc_5m_change_usd)) <= float(dead_zone_usd):
+        return None
+    return "yes" if btc_5m_change_usd > 0 else "no"
+
+
+def build_alignment_fallback_signal(
+    side: str,
+    market_mid_cents: int,
+    seconds_to_expiry: float,
+    balance_dollars: float,
+    config: dict,
+) -> Optional[BBSignal]:
+    """Synthesize a BBSignal for the alignment-fallback tier.
+
+    Used when BB_PURE found no contrarian mispricing but the user wants
+    to fire WITH the BTC trend anyway (option A). No fair-value math —
+    this tier bets that directional drift continues. Pure module so it
+    can be unit-tested without engine state.
+
+    Args:
+        side: "yes" or "no" — pre-computed trend-aligned side.
+        market_mid_cents: current YES mid in cents.
+        seconds_to_expiry: window time remaining in seconds.
+        balance_dollars: account balance for sizing.
+        config: dict with keys
+            "max_entry_cents", "min_entry_cents", "min_time_remaining_s",
+            "kelly_fraction", "kelly_max_frac", "max_contracts".
+
+    Returns:
+        A BBSignal with `alignment="aligned_fallback"`, `conviction_tier=1`,
+        and a small fixed-fraction bet sized off entry price; or None if
+        gates fail (price out of band, time too short, etc.).
+    """
+    s = (side or "").lower()
+    if s not in ("yes", "no"):
+        return None
+    if (market_mid_cents <= 0 or market_mid_cents >= 100):
+        return None
+    if seconds_to_expiry <= 0 or balance_dollars <= 0:
+        return None
+    min_time = float(config.get("min_time_remaining_s", 60.0))
+    if seconds_to_expiry < min_time:
+        return None
+    max_entry = int(config.get("max_entry_cents", 55))
+    min_entry = int(config.get("min_entry_cents", 5))
+    if s == "yes":
+        entry_cents = int(market_mid_cents)
+    else:
+        entry_cents = int(100 - market_mid_cents)
+    if entry_cents < min_entry or entry_cents > max_entry:
+        return None
+    if entry_cents >= 99:
+        return None
+    # Sizing: fixed fraction of balance scaled by entry price (no Kelly —
+    # there is no edge to compute against). Conservative by design: this
+    # is a "no contrarian setup, follow trend" fallback, not a thesis bet.
+    kelly_frac = float(config.get("kelly_fraction", 0.10))
+    kelly_max = float(config.get("kelly_max_frac", 0.05))
+    bet_frac = max(0.0, min(kelly_frac, kelly_max))
+    if bet_frac <= 0:
+        return None
+    bet_dollars = bet_frac * float(balance_dollars)
+    max_contracts = int(config.get("max_contracts", 200))
+    contracts = int(round(bet_dollars / max(entry_cents / 100.0, 0.01)))
+    contracts = max(1, min(contracts, max_contracts))
+    # Win probability proxied by entry price (= market-implied) — the
+    # protective layer needs a value but won't use this for math since
+    # `alignment="aligned_fallback"` flags this as a non-edge bet.
+    win_p = float(entry_cents) / 100.0
+    return BBSignal(
+        side=s,
+        edge_pp=0.0,
+        fair_yes_cents=int(entry_cents if s == "yes" else 100 - entry_cents),
+        market_mid_cents=int(market_mid_cents),
+        suggested_entry_cents=entry_cents,
+        win_probability=win_p,
+        kelly_fraction=bet_frac,
+        contracts=contracts,
+        seconds_to_expiry=float(seconds_to_expiry),
+        reason=(
+            f"alignment_fallback side={s} entry={entry_cents}c "
+            f"frac={bet_frac:.4f} contracts={contracts}"
+        ),
+        conviction_tier=1,
+        alignment="aligned_fallback",
+    )
 
 
 def evaluate(
