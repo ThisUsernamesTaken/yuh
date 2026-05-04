@@ -985,7 +985,10 @@ BB_PURE_MAX_STRIKE_DIST_PCT          = 0.0004  # 0.04% (~$31 at $78k BTC)
 # Time-of-day gate: pause during overnight hours where the tape is "ruthless"
 # per user manual-trading observation 2026-05-02. Default 06:00–22:00 PT
 # (= 13:00–05:00 UTC). Window covers US/EU active hours.
-BB_PURE_TRADING_HOURS_GATE_ENABLED   = True
+# 2026-05-03 PT 22:21 — DISABLED per user "let the engine trade"
+# directive after Option A ship. Engine now eligible for overnight
+# fires. Re-enable if night losses materialize.
+BB_PURE_TRADING_HOURS_GATE_ENABLED   = False   # 2026-05-03 ALL-HOURS
 BB_PURE_TRADING_HOUR_START_PT        = 6
 BB_PURE_TRADING_HOUR_END_PT          = 22
 BB_PURE_PT_UTC_OFFSET_H              = -7.0    # PDT (summer); -8 in winter

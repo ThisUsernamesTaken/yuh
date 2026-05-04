@@ -3794,3 +3794,76 @@ User direction pending on whether to ship.
 Day total holds: engine +$1.54 (7 fires), manual +$3.32, net +$4.86.
 
 Decision: continue monitoring at 270s cadence.
+
+---
+
+## 2026-05-03 22:17 PT — Option A SHIPPED + pushed; trading hours hit
+
+State at 22:17 PT:
+- nssm: SERVICE_RUNNING (restarted post-deploy)
+- BAL: $43.20 (unchanged)
+- Position: FLAT
+- Resting: 0
+- HEAD: **1816e49** (pushed to origin/master)
+
+Option A deploy sequence (per user "ship A update the repo"):
+- 22:08 nssm stop
+- user_config.py + polymarket_copy_engine.py edits
+- 545 tests passed (no regressions; 3 pre-existing failures unrelated)
+- 22:14 git commit 1816e49
+- 22:14 nssm start (engine restart)
+- 22:14 git push origin master (350f4ac → 1816e49)
+
+NIGHT-MODE TRANSITION at 22:17:14:
+- CopyEngine BLOCKED HOURS: ET 01:xx — 1-contract mode
+- Crossed BB_PURE_TRADING_HOUR_END_PT=22 cutoff at 22:00 PT
+  (window is [6, 22) PT — exclusive at 22)
+- BB_PURE will fire HOURS-BLOCK on every cycle until 06:00 PT
+  tomorrow (Mon May 4)
+
+Window 1:15-1:30 ET active (engine joined late at 22:17:15 with
+765s left). mid=34c. TA: score=-171 dir=down tier=STRONG rsi=14
+(extremely oversold).
+
+Day total holds (engine likely silent rest of the night):
+- Engine: +$1.54 (7 fires, 4W/3L)
+- Manual: +$3.32
+- **Net: +$4.86 final**
+
+This was a productive day:
+- 8 commits today (24e6e4e → 1816e49)
+- 67+ new tests
+- Multiple bug fixes (lock-release, book-crossed, position_fp,
+  ORPHAN_FLATTEN safety)
+- Three new strategies wired (BB_TREND, BB_MOMENTUM, B1
+  POSITION_ALIGNED)
+- Five alignment-stack flags activated (A1, A2, B1, B3, B4)
+- Option A entry-cap fix shipped + pushed
+- All commits on origin/master for fresh-clone parity
+
+Decision: continue monitoring at 270s cadence (nights are quiet
+but worth watching for any unexpected events).
+
+---
+
+## 2026-05-03 22:21 PT — night-mode tick (BLOCKED HOURS active)
+
+State at 22:21 PT:
+- nssm: SERVICE_RUNNING
+- BAL: $43.20 (unchanged)
+- Position: FLAT
+- Resting: 0
+- HEAD: 1816e49
+- Heartbeat: cycle 700 @ 22:21:10 (engine ticking)
+
+Trading-hours gate is now blocking BB_PURE (BLOCKED HOURS ET 01:xx
+"1-contract mode" log). Engine warmed up post Option A restart and
+is heartbeating cleanly but evals are gated.
+
+No new fires/errors/PROTECTIVE/RESIDUAL/OVERSELL events.
+
+Day total final: engine +$1.54 (7 fires), manual +$3.32, net +$4.86.
+
+Decision: continue monitoring at 270s cadence per user preference
+even during night-mode (rather than 30-min cadence I scheduled
+earlier).
