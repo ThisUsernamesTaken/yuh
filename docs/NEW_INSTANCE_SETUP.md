@@ -1,6 +1,6 @@
 # New Instance Setup — for AI agents and humans
 
-**Last updated**: 2026-05-03
+**Last updated**: 2026-05-03 PT (post commit ca1e347)
 **Reading prerequisite**: `CLAUDE.md` (root). Read it first to understand
 what the engine *does* before installing it.
 
@@ -9,10 +9,25 @@ Windows machine, validating it works, and flipping it to live trading. It
 exists because `README.md` got stale and confused fresh AI agents about
 which strategy is live.
 
-The engine's **only live strategy is `BB_PURE`** (Brownian-Bridge mispricing).
-TA_FORCED, SR_FADE, SCALP_DCA, wallet-copy, sniper, and ATM_REVERSION are
-all retired/feature-flagged-off. Don't re-enable them without reading the
-relevant `to-do/` postmortems.
+The engine has **three live entry strategies** as of ca1e347:
+- `BB_PURE` — Brownian-Bridge mispricing (mean-reversion in mean-rev zone)
+- `BB_TREND` — With-trend bets when BTC is firmly past strike (≥0.15%)
+- `BB_MOMENTUM` — Sustained directional BTC velocity entries
+
+All three are gated behind a per-window ticker lock — one entry per
+ticker per window across all three strategies.
+
+A five-flag alignment classification stack is also active:
+- A1 `BB_PURE_ALIGNMENT_GATE_ENABLED` — blocks contrarian BB fires
+- A2 `BB_PURE_ALIGNMENT_FALLBACK_TIER_ENABLED` — adds with-trend fallback
+- B1 `BB_PURE_POSITION_ALIGN_ENABLED` — overrides strike-dist block
+  when position-aligned (captures 0.04-0.15% no-man's-land setups)
+- B3 `BB_PURE_LOSS_STREAK_COOLDOWN_ENABLED` — auto-tightens after losses
+- B4 `BB_PURE_FINAL_MIN_RELAX_ENABLED` — relaxes time-floor for aligned
+
+TA_FORCED, SR_FADE, SCALP_DCA, wallet-copy, sniper, and ATM_REVERSION
+are all retired/feature-flagged-off. Don't re-enable them without reading
+the relevant `to-do/` postmortems.
 
 ---
 
@@ -135,9 +150,17 @@ Run the test suite:
     --ignore=tests/test_strategy_index.py
 ```
 
-Expect: ~445 passing, 2 pre-existing `test_late_dominant.py` failures
-unrelated to BB_PURE. The 4 ignored test files reference modules deleted
-long ago — safe to skip.
+Expect: ~545 passing (HEAD ca1e347). 3 pre-existing failures
+(2 in `test_late_dominant.py`, 1 in `test_sr_fade_gates.py`) unrelated
+to current strategies. The 4 ignored test files reference modules
+deleted long ago — safe to skip.
+
+The pure-module test files most worth reading first:
+- `tests/test_bb_pure.py` — BB_PURE math + sizing
+- `tests/test_bb_pure_alignment.py` — alignment classifier + position-
+  vs-strike override + fallback signal synthesis
+- `tests/test_bb_momentum.py` — directional-velocity entries
+- `tests/test_protective_math.py` — MFE-aware trail logic
 
 ---
 

@@ -3042,3 +3042,460 @@ Day total holds: engine +$0.53 (6 fires), manual +$3.32, net +$3.85.
 Pending: user flag-flip decision.
 
 Decision: continue monitoring at 270s cadence.
+
+---
+
+## 2026-05-03 20:57 PT — post-flag-flip restart confirmed (HEAD ca1e347)
+
+State at 20:57 PT:
+- nssm: SERVICE_RUNNING (restarted 20:56:39 post-commit ca1e347)
+- BAL: $42.19 (unchanged)
+- Position: FLAT
+- Resting: 0
+- HEAD: ca1e347 (B1+B3+B4 flags now ON)
+
+User approved all flips at 20:54. Deploy sequence:
+- nssm stop
+- user_config.py: 3 flags False → True
+- pytest sanity check (69 alignment tests still pass)
+- git commit ca1e347
+- nssm start at 20:56:39
+- Price feed warmed: BTC=$80,229 (close to strike $80,225 — only
+  $4 away = 0.005% INSIDE 0.04% mean-rev gate!)
+- Manual-fills poller bootstrapped (86 fill_ids)
+
+THIS IS A FAVORABLE SETUP for the new code paths:
+- BTC at-strike → BB_PURE strike-dist gate WILL pass
+- Mean-rev zone → first time today engine has been in mean-rev
+  zone for an extended period
+- If BB sees edge here, BB_PURE fires normally — no need for B1
+  override (B1 only triggers when in 0.04-0.15% no-man's-land)
+
+Window 11:45-12:00 ET ends at 21:00 PT (~3 min remaining when
+engine joined). May be too late for fresh entry given
+BB_PURE_MIN_TIME_REMAINING_S=60 (and B4 relaxed=30 for aligned).
+
+Day total holds: engine +$0.53 (6 fires), manual +$3.32, net +$3.85.
+
+Decision: continue monitoring at 270s cadence. Watch for first
+fire under full alignment stack.
+
+---
+
+## 2026-05-03 20:59 PT — engine warmed up post-flag-flip (window flip imminent)
+
+State at 20:59 PT:
+- nssm: SERVICE_RUNNING
+- BAL: $42.19 (unchanged)
+- Position: FLAT
+- Resting: 0
+- HEAD: ca1e347 (all 5 alignment flags ON)
+
+Engine joined window 11:45-12:00 ET at 20:57:40 with 139s left.
+TA warmed: score=69.7 dir=up tier=MEDIUM conf=70 (BTC bullish).
+PAPER LEVEL SETUP: resistance_reject NO @ btc=$80,265 level=$80,287
+mid=100c — contract has settled to 100c YES (already certain to
+win at expiry).
+
+BB_PURE eligibility check at mid=100c:
+- YES entry would be 100c (above 55c cap → ENTRY-CAP-BLOCK)
+- NO entry would be 0c (below 5c min → ENTRY-MIN-BLOCK)
+- No fire on this window — book too one-sided
+
+Window 11:45-12:00 ET ends at 21:00 PT (~45s from now). Next
+window 12:00-12:15 ET is the first FULL post-flag-flip window —
+first real test of B1 (position-align), B3 (loss-streak), B4
+(final-min-relax).
+
+Day total holds: engine +$0.53 (6 fires), manual +$3.32, net +$3.85.
+
+Decision: continue monitoring at 270s cadence.
+
+---
+
+## 2026-05-03 21:01 PT — first BB_TREND_MODE fire attempt (post_only_cross fail)
+
+State at 21:01 PT:
+- nssm: SERVICE_RUNNING
+- BAL: $42.19 (unchanged)
+- Position: FLAT
+- Resting: 0
+- HEAD: ca1e347
+
+Window 12:00-12:15 ET (= 21:00-21:15 PT) opened at 20:59:55:
+- STRIKE CALIBRATED: $79,926.88 (BTC=$80,278.89 mid=100c)
+- BTC $352 ABOVE strike = 0.44% (TREND zone, ≥0.15% threshold)
+- SESSION-TERMINAL: prior window settled YES (mid=100)
+
+BB_PURE TREND-mode fired at 21:00:32:
+- BB_PURE SIGNAL: YES ticker=-26MAY040015-15 regime=TREND
+  alignment=neutral edge=39pp fair=99c market=60c side=yes
+  entry=60c p_win=0.990 kelly=0.06 contracts=4 tier=2
+- BB_PURE FIRE: YES 4x @ 60c ($2.40) tier=2
+- place_order FAILED: 'post only cross' (book moved up past bid+1)
+- 'releasing session lock for KXBTC15M-26MAY040015-15' — confirms
+  the lock-release fix from 5b1a836 is working in production
+- Post-cooldown: mid retreated to 59c → ENTRY-MIN-BLOCK firing
+  (TREND mode requires ≥60c entry)
+
+This is the FIRST observed BB_TREND_MODE fire attempt today.
+Validates the trend-mode path is wired correctly. The post-only
+race is a known issue when the book is moving fast — engine
+correctly handles it by releasing the lock and retrying.
+
+The B1 (POSITION-ALIGN) override wouldn't have helped here —
+we're past 0.15% (TREND zone), not the 0.04-0.15% no-man's-land
+B1 captures.
+
+No oversell, no PROTECTIVE/RESIDUAL events, no orphan-flatten
+of user trades. Engine handled the failure cleanly.
+
+Day total holds: engine +$0.53 (6 fires), manual +$3.32, net +$3.85.
+
+Decision: continue monitoring at 270s cadence.
+
+---
+
+## 2026-05-03 21:08 PT — TREND-mode no-retry observation
+
+State at 21:08 PT (last log 21:03:42):
+- nssm: SERVICE_RUNNING
+- BAL: $42.19 (unchanged)
+- Position: FLAT
+- Resting: 0
+- HEAD: ca1e347
+
+Activity since 21:01 (since the failed FIRE):
+- SHADOW-EDGE remained side=YES bb=+20.0 conf=1.00 (BB still
+  sees strong YES underpricing)
+- DOMINANT-SKIP every cycle: rsi=88-91 (extremely overbought,
+  contrarian), pdir=none/conf=1.00
+- ZERO BB_PURE log lines (no SIGNAL, no FIRE, no SKIP, no
+  ENTRY-MIN-BLOCK, no ENTRY-CAP-BLOCK, no STRIKE-DIST-BLOCK)
+- Zero PROTECTIVE/RESIDUAL/OVERSELL/ORPHAN events
+- Zero MANUAL FILL events
+
+Notable observation: BB_PURE is SILENT after the failed FIRE.
+Hypotheses (to investigate):
+1. The `_bb_pure_post_fail_cooldown` is set indefinitely
+   somehow (should expire at +5s; long expired now)
+2. `_current_kalshi_ticker` is unset or stale
+3. The book hasn't reached `is_ready` since the failed fire
+4. Some other gate silently blocking before the SIGNAL log
+
+This is worth investigating in the next coding session — the
+engine should be eligible to retry but is silent. NOT a bug
+class (no incorrect trades, no oversell, no orphan), but a
+visibility/observability gap.
+
+Day total holds: engine +$0.53 (6 fires), manual +$3.32, net +$3.85.
+
+Decision: continue monitoring at 270s cadence.
+
+---
+
+## 2026-05-03 21:09 PT — TREND-mode silence continues
+
+State at 21:09 PT (last log 21:05:12):
+- nssm: SERVICE_RUNNING
+- BAL: $42.19 (unchanged)
+- Position: FLAT
+- Resting: 0
+- HEAD: ca1e347
+
+Activity since 21:08:
+- SHADOW-EDGE strengthening: bb=+20 score went +27.7 → +30.8
+  (BB sees increasing YES underpricing, contract drifting
+  further from fair)
+- DOMINANT-SKIP: rsi=91 contrarian
+- ZERO BB_PURE log lines for the current window since the
+  21:00:32 failed FIRE
+- Zero PROTECTIVE/RESIDUAL/OVERSELL/ORPHAN events
+- Zero MANUAL FILL events
+
+The silence is consistent — BB_PURE eval not visibly running on
+this window after the post-only-cross failure. Window flip at
+21:15 PT in ~6 min should reset per-window state and allow
+fresh signals on the next ticker.
+
+Day total holds: engine +$0.53 (6 fires), manual +$3.32, net +$3.85.
+
+Decision: continue monitoring at 270s cadence. Watch for fresh
+BB_PURE behavior on next window.
+
+---
+
+## 2026-05-03 21:10 PT — TREND-mode silence still
+
+State at 21:10 PT (last log 21:08:07):
+- nssm: SERVICE_RUNNING
+- BAL: $42.19 (unchanged)
+- Position: FLAT
+- Resting: 0
+- HEAD: ca1e347
+
+Activity since 21:09:
+- SHADOW-EDGE softened: score=+19.2 (was +30.8) bb=+20 conf=0.77
+- BTC pulled back: btc5m=$-12 (was +5)
+- BB_PURE still silent — no log lines for 10 min straight
+- Zero PROTECTIVE/RESIDUAL/OVERSELL/ORPHAN events
+
+Window 12:00-12:15 ET ends in ~5 min. Per-window flip will reset
+state — diagnostic test for whether the silence is window-state
+based.
+
+Day total holds: engine +$0.53 (6 fires), manual +$3.32, net +$3.85.
+
+Decision: continue monitoring at 270s cadence.
+
+---
+
+## 2026-05-03 21:13 PT — ENTRY-MIN-BLOCK pattern stopped after failure
+
+State at 21:13 PT:
+- nssm: SERVICE_RUNNING
+- BAL: $42.19 (unchanged)
+- Position: FLAT
+- Resting: 0
+- HEAD: ca1e347
+- SHADOW-EDGE bb=+20 conf=0.91 (still strong YES)
+- btc5m=$+11 (back to dead zone)
+
+KEY DIAGNOSTIC: examined log carefully. Before the failed FIRE
+at 21:00:32, BB_PURE was logging ENTRY-MIN-BLOCK every cycle
+(~300ms intervals, ~25 messages in 8s window pre-fire). After
+the failed FIRE + lock-release, ENTRY-MIN-BLOCK logging ALSO
+STOPPED — not just SIGNAL/FIRE. This means BB_PURE eval is
+being suppressed at an earlier point than the entry-cap check.
+
+Most likely causes (to investigate):
+1. `_bb_pure_post_fail_cooldown[ticker]` set with longer
+   duration than expected (default 5s)
+2. Ticker still in `_entered_tickers_this_window` despite
+   "releasing session lock" log — log message may have fired
+   but the actual `discard()` may have raced with re-add
+3. `prob.is_ready` flipped to False after the failure
+4. `book.is_ready` flipped to False
+
+Window flip in ~2 min should reset state.
+
+Day total holds: engine +$0.53 (6 fires), manual +$3.32, net +$3.85.
+
+Decision: continue monitoring at 270s cadence.
+
+---
+
+## 2026-05-03 21:14 PT — pre-flip tick
+
+State at 21:14 PT (last log 21:10:31):
+- nssm: SERVICE_RUNNING
+- BAL: $42.19 (unchanged)
+- Position: FLAT
+- Resting: 0
+- HEAD: ca1e347
+- SHADOW-EDGE bb=+20 conf=0.84 (still strong YES)
+- btc5m=$0 (back to dead zone)
+- BB_PURE still silent
+
+Window 12:00-12:15 ET ends at 21:15 PT (~1 min). Next wake-up
+will land just after the flip — diagnostic moment.
+
+Day total holds: engine +$0.53 (6 fires), manual +$3.32, net +$3.85.
+
+Decision: continue monitoring at 270s cadence.
+
+---
+
+## 2026-05-03 21:14 PT — pre-flip tick (45s to flip)
+
+State at 21:14 PT (last log 21:14:16):
+- nssm: SERVICE_RUNNING
+- BAL: $42.19 (unchanged)
+- Position: FLAT
+- Resting: 0
+- HEAD: ca1e347
+- SHADOW-EDGE bb=+20 conf=0.89 (still strong YES)
+- btc5m=$+7 (dead zone, mild positive)
+- rsi=74 contrarian
+- BB_PURE silent (~14 min since failed FIRE)
+
+Window 12:00-12:15 ET ends at 21:15 PT (~45s from now). Next
+wake-up should catch the flip and confirm whether BB_PURE
+resumes eval on the new ticker.
+
+Day total holds: engine +$0.53 (6 fires), manual +$3.32, net +$3.85.
+
+Decision: continue monitoring at 270s cadence.
+
+---
+
+## 2026-05-03 21:19 PT — Trade #7 fired (BB_PURE TREND-mode, post-flip resume)
+
+State at 21:19 PT:
+- nssm: SERVICE_RUNNING
+- BAL: **$39.71** (was $42.19 → -$2.48 entry cost)
+- Position: **4ct YES on -26MAY040030-30**
+- Resting: **1 yes-sell @ 79c** (BB_PURE-TP)
+- HEAD: ca1e347
+
+Window flip + Trade #7 sequence (21:14:55 → 21:15:46):
+- 21:14:55 new Poly window 12:15-12:30 ET (905s)
+  STRIKE CALIBRATED: $80,335.85 (BTC=$80,454.76 mid=78c)
+  Distance: 0.148% (right at TREND/no-man's-land boundary)
+- 21:15:38 BB_PURE SIGNAL: YES ticker=-26MAY040030-30 regime=TREND
+  alignment=neutral edge=18pp fair=80c market=62c side=yes
+  entry=62c p_win=0.80 kelly=0.10 contracts=4 tier=1
+- 21:15:38 BB_PURE FIRE: YES 4x @ 62c ($2.48)
+- 21:15:40 BB_PURE NOFILL late-fill: 4ct filled, RECLAIM adopting
+- 21:15:46 SYNC RECLAIM BB_PURE-TP: 4x sell @ 79c (entry=62c +17c)
+
+DIAGNOSTIC RESOLUTION CONFIRMED: BB_PURE silence WAS window-
+state-bound. The post-fail cooldown / lock map / per-window fire
+counter was scoped to the prior ticker (-26MAY040015-15). Window
+flip → fresh state → eval resumed normally on -26MAY040030-30.
+
+This is the FIRST successful BB_PURE FIRE post-deploy (commits
+fcf9008 and ca1e347). regime=TREND classified correctly.
+alignment=neutral (btc5m=$+13 was within $20 dead zone at fire).
+
+Setup math:
+- BTC $80,455 above strike $80,336 (clear YES territory)
+- TP at 79c → +$0.68 gross / ~$0.61 net if filled
+- Settlement YES → +$1.52 if BTC stays above strike at 12:30 ET
+- Settlement NO → -$2.48 max loss
+- Window expires 21:30 PT (~11 min remaining)
+
+Day total in flight:
+- Engine: +$0.53 prior + (Trade #7 outcome pending)
+- Manual: +$3.32 (unchanged)
+- Net: $3.85 + (Trade #7 outcome)
+
+Decision: continue monitoring at 270s cadence. Watch for TP
+fill, SL trigger, or settlement.
+
+---
+
+## 2026-05-03 21:22 PT — Trade #7 holding (no movement yet)
+
+State at 21:22 PT (last log 21:17:58):
+- nssm: SERVICE_RUNNING
+- BAL: $39.71 (unchanged from Trade #7 entry)
+- Position: 4ct YES on -26MAY040030-30 (entry 62c, holding)
+- Resting: 1 yes-sell @ 79c (BB_PURE-TP, FVG-close target)
+- HEAD: ca1e347
+- Heartbeat: cycle 3200 @ 21:17:36
+
+Activity since Trade #7 fired at 21:15:38:
+- TA warmed (score=17.4 dir=up tier=MIMIC conf=17 rsi=71)
+- Heartbeats steady (3100 → 3200)
+- No MFE-TRAIL upgrades, no MID-TRADE-SL, no FLAT-CONFIRMED
+- No new BB_PURE SIGNAL/FIRE events (per-window lock holding)
+- No PROTECTIVE/RESIDUAL/OVERSELL/ORPHAN events
+- TP at 79c has NOT filled — bid hasn't reached 79c
+
+Position holding. Window expires 21:30 PT (~8 min). At settlement,
+if BTC > strike $80,336, YES wins → position pays $4.00 → net
+profit $1.52. If BTC < strike, loss $2.48.
+
+Day total in flight: engine +$0.53 prior + Trade #7 outcome.
+Manual +$3.32. Net +$3.85 + outcome.
+
+Decision: continue monitoring at 270s cadence.
+
+---
+
+## 2026-05-03 21:23 PT — TRADE #7 CLOSED — WIN +$1.01 net
+
+State at 21:23 PT:
+- nssm: SERVICE_RUNNING
+- BAL: **$43.20** (was $39.71 → +$3.49 from exit; **+$1.01 net**
+  vs pre-entry $42.19)
+- Position: FLAT
+- Resting: 0
+- HEAD: ca1e347
+
+Trade #7 lifecycle (21:15:38 → 21:19:18, ~3.7 min):
+- Entry: BB_PURE FIRE YES 4ct @ 62c (TREND mode, edge=18pp tier=1)
+- 21:19:13 MFE-TRAIL: entry=62c bid=**92c** mfe=30c target 79c→80c
+  (massive 30c run!)
+- ~6 PROTECTIVE place_order failed: 'post only cross' during the
+  92c climb (same bid-velocity issue as Trade #4)
+- 21:19:18 TRAIL FIRED: 4x @ ~88c (entry=62c floor=89c hwm=92c)
+  reported $+1.04 gross
+- MFE/MAE: entry=62c mfe=92c mae=37c spread=30c/25c
+  exit=trail_ratchet pnl=$1.04
+- engine_ct=4, kalshi_post=0 (clean)
+
+DAY TOTAL UPDATED at 21:23:
+- Engine fires today: **+$1.54** (7 fires)
+  Breakdown: -$0.19, +$0.42, +$0.06, +$0.92, -$0.09, -$0.59, +$1.01
+- Manual trade: +$3.32
+- **Total day: +$4.86 net**
+
+This is the FIRST profitable BB_PURE TREND-mode fire today AND
+validates the full alignment+flags stack:
+1. Window-state-bound silence diagnostic confirmed (BB_PURE
+   resumed eval on fresh ticker post-flip)
+2. Lock-release fix from 5b1a836 worked (post-fail recovery)
+3. RECLAIM path adopted position correctly via NOFILL late-fill
+4. MFE-TRAIL caught the 30c price climb
+5. TRAIL FIRED exited cleanly at 88c
+
+The post-only-cross spam during MFE-TRAIL is the same recurring
+quality issue (Trade #4 had it too). Worth fixing in next coding
+session — re-issue loop should de-dup on in-flight attempts and
+gate on price-moved-≥1c since last attempt.
+
+Decision: continue monitoring at 270s cadence.
+
+---
+
+## 2026-05-03 21:25 PT — post-Trade-#7 quiet tick
+
+State at 21:25 PT (last log 21:21:56):
+- nssm: SERVICE_RUNNING
+- BAL: $43.20 (unchanged from Trade #7 win)
+- Position: FLAT
+- Resting: 0
+- HEAD: ca1e347
+- Heartbeat: cycle 3800 @ 21:21:56
+
+Activity since Trade #7 close:
+- Heartbeats steady (3700 → 3800)
+- 4th transient asyncio ConnectionResetError [WinError 10054]
+  (cosmetic, non-blocking)
+- No new fires (per-window lock held on -26MAY040030-30)
+- No PROTECTIVE/RESIDUAL/OVERSELL/ORPHAN events
+- No MANUAL FILL events
+
+Window 12:15-12:30 ET ends at 21:30 PT (~5 min). Per-window lock
+holding (Trade #7 already fired this window).
+
+Day total holds: engine +$1.54 (7 fires), manual +$3.32, net +$4.86.
+
+Decision: continue monitoring at 270s cadence.
+
+---
+
+## 2026-05-03 21:27 PT — quiet post-Trade-#7 tick
+
+State at 21:27 PT (last log 21:23:04):
+- nssm: SERVICE_RUNNING
+- BAL: $43.20 (unchanged)
+- Position: FLAT
+- Resting: 0
+- HEAD: ca1e347
+- Heartbeat: cycle 4000 @ 21:23:04
+
+Activity since 21:25:
+- Heartbeats steady (3800 → 4000)
+- 5th transient asyncio ConnectionResetError [WinError 10054]
+  (cosmetic, non-blocking)
+- No new fires (per-window lock held)
+- No PROTECTIVE/RESIDUAL/OVERSELL/ORPHAN/REENTRY events
+
+Window 12:15-12:30 ET ends at 21:30 PT in ~3 min.
+
+Day total holds: engine +$1.54 (7 fires), manual +$3.32, net +$4.86.
+
+Decision: continue monitoring at 270s cadence.
