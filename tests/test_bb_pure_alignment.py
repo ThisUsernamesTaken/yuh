@@ -22,6 +22,7 @@ from bb_pure import (
     classify_alignment,
     aligned_side_from_btc,
     build_alignment_fallback_signal,
+    classify_position_alignment,
 )
 
 
@@ -303,3 +304,90 @@ def test_default_bb_signal_alignment_is_neutral():
         reason="test",
     )
     assert sig.alignment == "neutral"
+
+
+# ─── classify_position_alignment (B1) ──────────────────────────────────
+
+
+def test_position_align_yes_above_strike_is_aligned():
+    """BTC above strike → YES likely settles ITM → buying YES is aligned."""
+    assert classify_position_alignment(
+        side="yes", btc_price=80000, strike=79900) == "aligned"
+
+
+def test_position_align_no_below_strike_is_aligned():
+    """BTC below strike → NO likely settles ITM → buying NO is aligned."""
+    assert classify_position_alignment(
+        side="no", btc_price=79900, strike=80000) == "aligned"
+
+
+def test_position_align_yes_below_strike_is_contrarian():
+    assert classify_position_alignment(
+        side="yes", btc_price=79900, strike=80000) == "contrarian"
+
+
+def test_position_align_no_above_strike_is_contrarian():
+    assert classify_position_alignment(
+        side="no", btc_price=80000, strike=79900) == "contrarian"
+
+
+def test_position_align_within_deadband_is_neutral():
+    # default deadband=$5; |delta|=$3 → neutral
+    assert classify_position_alignment(
+        side="yes", btc_price=79903, strike=79900) == "neutral"
+    assert classify_position_alignment(
+        side="no", btc_price=79897, strike=79900) == "neutral"
+
+
+def test_position_align_at_deadband_boundary_is_neutral():
+    assert classify_position_alignment(
+        side="yes", btc_price=79905, strike=79900) == "neutral"
+
+
+def test_position_align_just_past_deadband_classifies():
+    assert classify_position_alignment(
+        side="yes", btc_price=79906, strike=79900) == "aligned"
+    assert classify_position_alignment(
+        side="no", btc_price=79906, strike=79900) == "contrarian"
+
+
+def test_position_align_zero_btc_returns_neutral():
+    assert classify_position_alignment(
+        side="yes", btc_price=0, strike=79900) == "neutral"
+
+
+def test_position_align_zero_strike_returns_neutral():
+    assert classify_position_alignment(
+        side="yes", btc_price=80000, strike=0) == "neutral"
+
+
+def test_position_align_handles_uppercase_side():
+    assert classify_position_alignment(
+        side="YES", btc_price=80000, strike=79900) == "aligned"
+    assert classify_position_alignment(
+        side="No", btc_price=79900, strike=80000) == "aligned"
+
+
+def test_position_align_custom_deadband():
+    # deadband=$50, |delta|=$30 → neutral
+    assert classify_position_alignment(
+        side="yes", btc_price=79930, strike=79900, deadband_usd=50.0
+    ) == "neutral"
+    # deadband=$1, |delta|=$30 → classified
+    assert classify_position_alignment(
+        side="yes", btc_price=79930, strike=79900, deadband_usd=1.0
+    ) == "aligned"
+
+
+def test_position_align_real_world_today_setups():
+    """Reproduce today's actual blocked-by-strike-distance windows.
+    All would have been allowed via POSITION_ALIGNED override:"""
+    # Window 9:00-9:15 ET: BTC=$78,569, strike=$78,492 (above) — YES aligned
+    assert classify_position_alignment(
+        side="yes", btc_price=78569, strike=78492) == "aligned"
+    # Window 10:45-11:00 ET: BTC=$80,151, strike=$79,951 (above) — YES aligned
+    assert classify_position_alignment(
+        side="yes", btc_price=80151, strike=79951) == "aligned"
+    # Counter case: today's Trade #6 was NO when BTC was above strike → contrarian
+    assert classify_position_alignment(
+        side="no", btc_price=80151, strike=79951) == "contrarian"

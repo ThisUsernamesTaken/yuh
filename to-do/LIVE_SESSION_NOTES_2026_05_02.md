@@ -2081,3 +2081,751 @@ Activity since flip:
 Engine healthy. P&L unchanged: +$1.21 net day.
 
 Decision: continue monitoring at 270s cadence.
+
+---
+
+## 2026-05-03 18:12 PT — SHIPPED Option C: alignment gate + fallback tier
+
+**Commit**: 2997e01 "Option C: alignment classification gate +
+alignment-fallback tier"
+
+User confirmed design "C" — both alignment classification gate (B)
+AND alignment-fallback tier (A). Stopped engine, implemented,
+tested, committed, restarted.
+
+Files:
+- bb_pure.py: BBSignal.alignment field + 3 new pure helpers
+  (classify_alignment, aligned_side_from_btc,
+  build_alignment_fallback_signal)
+- polymarket_copy_engine.py: alignment gate inserted into
+  _evaluate_bb_pure_signal; new method
+  _evaluate_alignment_fallback_signal; tier wired into cascade
+  after BB_MOMENTUM
+- user_config.py: 7 new flags, all default OFF
+- tests/test_bb_pure_alignment.py: 29 deterministic unit tests
+
+Test results: 534 passed, 2 pre-existing LATE_DOMINANT failures
+(unrelated, flagged in CLAUDE.md). Net +29 new tests.
+
+**Both flags default OFF** — shipping the code, not the behavior.
+Engine restarted at 18:12:14 with identical behavior to pre-deploy.
+Flag flip checklist when ready:
+  1. Paper validate — set BB_PURE_ALIGNMENT_GATE_ENABLED=True for
+     one session, observe ALIGNMENT-CONTRARIAN-BLOCK log volume
+  2. If contrarian fires were rare and the blocks look right,
+     keep gate ON
+  3. Then enable BB_PURE_ALIGNMENT_FALLBACK_TIER_ENABLED=True for
+     one session, observe ALIGNMENT-FALLBACK fires
+  4. If fallback fires win-rate looks reasonable on small samples,
+     keep ON
+  5. Otherwise revert flags to False (no code change needed)
+
+Engine state post-deploy:
+- nssm: SERVICE_RUNNING
+- BAL: $39.55 (unchanged)
+- Position: FLAT
+- Resting: 0
+- HEAD: 2997e01
+
+Engine-only P&L today: +$1.21 net (unchanged by deploy).
+
+---
+
+## 2026-05-03 18:14 PT — monitoring tick (post-deploy, engine warmed up)
+
+State at 18:14 PT:
+- nssm: SERVICE_RUNNING
+- BAL: $39.55 (unchanged — confirmed via Kalshi)
+- Position: FLAT (confirmed via Kalshi)
+- Resting: 0
+- HEAD: 2997e01 (Option C alignment ship)
+
+Engine restart sequence (18:12:14 → 18:14:00):
+- 18:12:19: price feed warmed (1m/5m/15m/1h candles loaded)
+- 18:12:39: manual-fills poller bootstrapped (234 known order_ids,
+  117 seen fill_ids)
+- 18:13:19: flow started (0 wallets — scorer disabled, TA_FORCED
+  cascade unaffected)
+- 18:13:20: new Poly window detected (9:00-9:15 ET, 100s left
+  — engine joined this window late after restart)
+- 18:13:20: REGIME=MEAN_REVERTING vol=15% trend_score=0.00
+- 18:13:25: WS subscribed to KXBTC15M-26MAY032115-15
+- 18:13:25: SR-SEED loaded 40 levels from prior session
+- 18:13:26: TA warmed (score=-92.3 dir=down tier=STRONG conf=92
+  rsi=35 — TA bearish)
+- 18:14:00: heartbeat cycle 100 — engine fully ticking
+
+Window 9:00-9:15 ET (= 18:00-18:15 PT) only had 100s left when
+engine joined. Window flip at 18:15 PT in ~1 min. Per-window
+ticker lock RESET on restart (not a concern — first window after
+restart is fresh by definition).
+
+No new BB_PURE fires/signals/errors during warm-up. No alignment
+log lines (flags OFF as expected).
+
+Engine-only P&L today: +$1.21 net (unchanged).
+
+Decision: continue monitoring at 270s cadence.
+
+NOTE: handoff prompt was stale ("HEAD 24e6e4e", "alignment-entries
+shipping is on hold"). Actual state: HEAD 2997e01, alignment
+shipped both flags OFF. Engine running with identical-to-pre-deploy
+behavior.
+
+---
+
+## 2026-05-03 18:18 PT — Trade #5 + alignment-stamp first appearance
+
+State at 18:18 PT:
+- nssm: SERVICE_RUNNING
+- BAL: $39.46 (was $39.55 → **-$0.09** from Trade #5)
+- Position: FLAT (12 RESIDUAL-CLEAN polls confirm)
+- Resting: 0
+- HEAD: 2997e01
+- Heartbeat: cycle 700 @ 18:18:07
+
+Trade #5 lifecycle (18:15:17 → 18:15:50):
+- 18:15:01: new Poly window 9:15-9:30 ET (904s)
+- 18:15:17: **BB_PURE FIRE: NO -26MAY032130-30 5x @ 38c ($1.90) |
+  edge=11.0pp fair=50c market=61c kelly=0.0451 tier=1**
+- 18:15:20: SYNC RECLAIM (Kalshi already had 5 NO before
+  _open_position was set — recent_place=True so engine adopted it)
+- 18:15:20: SYNC RECLAIM placed BB_PURE-TP at 49c (entry 38c +11c)
+- 18:15:20: **BB_PURE SIGNAL log line includes new field:
+  `alignment=neutral`** ← FIRST APPEARANCE OF NEW STAMP ✓
+- 18:15:25: NOFILL late-fill 5ct after timeout
+- 18:15:50: PROTECTIVE FLAT-CONFIRMED (zero_streak=21/3 over 30s
+  span — "Likely caused by an untracked fill closing the position")
+- 18:15:51: SYNC RESIDUAL FLATTEN attempted from stale code path
+  (no-op since polling immediately confirmed flat)
+- 18:16:19: 12 RESIDUAL-CLEAN polls all zero — clean
+
+Result: -$0.09 BAL change → small loss. The TP at 49c either
+didn't fill or got cancelled mid-flight. The "untracked fill" exit
+suggests the position closed via WS event the engine didn't ingest
+(possibly external/manual action, possibly a fast WS-missed fill).
+
+The alignment=neutral stamp confirms:
+- BB_PURE classifier is running on every fire ✓
+- BTC 5m move was within $20 dead zone at trade time (= neutral) ✓
+- Default behavior unchanged (no fire was blocked, no fallback fired) ✓
+
+Engine-only P&L today now: +$1.12 net (5 fires).
+Day breakdown: -$0.19, +$0.42, +$0.06, +$0.92, -$0.09.
+
+No oversell, no REENTRY-BLOCK, no STUCK-RESIDUAL. The SYNC
+RESIDUAL FLATTEN at 18:15:51 was a benign double-check that
+returned no-op when the post-close poll confirmed flat.
+
+Decision: continue monitoring at 270s cadence.
+
+---
+
+## 2026-05-03 18:24 PT — ENGINE STOPPED (false-alarm by Claude)
+
+State at 18:24 PT:
+- nssm: **SERVICE_STOPPED** (by Claude at 18:20:34, in error)
+- BAL: $0.46
+- Position: USER's 53ct YES @ 72c on -26MAY032130-30
+- Resting: 4 yes-sell orders @ 83c (engine MANUAL TP helpers, alive)
+- HEAD: 2997e01
+
+Sequence of events (18:18:38 → 18:24:17):
+- 18:18:38 → 18:18:43: USER manually buys 53ct YES @ 72c on the
+  -26MAY032130-30 ticker (4 separate fills: 1 + 25 + 23 + 3 = 52ct,
+  plus an existing 1ct from earlier = 53ct total; total cost $38).
+- Engine correctly identifies as manual trading via the
+  `engine_max=22 < observed=53` heuristic at 18:18:52.
+- Engine helpfully places 4 MANUAL TP orders @ 83c covering each
+  fill (entry+11c, +15.3% ROI if filled).
+- 18:18:43 ESCROW LEAK warning: balance -$39 over 60s — OBSERVATION
+  log, engine knew it was manual.
+- 18:19:18 LEDGER WITHDRAWAL: -478 cents — OBSERVATION log.
+- 18:20:34 SHUTDOWN SIGNAL 2 received — Claude's `nssm stop`
+  hits, engine cleanly shuts down. Resting TPs PRESERVED on Kalshi.
+
+What went wrong (my error):
+- 18:24 monitoring tick saw BAL=$0.46 (was $39.46) + position=53ct
+  on previously-traded ticker → triggered "wayward pattern" stop
+  rule.
+- The engine logs ALREADY contained MANUAL FILL RECORDED + SYNC
+  MANUAL-DETECTED lines explaining the situation. I should have
+  read those before reacting to the apparent state change.
+- Stop is now in place; reversal is harmless (TPs still live).
+
+Recovery options pending user direction:
+1. Leave stopped → TPs ride to 83c or settlement at 18:30 PT.
+2. Restart engine → BB_PURE eligible to fire on next window
+   (18:30 PT flip), TPs unaffected.
+3. Cancel TPs → hold to settlement (more upside on YES win,
+   full downside risk).
+
+User has not yet given direction. Engine STAYS STOPPED.
+
+Settlement at 18:30 PT in ~6 min:
+- Strike: $78,492.99
+- BTC at last manual fill (18:18): $78,480 (below strike → NO)
+- TPs at 83c: would fire only if YES bid rallies enough
+- Day P&L if user position settles NO: -$38 manual + $1.12
+  engine = ~-$37 net day
+- Day P&L if user position settles YES: +$14.84 manual + $1.12
+  engine = ~+$15.96 net day
+- Day P&L if TPs fill before settlement: +$5.83 manual +
+  $1.12 engine = ~+$6.95 net day
+
+Lesson logged: when a sudden state change appears at a monitoring
+tick, BEFORE running the decision-rule "STOP" branch, read the
+log for `MANUAL FILL RECORDED` / `SYNC MANUAL-DETECTED` /
+`MANUAL TP PLACED` lines in the last 60s. Those explicitly attribute
+the change to manual user trading and should suppress the stop.
+
+---
+
+## 2026-05-03 19:01 PT — engine restarted by user
+
+State at 19:01 PT:
+- nssm: SERVICE_RUNNING (restarted 19:01:00)
+- BAL: $42.78 (was $44.62 at 18:30 → -$1.84 over engine-off interval)
+- Position: FLAT
+- Resting: 0
+- HEAD: 2997e01
+- BTC: $79,838 (up ~$1,300 from 18:18)
+
+User's settlement reconstruction (clarified):
+- Pre-buy: $39.46
+- Bought 53ct YES @ 72c (cost ~$39.00)
+- Held until 18:30 PT settlement
+- TPs at 83c filled before/at settlement → BAL recovered to
+  $44.62
+- Net manual gain: ~$5.16
+
+Engine offline period (18:20:34 → 19:01:00 = ~41 min):
+- Missed 2-3 windows entirely
+- Manual-fills poller bootstrapped 122 fill_ids (was 117) →
+  +5 fills detected during offline period (4 TP fills @ 83c
+  + 1 other event)
+- BAL drift -$1.84 between 18:30 and 19:01 — unaccounted; either
+  fee reconciliation or unobserved user activity. Engine couldn't
+  have moved it (offline).
+
+Day total reconciled at 19:01:
+- Engine-only: +$1.12 (5 fires)
+- Manual: ~+$3.32 (settlement +$5.16, drift -$1.84)
+- **Net day: +$4.44** (best day this week)
+
+Engine warming up — manual-fills poller bootstrapped, price feed
+and WS connecting. Will resume monitoring at 270s cadence.
+
+---
+
+## 2026-05-03 19:07 PT — first post-restart monitoring tick (clean)
+
+State at 19:07 PT:
+- nssm: SERVICE_RUNNING
+- BAL: $42.78 (unchanged from restart)
+- Position: FLAT
+- Resting: 0
+- HEAD: 2997e01
+- Heartbeat: cycle 900 @ 19:07:13
+
+Activity since restart (19:01 → 19:07):
+- 19:02:03 new Poly window 10:00-10:15 ET (777s left when joined)
+- 19:04:30 VWAP FLIP: NO → YES (BTC=$79,744 crossed above VWAP=$79,635)
+- Heartbeats cycling cleanly (~34s per 100 cycles)
+- Zero BB_PURE fires/signals (likely strike-distance gate
+  blocking, log throttle suppressing)
+- Zero PROTECTIVE/RESIDUAL/OVERSELL/ORPHAN/REENTRY events
+- Zero MANUAL FILL events (no further user trading observed)
+
+Window 10:00-10:15 ET has ~6 min left. BTC at ~$79,744 — engine
+is healthy, watching for strike-proximity setups.
+
+Day P&L unchanged: engine +$1.12, manual +$3.32, net +$4.44.
+
+Decision: continue monitoring at 270s cadence.
+
+---
+
+## 2026-05-03 19:12 PT — monitoring tick (window 10:00-10:15 ET, ~3 min left)
+
+State at 19:12 PT:
+- nssm: SERVICE_RUNNING
+- BAL: $42.78 (unchanged)
+- Position: FLAT
+- Resting: 0
+- HEAD: 2997e01
+- Heartbeat: cycle 1700 @ 19:11:51
+
+Activity since 19:07:
+- Heartbeats cycling cleanly (cycles 900 → 1700, ~5 min)
+- Zero BB_PURE fires/signals/PROTECTIVE/RESIDUAL/OVERSELL events
+- 19:11:50 transient asyncio ConnectionResetError [WinError 10054]
+  — Windows-side socket cleanup blip on a remote connection drop.
+  Non-blocking: next heartbeat fired 1s later. Common transient
+  issue, not an engine fault.
+
+Window 10:00-10:15 ET has ~3 min left. Window flip at 19:15 PT
+inside next interval.
+
+Day P&L unchanged: engine +$1.12, manual +$3.32, net +$4.44.
+
+Decision: continue monitoring at 270s cadence (19:12 wakeup → 19:17).
+
+---
+
+## 2026-05-03 19:17 PT — monitoring tick (window 10:15-10:30 ET, ~13 min left)
+
+State at 19:17 PT:
+- nssm: SERVICE_RUNNING
+- BAL: $42.78 (unchanged)
+- Position: FLAT
+- Resting: 0
+- HEAD: 2997e01
+- Heartbeat: cycle 2500 @ 19:17:11
+
+Window flip events at 19:14:55:
+- new Poly window 10:15-10:30 ET (905s)
+- STRIKE CALIBRATED: $79,867.04 (BTC=$79,954.99 mid=66c)
+- SESSION-TERMINAL: KXBTC15M-26MAY032215-15 mid=66 regime=chop
+  levels=40 (prior window's terminal data persisted)
+
+Activity since flip:
+- BTC dropped ~$170 (window-open $79,955 → 19:17 ~$79,786)
+- mid dropped from 66c to ~35c — market reflecting BTC drop
+- DOMINANT-SKIP firing on btc5m=$-18 (just inside dead zone)
+- SHADOW-EDGE: side=YES score=+15.3 bb=+16.4 (BB sees strong
+  YES edge but DOMINANT not acting)
+- BTC-vs-strike distance ~$81 = 0.10% (outside 0.04% gate),
+  STRIKE-DIST-BLOCK likely active (log throttled)
+- Zero BB_PURE fires/signals/PROTECTIVE/RESIDUAL/OVERSELL events
+- Zero MANUAL FILL events
+
+Day P&L unchanged: engine +$1.12, manual +$3.32, net +$4.44.
+
+Decision: continue monitoring at 270s cadence.
+
+---
+
+## 2026-05-03 19:22 PT — monitoring tick (window 10:15-10:30 ET, ~8 min left)
+
+State at 19:22 PT:
+- nssm: SERVICE_RUNNING
+- BAL: $42.78 (unchanged)
+- Position: FLAT
+- Resting: 0
+- HEAD: 2997e01
+- Heartbeat: 19:22:03 (cycles in mid-2000s)
+
+Activity since 19:17:
+- SHADOW-EDGE strengthening on YES: score=+16.2 conf=0.65 bb=+20.0
+  (was +15.3 / +16.4 — BB sees increasing YES underpricing)
+- DOMINANT-SKIP every cycle: btc5m=$-27 (BTC down $27 in 5min,
+  YES is contrarian to trend — DOMINANT requires April-15 profile
+  match which isn't here)
+- Zero BB_PURE fires (strike-distance gate likely still blocking,
+  log throttled)
+- Zero PROTECTIVE/RESIDUAL/OVERSELL/ORPHAN/REENTRY events
+- Zero MANUAL FILL events
+
+Hypothetical alignment-fallback tier would also reject this setup
+even if enabled: btc5m=$-27 → aligned side NO → NO entry @ 65c
+> 55c cap.
+
+Day P&L unchanged: engine +$1.12, manual +$3.32, net +$4.44.
+
+Decision: continue monitoring at 270s cadence.
+
+---
+
+## 2026-05-03 19:27 PT — monitoring tick (window 10:15-10:30 ET, ~3 min left)
+
+State at 19:27 PT:
+- nssm: SERVICE_RUNNING
+- BAL: $42.78 (unchanged)
+- Position: FLAT
+- Resting: 0
+- HEAD: 2997e01
+- Heartbeat: 19:27:13
+
+Activity since 19:22:
+- SHADOW-EDGE FLIPPED: was YES bb=+20.0 (19:22) → now NO bb=-20.0
+  (19:27). BB model now sees NO as underpriced.
+- btc5m flipped sharply: $-27 (19:22) → $+84 (19:27:13) — ~$111
+  swing in 5 min. Sharp BTC rally.
+- DOMINANT-SKIP every cycle: rsi=27 (oversold-contrarian).
+- Zero BB_PURE fires/signals/PROTECTIVE/RESIDUAL/OVERSELL events
+- Zero MANUAL FILL events
+
+If BTC rallied close to strike (~$79,867), strike-distance gate
+may have momentarily opened — but no BB_PURE SIGNAL log indicates
+either still blocking or BB eval missed the moment.
+
+Day P&L unchanged: engine +$1.12, manual +$3.32, net +$4.44.
+
+Decision: continue monitoring at 270s cadence. Window flip at
+~19:30 PT inside next interval.
+
+---
+
+## 2026-05-03 19:32 PT — Trade #6 small loss (NO 4ct @ 44c → -$0.59)
+
+State at 19:32 PT:
+- nssm: SERVICE_RUNNING
+- BAL: **$42.19** (was $42.78 → -$0.59 from Trade #6)
+- Position: FLAT
+- Resting: 0
+- HEAD: 2997e01
+
+Trade #6 lifecycle (19:30:25 → 19:31:18, ~53s):
+- 19:30:25 BB_PURE SIGNAL: NO ticker=-26MAY032245-45
+  regime=MEAN_REVERSION alignment=neutral edge=10pp fair=46c
+  market=56c side=no entry=44c p_win=0.540 kelly=0.0446 contracts=4
+- 19:30:25 NOFILL late-fill 4ct
+- 19:30:48 SYNC RECLAIM (engine adopted Kalshi position)
+- 19:31:18 PROTECTIVE FLAT-CONFIRMED via "untracked fill" pattern
+  (zero_streak=44/3 over 29.7s)
+- 19:31:24 SYNC RESIDUAL FLATTEN attempted (no-op, already flat)
+- 19:31:47 12 RESIDUAL-CLEAN polls confirm flat
+
+**Pattern emerging — "untracked fill" close on consecutive NO entries:**
+- Trade #5 at 18:15: NO 5ct @ 38c → -$0.09 (untracked-fill close)
+- Trade #6 at 19:30: NO 4ct @ 44c → -$0.59 (untracked-fill close)
+
+Both NO entries closed in <60s via untracked fill, both small
+losses. Engine doesn't observe the exit fill via WS. Hypotheses:
+1. TP at fair-value cents fills via another market participant
+   but the WS notification is dropped/missed
+2. Kalshi-side fast settlement behavior on these tickers
+3. SL crossing spread via code path that doesn't log MFE/MAE
+
+No oversell, no REENTRY-BLOCK (lock correctly held — many SKIP
+"already entered this window" log lines confirm), no STUCK-RESIDUAL.
+The alignment classifier correctly stamped neutral (btc5m back
+inside $20 dead zone at 19:30 after the earlier $+84 swing).
+
+Engine-only P&L today: +$0.53 net (6 fires).
+Day breakdown: -$0.19, +$0.42, +$0.06, +$0.92, -$0.09, -$0.59.
+Combined day total: engine +$0.53, manual +$3.32, net +$3.85.
+
+Decision: continue monitoring at 270s cadence. Worth investigating
+the untracked-fill-close pattern after market close.
+
+---
+
+## 2026-05-03 19:38 PT — monitoring tick (window 10:30-10:45 ET, ~7 min left)
+
+State at 19:38 PT:
+- nssm: SERVICE_RUNNING
+- BAL: $42.19 (unchanged since Trade #6 close)
+- Position: FLAT
+- Resting: 0
+- HEAD: 2997e01
+- Heartbeat: cycle 5900 @ 19:37:44
+
+Activity since 19:32:
+- Heartbeats cycling cleanly (~34s/100 cycles)
+- Zero BB_PURE fires/signals (per-window lock held on
+  -26MAY032245-45 since Trade #6)
+- Zero PROTECTIVE/RESIDUAL/OVERSELL/ORPHAN/REENTRY events
+- Zero MANUAL FILL events
+- Zero place_order failures
+
+Engine waiting out the rest of the window. Next BB_PURE fire
+chance is ~19:45 PT when window flips to 10:45-11:00 ET.
+
+Day P&L unchanged: engine +$0.53 (6 fires), manual +$3.32,
+net +$3.85.
+
+Decision: continue monitoring at 270s cadence.
+
+---
+
+## 2026-05-03 19:43 PT — monitoring tick (window 10:30-10:45 ET, ~2 min left)
+
+State at 19:43 PT:
+- nssm: SERVICE_RUNNING
+- BAL: $42.19 (unchanged)
+- Position: FLAT
+- Resting: 0
+- HEAD: 2997e01
+- Heartbeat: cycle 6800 @ 19:43:08
+
+Activity since 19:38:
+- Heartbeats cycling cleanly (cycles 5900 → 6800, ~34s/100)
+- Zero BB_PURE fires/signals (window lock still held)
+- Zero PROTECTIVE/RESIDUAL/OVERSELL/ORPHAN/REENTRY events
+- Zero MANUAL FILL events
+- Zero place_order failures
+
+12 minutes of pure heartbeat post Trade #6. Window flip in ~2 min.
+
+Day P&L unchanged: engine +$0.53 (6 fires), manual +$3.32,
+net +$3.85.
+
+Decision: continue monitoring at 270s cadence.
+
+---
+
+## 2026-05-03 19:48 PT — monitoring tick (window 10:45-11:00 ET, ~12 min left)
+
+State at 19:48 PT:
+- nssm: SERVICE_RUNNING
+- BAL: $42.19 (unchanged)
+- Position: FLAT
+- Resting: 0
+- HEAD: 2997e01
+- Heartbeat: cycle 7500 @ 19:47:56
+
+Window flip events at 19:44:56:
+- new Poly window 10:45-11:00 ET (904s)
+- STRIKE CALIBRATED: $79,951.34 (BTC=$80,151.97 mid=76c) — BTC
+  rallied ~$300 from prior window's strike point, now $200 ABOVE
+  this window's strike → 0.25% distance (way outside 0.04% gate)
+- SESSION-TERMINAL: KXBTC15M-26MAY032245-45 mid=76 regime=chop
+  levels=40
+
+Activity since flip:
+- SHADOW-EDGE strong YES: score=+20.2 conf=0.81 bb=+20.0 (BB sees
+  significant YES underpricing despite mid=76c)
+- DOMINANT-SKIP every cycle: btc5m=$0 (BTC stable last 5min, no
+  clear trend direction)
+- Zero BB_PURE fires (strike-distance gate blocking, BTC $200
+  above strike)
+- Zero PROTECTIVE/RESIDUAL/OVERSELL/ORPHAN/REENTRY events
+- Zero MANUAL FILL events
+
+Hypothetical alignment-fallback tier would also reject this setup
+even if enabled: btc5m=$0 within dead zone → neutral → no aligned
+side → no fallback fire. (The fallback only fires when BTC has a
+clear directional trend — by design.)
+
+Day P&L unchanged: engine +$0.53 (6 fires), manual +$3.32,
+net +$3.85.
+
+Decision: continue monitoring at 270s cadence.
+
+---
+
+## 2026-05-03 19:53 PT — monitoring tick (window 10:45-11:00 ET, ~7 min left)
+
+State at 19:53 PT:
+- nssm: SERVICE_RUNNING
+- BAL: $42.19 (unchanged)
+- Position: FLAT
+- Resting: 0
+- HEAD: 2997e01
+- Heartbeat: 19:53:14
+
+Activity since 19:48:
+- SHADOW-EDGE strengthened: score=+26.2 conf=1.00 bb=+20.0
+  (BB sees full-conviction YES underpricing)
+- DOMINANT-SKIP every cycle (April-15 profile not matching;
+  pdir=none/conf=0.56)
+- Zero BB_PURE fires (strike-distance gate still blocking — BTC
+  remains far above strike)
+- Zero PROTECTIVE/RESIDUAL/OVERSELL/ORPHAN/REENTRY events
+- Zero MANUAL FILL events
+
+Day P&L unchanged: engine +$0.53 (6 fires), manual +$3.32,
+net +$3.85.
+
+Decision: continue monitoring at 270s cadence.
+
+---
+
+## 2026-05-03 19:58 PT — monitoring tick (window 10:45-11:00 ET, ~1.5 min left)
+
+State at 19:58 PT:
+- nssm: SERVICE_RUNNING
+- BAL: $42.19 (unchanged)
+- Position: FLAT
+- Resting: 0
+- HEAD: 2997e01
+- Heartbeat current: 19:58:19
+
+Activity since 19:53:
+- SHADOW-EDGE decayed slightly: was score=+26.2 → now +17.0
+  (still bb=+20 but composite weaker)
+- DOMINANT-SKIP: btc5m=$-38 (BTC dropped $38 in 5min — coming
+  back from earlier rally), rsi=79 (overbought-contrarian)
+- Zero BB_PURE fires (strike-distance still blocking)
+- 19:58:13 transient asyncio ConnectionResetError [WinError 10054]
+  — third today, same Windows socket cleanup blip pattern.
+  Non-blocking; engine continued.
+- Zero PROTECTIVE/RESIDUAL/OVERSELL/ORPHAN/REENTRY/MANUAL events
+
+Window flip imminent at 20:00 PT in ~1.5 min.
+
+Day P&L unchanged: engine +$0.53 (6 fires), manual +$3.32,
+net +$3.85.
+
+Decision: continue monitoring at 270s cadence.
+
+---
+
+## 2026-05-03 20:03 PT — monitoring tick (window 11:00-11:15 ET, ~12 min left)
+
+State at 20:03 PT:
+- nssm: SERVICE_RUNNING
+- BAL: $42.19 (unchanged)
+- Position: FLAT
+- Resting: 0
+- HEAD: 2997e01
+- Heartbeat current: 20:03:16
+
+Window flip events at 19:59:55:
+- new Poly window 11:00-11:15 ET (904s)
+- STRIKE CALIBRATED: $80,124.45 (BTC=$80,193.48 mid=62c)
+- BTC-strike distance ~$69 = 0.086% (still outside 0.04% gate)
+- SESSION-TERMINAL: prior window's regime=STRUCTURED (was CHOP
+  in earlier windows — first STRUCTURED regime detection today)
+
+Activity since flip:
+- BB model edge collapsed: bb=+20.0 → bb=+0.0 over the flip
+  (BB sees NO mispricing now)
+- DOMINANT now PASSING on fvg_side=NO (low conf=0.25)
+- PRESSURE ENTRY logging NO candidates (shadow only — no actual
+  order placement; position FLAT confirms)
+- Zero BB_PURE fires (no edge; nothing to fire on)
+- Zero PROTECTIVE/RESIDUAL/OVERSELL/ORPHAN/REENTRY events
+- Zero MANUAL FILL events
+
+Day P&L unchanged: engine +$0.53 (6 fires), manual +$3.32,
+net +$3.85.
+
+Decision: continue monitoring at 270s cadence.
+
+---
+
+## 2026-05-03 20:08 PT — monitoring tick (window 11:00-11:15 ET, ~7 min left)
+
+State at 20:08 PT:
+- nssm: SERVICE_RUNNING
+- BAL: $42.19 (unchanged)
+- Position: FLAT
+- Resting: 0
+- HEAD: 2997e01
+- Heartbeat current: 20:07:53
+
+Activity since 20:03:
+- SHADOW-EDGE flipped back to YES: score=+21.1 conf=0.84 bb=+20.0
+  (BB now sees strong YES underpricing again — BB model
+  oscillating with mid as the contract reprices)
+- DOMINANT-SKIP every cycle: btc5m=$+4 (BTC near-flat, no clear
+  trend direction)
+- Zero BB_PURE fires (strike-distance gate blocking, log throttled)
+- Zero PROTECTIVE/RESIDUAL/OVERSELL/ORPHAN/REENTRY events
+- Zero MANUAL FILL events
+
+Day P&L unchanged: engine +$0.53 (6 fires), manual +$3.32,
+net +$3.85.
+
+Decision: continue monitoring at 270s cadence.
+
+---
+
+## 2026-05-03 20:14 PT — monitoring tick (window 11:00-11:15 ET, ~1 min left)
+
+State at 20:14 PT:
+- nssm: SERVICE_RUNNING
+- BAL: $42.19 (unchanged)
+- Position: FLAT
+- Resting: 0
+- HEAD: 2997e01
+- Heartbeat: cycle 11900 @ 20:14:09
+
+Activity since 20:08:
+- BTC dropping sharply: btc5m=$+4 (20:08) → $-78 (20:14) —
+  $82 swing in 6 min, sharp correction
+- SHADOW-EDGE still YES bb=+20 conf=0.64 (BB didn't reprice as
+  fast as BTC dropped — model lag visible)
+- RSI=71 still overbought-contrarian
+- DOMINANT-SKIP every cycle (April-15 profile mismatch)
+- Zero BB_PURE fires (strike-distance gate blocking)
+- Zero PROTECTIVE/RESIDUAL/OVERSELL/ORPHAN/REENTRY events
+- Zero MANUAL FILL events
+
+Hypothetical alignment behavior on this setup:
+- btc5m=$-78 → aligned side = NO
+- BB cheap side = YES → alignment classifier: CONTRARIAN
+- Alignment gate ON would BLOCK this contrarian YES fire
+- Alignment fallback ON would NOT fire (only fires on aligned)
+- BOTH alignment features would correctly suppress this trade
+
+Window flip imminent at 20:15 PT in ~1 min.
+
+Day P&L unchanged: engine +$0.53 (6 fires), manual +$3.32,
+net +$3.85.
+
+Decision: continue monitoring at 270s cadence.
+
+---
+
+## 2026-05-03 20:19 PT — monitoring tick (window 11:15-11:30 ET, ~10 min left)
+
+State at 20:19 PT:
+- nssm: SERVICE_RUNNING
+- BAL: $42.19 (unchanged)
+- Position: FLAT
+- Resting: 0
+- HEAD: 2997e01
+- Heartbeat current: 20:19:17
+
+Window flip events at 20:14:55:
+- new Poly window 11:15-11:30 ET (904s)
+- STRIKE CALIBRATED: $80,305.61 (BTC=$80,337.25 mid=55c) — BTC
+  recovered from earlier $-78 dip to $80,337
+- Strike distance: $32 = 0.040% (RIGHT at the gate threshold!)
+- SESSION-TERMINAL: prior window 11:15 ET regime=CHOP (back to
+  chop from STRUCTURED in prior window)
+
+Activity since flip:
+- BB model repriced after BTC drop: bb=+20 → bb=-2.1 (now sees
+  mild NO underpricing, well below 8pp threshold for BB_PURE)
+- DOMINANT=PASS NO (fvg_side=NO conf=0.32 — low conviction)
+- PRESSURE ENTRY logging NO candidates (shadow only — fvg=-10c
+  prob=37% edge=-2c)
+- Zero BB_PURE fires (edge insufficient)
+- Zero PROTECTIVE/RESIDUAL/OVERSELL/ORPHAN/REENTRY events
+- Zero MANUAL FILL events
+
+Day P&L unchanged: engine +$0.53 (6 fires), manual +$3.32,
+net +$3.85.
+
+Decision: continue monitoring at 270s cadence.
+
+---
+
+## 2026-05-03 20:24 PT — monitoring tick (window 11:15-11:30 ET, ~5 min left)
+
+State at 20:24 PT:
+- nssm: SERVICE_RUNNING
+- BAL: $42.19 (unchanged)
+- Position: FLAT
+- Resting: 0
+- HEAD: 2997e01
+- Heartbeat current: 20:24:40
+
+Activity since 20:19:
+- SHADOW-EDGE NO strengthening: was bb=-2.1 (20:19) → bb=-11.7
+  (20:24). BB now sees significant NO underpricing on
+  composite scale (~10-15pp BB_PURE edge equivalent).
+- DOMINANT-SKIP every cycle: btc5m=$0 (BTC flat after the
+  earlier rally-and-correction sequence)
+- Zero BB_PURE fires — likely strike-distance gate (BTC may have
+  drifted further from $80,305 strike) OR ENTRY-CAP-BLOCK if NO
+  entry > 55c.
+- Zero PROTECTIVE/RESIDUAL/OVERSELL/ORPHAN/REENTRY events
+- Zero MANUAL FILL events
+
+Continuing observation: BB model has been showing strong directional
+edge (alternating YES/NO at +20/-20 scale) across multiple windows,
+but BB_PURE consistently blocked by either strike-distance or
+entry-cap gates. Validates the user's "missing profitable trades"
+suspicion — most blocks have been correct (gates working) but
+some windows where BTC clearly settles past strike likely missed.
+
+Day P&L unchanged: engine +$0.53 (6 fires), manual +$3.32,
+net +$3.85.
+
+Decision: continue monitoring at 270s cadence.

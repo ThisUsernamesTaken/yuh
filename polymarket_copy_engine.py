@@ -714,6 +714,15 @@ class PolymarketCopyEngine:
         self._instant_buy_fired_this_window: bool = False
         self._last_stop_time: float = 0.0      # Time of last stop-loss exit
         self._closed_tickers: set = set()      # Tickers where we sold/closed — sync must skip these
+        # 2026-05-03 PT 20:30 — LOSS-STREAK COOLDOWN (B3) state.
+        # Tracks consecutive BB_PURE losses for the cooldown gate.
+        # Approximates loss/win at close time using entry_cents vs current
+        # bid (precise P&L attribution deferred to B2). Counter increments
+        # on close-with-loss, resets on close-with-win, decays after
+        # BB_PURE_LOSS_STREAK_RELEASE_WINDOWS windows w/o a fire.
+        self._bb_pure_loss_streak: int = 0
+        self._bb_pure_streak_last_fire_window_id: int = -1
+        self._bb_pure_streak_decay_counter: int = 0
         # 2026-04-22: Belt-and-suspenders per-window entry guard.
         # Independent of `_trades_this_window` counter (which has had reset
         # bugs in the past). Any ticker we've entered is permanently locked
@@ -2445,6 +2454,28 @@ class PolymarketCopyEngine:
             (market.get("question") or "?")[:50], market.get("_seconds_left", 0),
         )
         self._state.active_poly_market = condition_id[:20]
+        # 2026-05-03 PT 20:30 — LOSS-STREAK COOLDOWN (B3) decay counter.
+        # Every window WITHOUT a fire counts as a "decay tick"; after
+        # BB_PURE_LOSS_STREAK_RELEASE_WINDOWS quiet windows in a row,
+        # release the cooldown. Counter resets to 0 on every fire (set
+        # in _execute_bb_pure_signal).
+        try:
+            if (bool(_uc("BB_PURE_LOSS_STREAK_COOLDOWN_ENABLED", False))
+                    and int(getattr(self, "_bb_pure_loss_streak", 0) or 0) > 0):
+                _release_n = int(_uc("BB_PURE_LOSS_STREAK_RELEASE_WINDOWS", 3))
+                self._bb_pure_streak_decay_counter = int(
+                    getattr(self, "_bb_pure_streak_decay_counter", 0) or 0
+                ) + 1
+                if self._bb_pure_streak_decay_counter >= _release_n:
+                    logger.info(
+                        "BB_PURE LOSS-STREAK DECAY-RELEASE: streak %d → 0 "
+                        "after %d quiet windows",
+                        self._bb_pure_loss_streak, _release_n,
+                    )
+                    self._bb_pure_loss_streak = 0
+                    self._bb_pure_streak_decay_counter = 0
+        except Exception as _dse:
+            logger.debug("loss-streak decay update failed: %s", _dse)
 
         # ── Reset probability engine strike for new session ──
         # Kalshi uses CF Benchmarks BRTI (60-source avg), not Coinbase spot.
@@ -9005,9 +9036,27 @@ class PolymarketCopyEngine:
         bal_dollars = float(_LIVE_BALANCE_DOLLARS or 0.0)
         if bal_dollars <= 0:
             return None
+        # 2026-05-03 PT 20:30 — LOSS-STREAK COOLDOWN (B3) edge tightening.
+        # When loss_streak >= threshold, multiply min_edge_pp to require
+        # higher conviction during cooldown. Released on win (in close
+        # path) or after BB_PURE_LOSS_STREAK_RELEASE_WINDOWS windows w/o
+        # a fire (decay counter).
+        _base_min_edge = float(_uc("BB_PURE_MIN_EDGE_PP", 8.0))
+        _effective_min_edge = _base_min_edge
+        if bool(_uc("BB_PURE_LOSS_STREAK_COOLDOWN_ENABLED", False)):
+            _streak_thresh = int(_uc("BB_PURE_LOSS_STREAK_THRESHOLD", 2))
+            _streak_mult = float(_uc("BB_PURE_LOSS_STREAK_EDGE_MULT", 1.5))
+            if int(getattr(self, "_bb_pure_loss_streak", 0)) >= _streak_thresh:
+                _effective_min_edge = _base_min_edge * _streak_mult
+                logger.info(
+                    "BB_PURE LOSS-STREAK COOLDOWN: streak=%d ≥ %d, "
+                    "edge floor %.1fpp → %.1fpp (mult=%.2f)",
+                    self._bb_pure_loss_streak, _streak_thresh,
+                    _base_min_edge, _effective_min_edge, _streak_mult,
+                )
         # Build config (with conviction-tier knobs, 2026-05-01)
         config = {
-            "min_edge_pp":           float(_uc("BB_PURE_MIN_EDGE_PP", 8.0)),
+            "min_edge_pp":           _effective_min_edge,
             # 2026-05-03: pass the MAX of mean-rev and trend caps so
             # bb_pure doesn't pre-filter entries that would qualify for
             # trend mode. Regime-specific cap is applied post-eval below
@@ -9019,7 +9068,16 @@ class PolymarketCopyEngine:
                 else int(_uc("BB_PURE_MAX_ENTRY_CENTS", 55)),
             ),
             "min_entry_cents":       int(_uc("BB_PURE_MIN_ENTRY_CENTS", 5)),
-            "min_time_remaining_s":  float(_uc("BB_PURE_MIN_TIME_REMAINING_S", 60.0)),
+            # 2026-05-03 PT 20:30 — FINAL-MINUTE RELAX (B4). When the
+            # final-min-relax flag is on, pass the relaxed floor here so
+            # bb_pure.evaluate doesn't pre-filter aligned setups.
+            # Engine then enforces strict 60s cap below for non-aligned
+            # signals after computing alignment.
+            "min_time_remaining_s":  float(
+                _uc("BB_PURE_FINAL_MIN_RELAX_S", 30.0)
+                if bool(_uc("BB_PURE_FINAL_MIN_RELAX_ENABLED", False))
+                else _uc("BB_PURE_MIN_TIME_REMAINING_S", 60.0)
+            ),
             "kelly_fraction":        float(_uc("BB_PURE_KELLY_FRACTION", 0.25)),
             "kelly_max_frac":        float(_uc("BB_PURE_KELLY_MAX_FRAC", 0.15)),
             "max_contracts":         int(_get_sizing_cap()),
@@ -9127,25 +9185,68 @@ class PolymarketCopyEngine:
                             and persistence_ok:
                         sig_regime = "TREND"
                     else:
-                        # Neither qualifying regime — block
-                        if trend_mode_on and in_trend_zone:
-                            # Diagnostic: in trend zone but failed match/persist
-                            logger.info(
-                                "BB_PURE STRIKE-DIST-BLOCK: BTC $%.0f strike "
-                                "$%.0f dist=%.4f%% in TREND zone but "
-                                "match=%s persist=%s — skipping",
-                                btc_price, strike, dist_pct * 100,
-                                trend_match, persistence_ok,
-                            )
-                        else:
-                            logger.info(
-                                "BB_PURE STRIKE-DIST-BLOCK: BTC $%.0f strike "
-                                "$%.0f dist=%.4f%% > %.4f%% — neither "
-                                "mean-rev nor trend zone (skipping)",
-                                btc_price, strike, dist_pct * 100,
-                                max_dist_pct * 100,
-                            )
-                        return None
+                        # Neither qualifying regime — would normally block.
+                        # 2026-05-03 PT 20:30 — POSITION_ALIGNED override (B1):
+                        # when BB cheap side matches BTC's position vs
+                        # strike (BTC>strike & YES, or BTC<strike & NO),
+                        # allow the entry through. Captures sustained-trend
+                        # setups that velocity-based alignment misses.
+                        # Capped at POSITION_ALIGN_MAX_DIST_PCT to avoid
+                        # firing in extreme-far-from-strike conditions
+                        # where BB model is unreliable.
+                        _pos_align_used = False
+                        if bool(_uc("BB_PURE_POSITION_ALIGN_ENABLED", False)):
+                            try:
+                                from bb_pure import classify_position_alignment
+                                _pa_deadband = float(
+                                    _uc("BB_PURE_POSITION_ALIGN_DEADBAND_USD", 5.0)
+                                )
+                                _pa_max_dist = float(
+                                    _uc("BB_PURE_POSITION_ALIGN_MAX_DIST_PCT", 0.0015)
+                                )
+                                _pa = classify_position_alignment(
+                                    side=sig.side,
+                                    btc_price=btc_price,
+                                    strike=strike,
+                                    deadband_usd=_pa_deadband,
+                                )
+                                if _pa == "aligned" and dist_pct <= _pa_max_dist:
+                                    sig_regime = "POSITION_ALIGNED"
+                                    _pos_align_used = True
+                                    logger.warning(
+                                        "BB_PURE POSITION-ALIGN-PASS: BTC "
+                                        "$%.0f strike $%.0f dist=%.4f%% "
+                                        "side=%s pa=aligned — overriding "
+                                        "strike-distance block",
+                                        btc_price, strike, dist_pct * 100,
+                                        sig.side.upper(),
+                                    )
+                            except Exception as _pae:
+                                logger.debug(
+                                    "BB_PURE position-align check failed: %s",
+                                    _pae,
+                                )
+                        if not _pos_align_used:
+                            if trend_mode_on and in_trend_zone:
+                                # Diagnostic: in trend zone but failed
+                                # match/persist
+                                logger.info(
+                                    "BB_PURE STRIKE-DIST-BLOCK: BTC $%.0f "
+                                    "strike $%.0f dist=%.4f%% in TREND zone "
+                                    "but match=%s persist=%s — skipping",
+                                    btc_price, strike, dist_pct * 100,
+                                    trend_match, persistence_ok,
+                                )
+                            else:
+                                logger.info(
+                                    "BB_PURE STRIKE-DIST-BLOCK: BTC $%.0f "
+                                    "strike $%.0f dist=%.4f%% > %.4f%% — "
+                                    "neither mean-rev nor trend zone "
+                                    "(skipping)",
+                                    btc_price, strike, dist_pct * 100,
+                                    max_dist_pct * 100,
+                                )
+                            return None
 
                     # Stamp regime for downstream logging / sizing decisions
                     try:
@@ -9155,6 +9256,10 @@ class PolymarketCopyEngine:
 
                     # Regime-specific entry-price cap (after regime decided)
                     if sig_regime == "MEAN_REVERSION":
+                        regime_cap = int(_uc("BB_PURE_MAX_ENTRY_CENTS", 55))
+                        regime_min = int(_uc("BB_PURE_MIN_ENTRY_CENTS", 5))
+                    elif sig_regime == "POSITION_ALIGNED":
+                        # B1 override: still cheap-side bet, use mean-rev caps
                         regime_cap = int(_uc("BB_PURE_MAX_ENTRY_CENTS", 55))
                         regime_min = int(_uc("BB_PURE_MIN_ENTRY_CENTS", 5))
                     else:  # TREND
@@ -9484,6 +9589,23 @@ class PolymarketCopyEngine:
                     _align_dead_zone,
                 )
                 return None
+            # 2026-05-03 PT 20:30 — FINAL-MINUTE RELAX engine-side enforce.
+            # bb_pure.evaluate was passed the relaxed time-floor when the
+            # flag is on, so non-aligned signals slipping past need a
+            # second-level guard here. Aligned signals (with-trend or
+            # position-aligned) get to keep the relaxed floor.
+            if bool(_uc("BB_PURE_FINAL_MIN_RELAX_ENABLED", False)):
+                _strict_floor = float(_uc("BB_PURE_MIN_TIME_REMAINING_S", 60.0))
+                if (sig.seconds_to_expiry < _strict_floor
+                        and _alignment != "aligned"):
+                    logger.info(
+                        "BB_PURE FINAL-MIN-STRICT: %s alignment=%s "
+                        "secs_to_exp=%.0f < %.0f — only aligned setups "
+                        "get the relaxed floor; skipping",
+                        ticker[-15:], _alignment,
+                        sig.seconds_to_expiry, _strict_floor,
+                    )
+                    return None
         except Exception as _ae:
             logger.debug("BB_PURE alignment classification failed: %s", _ae)
 
@@ -9841,6 +9963,14 @@ class PolymarketCopyEngine:
         ticker = getattr(self, "_current_kalshi_ticker", "") or ""
         if not ticker or not sig:
             return
+        # 2026-05-03 PT 20:30 — LOSS-STREAK DECAY counter reset (B3).
+        # Any BB_PURE-tier fire interrupts the "quiet windows" decay path.
+        # The streak itself is not reset — only the decay counter.
+        try:
+            if bool(_uc("BB_PURE_LOSS_STREAK_COOLDOWN_ENABLED", False)):
+                self._bb_pure_streak_decay_counter = 0
+        except Exception:
+            pass
         # 1-trade-per-window lock check
         if ticker in getattr(self, '_entered_tickers_this_window', set()):
             logger.info(
@@ -18060,6 +18190,66 @@ class PolymarketCopyEngine:
                 self._emit_sr_level_outcome(self._open_position, reason or "clear_position")
         except Exception:
             logger.exception("CopyEngine SR-LEVEL-OUTCOME (clear_position) error")
+        # 2026-05-03 PT 20:30 — LOSS-STREAK COOLDOWN (B3) close-side update.
+        # Only count BB_PURE / BB_MOMENTUM / POSITION_ALIGNED entries (the
+        # tiers gated by BB_PURE_LOSS_STREAK_COOLDOWN_ENABLED). Approximate
+        # loss/win at close by entry_cents vs current bid; precise P&L
+        # attribution deferred to B2.
+        try:
+            if (bool(_uc("BB_PURE_LOSS_STREAK_COOLDOWN_ENABLED", False))
+                    and self._open_position is not None):
+                _strat = (
+                    self._open_position.get("strategy_name", "")
+                    or self._open_position.get("strategy", "")
+                    or ""
+                ).upper()
+                _gates_strat = (
+                    "BB_PURE" in _strat or "BB_MOMENTUM" in _strat
+                    or "POSITION_ALIGN" in _strat or "ALIGNMENT" in _strat
+                )
+                if _gates_strat:
+                    _entry_c = int(
+                        self._open_position.get("original_entry_cents") or
+                        self._open_position.get("entry_cents", 0) or 0
+                    )
+                    _side_close = (self._open_position.get("side") or "").lower()
+                    _close_bid = 0
+                    try:
+                        _tk = self._open_position.get("ticker", "")
+                        _bk = self._kalshi_ws.get_book(_tk) if (
+                            self._kalshi_ws and hasattr(self._kalshi_ws, "get_book")
+                        ) else None
+                        if _bk is not None and _bk.is_ready:
+                            if _side_close == "yes":
+                                _close_bid = int(getattr(_bk, "best_yes_bid", 0) or 0)
+                            else:
+                                _close_bid = int(getattr(_bk, "best_no_bid", 0) or 0)
+                    except Exception:
+                        _close_bid = 0
+                    if _entry_c > 0 and _close_bid > 0:
+                        _is_loss = _close_bid < _entry_c
+                        if _is_loss:
+                            self._bb_pure_loss_streak = int(
+                                getattr(self, "_bb_pure_loss_streak", 0) or 0
+                            ) + 1
+                            logger.warning(
+                                "BB_PURE LOSS-STREAK INCREMENT: streak=%d "
+                                "(entry=%dc close_bid=%dc strat=%s)",
+                                self._bb_pure_loss_streak, _entry_c,
+                                _close_bid, _strat,
+                            )
+                        else:
+                            if int(getattr(self, "_bb_pure_loss_streak", 0) or 0) > 0:
+                                logger.info(
+                                    "BB_PURE LOSS-STREAK RESET: %d → 0 "
+                                    "(entry=%dc close_bid=%dc strat=%s)",
+                                    self._bb_pure_loss_streak, _entry_c,
+                                    _close_bid, _strat,
+                                )
+                            self._bb_pure_loss_streak = 0
+                        self._bb_pure_streak_decay_counter = 0
+        except Exception as _lse:
+            logger.debug("BB_PURE loss-streak update failed: %s", _lse)
         await self._cancel_tp_order()
         if self._open_position:
             self._closed_tickers.add(self._open_position.get("ticker", ""))

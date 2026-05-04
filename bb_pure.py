@@ -98,6 +98,45 @@ def aligned_side_from_btc(
     return "yes" if btc_5m_change_usd > 0 else "no"
 
 
+def classify_position_alignment(
+    side: str,
+    btc_price: float,
+    strike: float,
+    deadband_usd: float = 5.0,
+) -> str:
+    """Classify a signal's side vs BTC's position relative to strike.
+
+    Distinct from `classify_alignment` (which uses 5-min velocity) — this
+    classifier asks whether the BB cheap side aligns with where BTC IS
+    relative to strike, regardless of recent direction. Captures the
+    pattern: BTC has been firmly above strike for a while (not just last
+    5 min), so YES is the with-trend side at settlement even if the
+    velocity check shows neutral.
+
+    Args:
+        side: "yes" or "no" — BB cheap side.
+        btc_price: current BTC spot in USD.
+        strike: this window's calibrated strike in USD.
+        deadband_usd: when |btc - strike| ≤ this, treat as neutral
+            (BTC near-strike, no clear positional alignment).
+
+    Returns:
+        "aligned" if BB cheap side matches BTC position vs strike.
+        "contrarian" if BB cheap side opposes it.
+        "neutral" if BTC is within deadband of strike.
+    """
+    if btc_price <= 0 or strike <= 0:
+        return "neutral"
+    delta = float(btc_price) - float(strike)
+    if abs(delta) <= float(deadband_usd):
+        return "neutral"
+    s = (side or "").lower()
+    if delta > 0:  # BTC above strike — YES likely settles in-the-money
+        return "aligned" if s == "yes" else "contrarian"
+    else:  # BTC below strike — NO likely settles in-the-money
+        return "aligned" if s == "no" else "contrarian"
+
+
 def build_alignment_fallback_signal(
     side: str,
     market_mid_cents: int,

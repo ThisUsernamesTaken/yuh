@@ -848,8 +848,13 @@ BB_PURE_TAPE_BTC_DEAD_ZONE_USD       = 20.0   # |BTC 5m change| ≤ this
 #
 # Both flags default OFF: shipping the code, not the behavior. Flip to
 # True per the deploy review checklist (paper validate → live).
-BB_PURE_ALIGNMENT_GATE_ENABLED            = False  # block contrarian BB fires
-BB_PURE_ALIGNMENT_FALLBACK_TIER_ENABLED   = False  # add a with-trend tier
+# 2026-05-03 PT 20:30 — A1/A2 ACTIVATED. Both alignment features were
+# shipped default-OFF earlier; user reviewed today's tape and authorized
+# flipping ON for live validation. Engine behavior change minimal on
+# today's tape (most fires were alignment=neutral) but enables future
+# protection.
+BB_PURE_ALIGNMENT_GATE_ENABLED            = True   # 2026-05-03 ACTIVATED
+BB_PURE_ALIGNMENT_FALLBACK_TIER_ENABLED   = True   # 2026-05-03 ACTIVATED
 BB_PURE_ALIGNMENT_BTC_DEAD_ZONE_USD       = 20.0   # |BTC 5m change| ≤ this
                                                    # = no clear trend → no
                                                    # alignment classification
@@ -867,6 +872,44 @@ BB_PURE_ALIGNMENT_FALLBACK_MIN_TIME_S       = 90.0  # min seconds-to-expiry
                                                     # edge to lean on)
 BB_PURE_ALIGNMENT_FALLBACK_KELLY_FRACTION   = 0.10  # fixed fraction (no Kelly)
 BB_PURE_ALIGNMENT_FALLBACK_KELLY_MAX_FRAC   = 0.05  # absolute ceiling
+
+# 2026-05-03 PT 20:30 — POSITION-VS-STRIKE ALIGNMENT (option B1).
+# When BB_PURE's strike-distance gate would block (BTC in 0.04-0.15%
+# no-man's-land), check whether BB's cheap side aligns with where BTC
+# IS relative to strike. If aligned (e.g., BTC>strike & BB picks YES),
+# allow the entry through with regime tag POSITION_ALIGNED. Captures
+# sustained-trend setups that the velocity-based classifier misses.
+# Default OFF — opt-in; flip after observing engine behavior with
+# A1/A2 alignment features active.
+BB_PURE_POSITION_ALIGN_ENABLED          = False   # opt-in; allows BB_PURE
+                                                  # to bypass strike-distance
+                                                  # block when position-aligned
+BB_PURE_POSITION_ALIGN_DEADBAND_USD     = 5.0     # |BTC - strike| ≤ this
+                                                  # = neutral, no override
+BB_PURE_POSITION_ALIGN_MAX_DIST_PCT     = 0.0015  # only override up to 0.15%
+                                                  # (above that, BB_TREND
+                                                  # zone takes over instead)
+
+# 2026-05-03 PT 20:30 — LOSS-STREAK COOLDOWN (option B3).
+# After N consecutive losses on BB_PURE, tighten min_edge_pp by a
+# multiplier for the next entry. Releases on next win or after K windows.
+# Win/loss determined by entry_cents vs current_bid at close time
+# (approximate; B2 will refine when shipped).
+BB_PURE_LOSS_STREAK_COOLDOWN_ENABLED    = False   # opt-in
+BB_PURE_LOSS_STREAK_THRESHOLD           = 2       # tighten after N losses
+BB_PURE_LOSS_STREAK_EDGE_MULT           = 1.5     # 8pp × 1.5 = 12pp during
+                                                  # cooldown
+BB_PURE_LOSS_STREAK_RELEASE_WINDOWS     = 3       # auto-release after N
+                                                  # windows w/o a fire
+
+# 2026-05-03 PT 20:30 — FINAL-MINUTE RELAX FOR ALIGNED SETUPS (option B4).
+# When alignment classifier returns "aligned" (BB cheap side matches
+# BTC trend), relax the min-time-remaining floor. Settlement-cliff
+# trades on aligned setups have near-determined outcomes and are
+# the safer subset of late-window entries.
+BB_PURE_FINAL_MIN_RELAX_ENABLED         = False   # opt-in
+BB_PURE_FINAL_MIN_RELAX_S               = 30.0    # relaxed floor for aligned
+                                                  # setups (vs 60s default)
 
 # Bump KalshiTape retention to 5 min so the absorption window has
 # enough trade history. Default in kalshi_tape.py is 120s.
