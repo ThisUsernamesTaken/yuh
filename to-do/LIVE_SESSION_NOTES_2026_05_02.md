@@ -3499,3 +3499,40 @@ Window 12:15-12:30 ET ends at 21:30 PT in ~3 min.
 Day total holds: engine +$1.54 (7 fires), manual +$3.32, net +$4.86.
 
 Decision: continue monitoring at 270s cadence.
+
+---
+
+## 2026-05-03 21:30 PT — window flip + retrospective on Trade #7
+
+State at 21:30 PT:
+- nssm: SERVICE_RUNNING
+- BAL: $43.20 (unchanged)
+- Position: FLAT
+- Resting: 0
+- HEAD: e870cbf (just committed README + setup doc refresh)
+
+Window flip events at 21:30:00:
+- new Poly window 12:30-12:45 ET (905s)
+- STRIKE CALIBRATED: $80,040.16 (BTC=$80,341.60 mid=92c)
+- BTC distance: 0.375% — way outside 0.04% mean-rev AND 0.15% trend
+  zone AND 0.15% B1 max-dist cap. No entry path open this window.
+- SESSION-TERMINAL: prior window 12:15-12:30 ET settled at mid=92c
+  → confirms Trade #7's YES bet would have settled YES at $1.00 if
+  held to expiry. Trail-fired at 88c captured ~67% of max profit
+  (+$1.01 vs theoretical +$1.52). Reasonable trade-off given
+  uncertainty mid-window.
+
+Activity since flip:
+- SHADOW-EDGE side=YES bb=+20 pres=+3.5 conf=1.00 (very strong)
+- DOMINANT=PASS YES (microstructure tier observation, shadow only)
+- PRESSURE ENTRY YES persist=3 fvg=+44c prob=95% (shadow)
+- BB_PURE silent this window (mid=92c > BB_TREND_MAX cap 75c, plus
+  0.375% > 0.15% B1 cap → no entry pathway open)
+
+Day total holds: engine +$1.54 (7 fires), manual +$3.32, net +$4.86.
+
+GitHub doc refresh committed at e870cbf: README + NEW_INSTANCE_SETUP
+updated to reflect ca1e347 alignment stack. Branch now 4 commits
+ahead of origin/master. Push pending user explicit consent.
+
+Decision: continue monitoring at 270s cadence.
