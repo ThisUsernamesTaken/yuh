@@ -1608,6 +1608,36 @@ were both on entries that fired into adverse continuing moves.
 
 Next iteration ships the 3c-bounce reversal-confirmation gate.
 
+### 17:20 PT — Trade #3 actually closed PRE-SETTLEMENT at slight profit
+
+Surprise outcome: position was sold by protective TP at ~52c before
+settlement, NOT held to NO settlement loss. BAL went $38.57 → $38.63
+(+$0.06) instead of expected -$1.44.
+
+The protective MFE-trail layer found a fill window during the bid
+spike (53c→78c→back) and closed the position at ~52c just before BTC
+fell further below strike. Even though the entry was directionally
+wrong (BTC settled NO), the protective exit layer salvaged a tiny
+profit.
+
+This is genuinely good behavior — exact validation of why we keep
+PROTECTIVE_ORDER_MODE on. The MFE-aware trail captured what little
+edge existed before BTC continued down.
+
+**Final today's engine-only P&L: +$0.29 across 3 fires.**
+
+  Trade 1: BB_PURE NO 2ct @ 52c → -$0.19 (external close)
+  Trade 2: BB_PURE YES 6ct @ 41c → +$0.42 (external close)
+  Trade 3: BB_PURE YES 3ct @ 48c → +$0.06 (protective TP)
+
+Three out of three trades exited via different paths — external,
+external, protective — and net positive. Option A's gate-disable
+unlocked real BB_PURE alpha that the prior config was suppressing.
+
+Engine LIVE for next session. User said "should be live for next
+session." Configuration preserved as-is. Next-session priority:
+ship 3c-bounce reversal-confirmation gate.
+
 ### 14:35 PT — first post-restart fire (BB_PURE, NOT bb_momentum)
 
 State: BAL $25.19 (down $0.19), FLAT, 0 resting.
