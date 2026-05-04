@@ -2829,3 +2829,216 @@ Day P&L unchanged: engine +$0.53 (6 fires), manual +$3.32,
 net +$3.85.
 
 Decision: continue monitoring at 270s cadence.
+
+---
+
+## 2026-05-03 20:39 PT — post-B1/B3/B4 deploy + A1/A2 activation
+
+Commit: fcf9008 "Activate alignment + ship B1/B3/B4
+(position-align, loss-streak, final-min-relax)"
+
+Per user "implement all" directive at 20:32:
+- A1 ACTIVATED: BB_PURE_ALIGNMENT_GATE_ENABLED False → True
+- A2 ACTIVATED: BB_PURE_ALIGNMENT_FALLBACK_TIER_ENABLED False → True
+- B1 SHIPPED: classify_position_alignment + override (default OFF)
+- B3 SHIPPED: loss-streak cooldown counter + threshold gate (default OFF)
+- B4 SHIPPED: final-minute relax for aligned setups (default OFF)
+- B2 DEFERRED: untracked-fill P&L attribution (needs WS handler study)
+
+Tests: 545 passed, 12 new B1 tests, 3 pre-existing failures
+unrelated. No regressions.
+
+Deploy sequence:
+- 20:32:00 nssm stop
+- (code edits + tests)
+- 20:38:33 git commit fcf9008
+- 20:38:50 nssm start (engine restart)
+- 20:38:56 price feed warmed (1m=80040, 5m=80085, 15m=80090, 1h=80193)
+- 20:39:16 manual-fills poller bootstrapped (86 seen fill_ids)
+- 20:39:53 (now) engine warming up, no new Poly window log yet
+
+State at 20:39 PT:
+- nssm: SERVICE_RUNNING
+- BAL: $42.19 (unchanged across deploy)
+- Position: FLAT
+- Resting: 0
+- HEAD: fcf9008
+- Engine missed ~7 min of trading during deploy (likely no fires
+  given today's tape was strike-distance blocked anyway)
+
+Day total holds: engine +$0.53 (6 fires), manual +$3.32, net +$3.85.
+
+Decision: continue monitoring at 270s cadence. Watch for first
+appearance of ALIGNMENT-CONTRARIAN-BLOCK or BB_PURE
+ALIGNMENT-FALLBACK SIGNAL log lines (newly activated features).
+
+---
+
+## 2026-05-03 20:44 PT — first post-deploy monitoring tick (clean)
+
+State at 20:44 PT:
+- nssm: SERVICE_RUNNING
+- BAL: $42.19 (unchanged)
+- Position: FLAT
+- Resting: 0
+- HEAD: fcf9008
+- Heartbeat: cycle 700 @ 20:43:55
+
+Activity since restart at 20:38:50:
+- 20:39:57 engine joined window 11:30-11:45 ET (303s left when
+  joined — partial window, joined late)
+- 20:41:27 baseline established (11c from 262 samples) —
+  microstructure stats warming up
+- Cycles 100 → 700 in 4 min, ~34s pacing (healthy)
+- Zero BB_PURE fires/signals
+- Zero ALIGNMENT-CONTRARIAN-BLOCK / ALIGNMENT-FALLBACK SIGNAL
+  (no setups triggered new logic yet)
+- Zero PROTECTIVE/RESIDUAL/OVERSELL/ORPHAN/REENTRY events
+- Zero MANUAL FILL events
+
+Window 11:30-11:45 ET ends at 20:45 PT (~1 min from now). Next
+window flip will be the first FULL post-deploy window — first
+real test of activated A1/A2 features.
+
+Day total holds: engine +$0.53 (6 fires), manual +$3.32, net +$3.85.
+
+Decision: continue monitoring at 270s cadence.
+
+---
+
+## 2026-05-03 20:45 PT — first FULL post-deploy window opened
+
+State at 20:45 PT:
+- nssm: SERVICE_RUNNING
+- BAL: $42.19 (unchanged)
+- Position: FLAT
+- Resting: 0
+- HEAD: fcf9008
+
+Window flip events at 20:45:01:
+- new Poly window 11:45-12:00 ET (904s)
+- STRIKE CALIBRATED: $80,225.87 (BTC=$79,994.69 mid=14c)
+- BTC now $231 BELOW strike — 0.288% (way outside 0.04% gate AND
+  inside 0.15% trend-zone-wrong-direction)
+- mid=14c at open (strong NO bias — market 86% confident NO)
+- SESSION-TERMINAL: prior 11:45 window regime=CHOP
+
+Activity since flip:
+- SHADOW-EDGE side=NO score=-20.0 conf=0.80 bb=-20.0
+  (strong NO conviction)
+- DOMINANT-SKIP: btc5m=$0 (flat 5-min — no directional move)
+- Zero BB_PURE fires (strike-distance gate blocks; B1 would
+  override but is default-OFF)
+- Zero ALIGNMENT-CONTRARIAN-BLOCK fires (alignment=neutral with
+  btc5m in dead zone)
+- Zero ALIGNMENT-FALLBACK SIGNAL fires (neutral → no aligned side
+  → fallback skips)
+- Zero PROTECTIVE/RESIDUAL/OVERSELL/ORPHAN/REENTRY events
+
+Activated A1/A2 features behaving correctly: alignment classifier
+returns "neutral" when btc5m within $20 dead zone, suppressing
+both gate-block AND fallback-fire. Engine treats this just like
+pre-deploy — no behavior change visible on this setup.
+
+This is a CLASSIC "missing profitable trade" setup that B1
+(position-vs-strike alignment) WOULD have captured if its flag
+were ON: BB strongly favors NO at 14c, BTC is firmly below strike,
+position-aligned per B1 classifier. Default-OFF status preserves
+caution on the first window with the new code path.
+
+Day total holds: engine +$0.53 (6 fires), manual +$3.32, net +$3.85.
+
+Decision: continue monitoring at 270s cadence.
+
+---
+
+## 2026-05-03 20:49 PT — A1 gate would-fire scenario observed
+
+State at 20:49 PT:
+- nssm: SERVICE_RUNNING
+- BAL: $42.19 (unchanged)
+- Position: FLAT
+- Resting: 0
+- HEAD: fcf9008
+
+Activity since 20:45:
+- BTC swung sharply: btc5m=$0 (20:45) → btc5m=$+125 (20:49)
+  = $125 rally in 4 min (BTC catching back up to strike)
+- SHADOW-EDGE: side=NO score=-15.6 bb=-20.0 (BB still picks NO)
+- BB picks NO + btc5m=+125 (BTC up) → alignment=CONTRARIAN
+- ALIGNMENT-CONTRARIAN-BLOCK NOT logged because BB_PURE is
+  already blocked upstream by strike-distance gate (BTC still
+  below strike). The contrarian-gate code never gets executed
+  on this signal.
+
+This is the first window post-deploy where alignment classifier
+would have classified as contrarian. Validates A1 logic is
+correct: gate would block NO fires when BTC trending up, but
+the upstream strike-distance gate is acting first.
+
+User asked at 20:48 about "why no trades" — explained that A1/A2
+require specific tape conditions (alignment classifier needs to
+be aligned/contrarian, not neutral) to fire visibly, and B1/B3/B4
+are still default-OFF. Proposed flipping B1+B3+B4 ON. Awaiting
+user direction.
+
+Day total holds: engine +$0.53 (6 fires), manual +$3.32, net +$3.85.
+
+Decision: continue monitoring at 270s cadence.
+
+---
+
+## 2026-05-03 20:51 PT — quiet monitoring tick
+
+State at 20:51 PT:
+- nssm: SERVICE_RUNNING
+- BAL: $42.19 (unchanged)
+- Position: FLAT
+- Resting: 0
+- HEAD: fcf9008
+- Heartbeat: cycle 1900 @ 20:51:05
+
+Activity since 20:49 (window 11:45-12:00 ET):
+- Heartbeats cycling cleanly (1600 → 1900, ~34s/100)
+- Zero BB_PURE fires/signals
+- Zero ALIGNMENT-CONTRARIAN-BLOCK / FALLBACK / POSITION-ALIGN log
+  lines — no setups have triggered new code paths visibly
+- Zero PROTECTIVE/RESIDUAL/OVERSELL/ORPHAN/REENTRY events
+
+BB_PURE remains blocked by strike-distance (BTC ~$80k vs strike
+$80,226 = ~0.29% — way outside 0.04% gate AND outside the 0.15%
+position-align cap, so even with B1 flipped ON this window
+wouldn't qualify).
+
+Day total holds: engine +$0.53 (6 fires), manual +$3.32, net +$3.85.
+
+Pending: user flag-flip decision on B1/B3/B4.
+
+Decision: continue monitoring at 270s cadence.
+
+---
+
+## 2026-05-03 20:54 PT — quiet monitoring tick
+
+State at 20:54 PT:
+- nssm: SERVICE_RUNNING
+- BAL: $42.19 (unchanged)
+- Position: FLAT
+- Resting: 0
+- HEAD: fcf9008
+- Heartbeat: cycle 2400 @ 20:53:52
+
+Activity since 20:51:
+- Heartbeats cycling cleanly (1900 → 2400, ~34s/100)
+- Zero BB_PURE fires/signals
+- Zero ALIGNMENT-* / POSITION-ALIGN / LOSS-STREAK / FINAL-MIN
+  log lines (gates not reached)
+- Zero PROTECTIVE/RESIDUAL/OVERSELL/ORPHAN/REENTRY events
+- Zero MANUAL FILL events
+
+Window 11:45-12:00 ET ends at 21:00 PT (~6 min remaining).
+
+Day total holds: engine +$0.53 (6 fires), manual +$3.32, net +$3.85.
+Pending: user flag-flip decision.
+
+Decision: continue monitoring at 270s cadence.

@@ -879,11 +879,8 @@ BB_PURE_ALIGNMENT_FALLBACK_KELLY_MAX_FRAC   = 0.05  # absolute ceiling
 # IS relative to strike. If aligned (e.g., BTC>strike & BB picks YES),
 # allow the entry through with regime tag POSITION_ALIGNED. Captures
 # sustained-trend setups that the velocity-based classifier misses.
-# Default OFF — opt-in; flip after observing engine behavior with
-# A1/A2 alignment features active.
-BB_PURE_POSITION_ALIGN_ENABLED          = False   # opt-in; allows BB_PURE
-                                                  # to bypass strike-distance
-                                                  # block when position-aligned
+# 2026-05-03 PT 20:54 ACTIVATED per user "approved all flips" directive.
+BB_PURE_POSITION_ALIGN_ENABLED          = True    # 2026-05-03 ACTIVATED
 BB_PURE_POSITION_ALIGN_DEADBAND_USD     = 5.0     # |BTC - strike| ≤ this
                                                   # = neutral, no override
 BB_PURE_POSITION_ALIGN_MAX_DIST_PCT     = 0.0015  # only override up to 0.15%
@@ -895,7 +892,8 @@ BB_PURE_POSITION_ALIGN_MAX_DIST_PCT     = 0.0015  # only override up to 0.15%
 # multiplier for the next entry. Releases on next win or after K windows.
 # Win/loss determined by entry_cents vs current_bid at close time
 # (approximate; B2 will refine when shipped).
-BB_PURE_LOSS_STREAK_COOLDOWN_ENABLED    = False   # opt-in
+# 2026-05-03 PT 20:54 ACTIVATED per user "approved all flips" directive.
+BB_PURE_LOSS_STREAK_COOLDOWN_ENABLED    = True    # 2026-05-03 ACTIVATED
 BB_PURE_LOSS_STREAK_THRESHOLD           = 2       # tighten after N losses
 BB_PURE_LOSS_STREAK_EDGE_MULT           = 1.5     # 8pp × 1.5 = 12pp during
                                                   # cooldown
@@ -907,7 +905,8 @@ BB_PURE_LOSS_STREAK_RELEASE_WINDOWS     = 3       # auto-release after N
 # BTC trend), relax the min-time-remaining floor. Settlement-cliff
 # trades on aligned setups have near-determined outcomes and are
 # the safer subset of late-window entries.
-BB_PURE_FINAL_MIN_RELAX_ENABLED         = False   # opt-in
+# 2026-05-03 PT 20:54 ACTIVATED per user "approved all flips" directive.
+BB_PURE_FINAL_MIN_RELAX_ENABLED         = True    # 2026-05-03 ACTIVATED
 BB_PURE_FINAL_MIN_RELAX_S               = 30.0    # relaxed floor for aligned
                                                   # setups (vs 60s default)
 
