@@ -1576,6 +1576,38 @@ required BAL. So entries up to ~5ct will fire.
 Test suite: 506 passing, 2 pre-existing unrelated failures.
 Engine restart pending for activation.
 
+### 17:00-17:15 PT — third trade, validates user's "enters too early"
+
+Sequence:
+- 17:00:18 BB_PURE FIRE: YES 3x @ 48c on 26MAY032015-15
+  edge=49pp fair=97c market=48c tier=3 — high conviction
+- 17:00:42 SYNC RECLAIM (late-fill confirmed)
+- 17:07-17:08 PROTECTIVE TP/SL re-pegging at 53c-78c as bid bounced
+- 17:13 BTC at $78,459 vs strike $78,554 = $95 BELOW strike
+- 17:15 window closed
+- Settlement: NO (BTC didn't recover to strike)
+- Net: -$1.44
+
+User feedback during trade: "enters too early, needs to wait for
+reversal, indicator could be 3 cent gain on up/down contract price
+for whichever side it's trying to enter for"
+
+Validates exactly: the 49pp BB edge at entry was based on stale fair
+value — by the time we entered, BTC had already moved $30+ below
+strike. The "fair=97c" was misleading because the model was looking
+at a snapshot before BTC's continued drop.
+
+**The 3c-bounce gate would have prevented this entry**: YES contract
+hadn't gained 3c from any recent low — it was still trending DOWN
+at entry time.
+
+Today's engine-only P&L: -$0.19 + $0.42 - $1.44 = **-$1.21**.
+3 fires, 1 win 2 losses, but the win was on the cleanest signal
+(15pp + early bounce confirmation present in retrospect). The losses
+were both on entries that fired into adverse continuing moves.
+
+Next iteration ships the 3c-bounce reversal-confirmation gate.
+
 ### 14:35 PT — first post-restart fire (BB_PURE, NOT bb_momentum)
 
 State: BAL $25.19 (down $0.19), FLAT, 0 resting.
@@ -1633,3 +1665,35 @@ needs to either:
 
 Today's data on our engine's actual fire is INVALID — the trade was
 terminated by an external party, not by our protective logic.
+
+### 15:32 PT — STOP triggered: 12 stacked orphan-flatten orders
+
+User said cross-engine was closed, flipped BB_TREND_MODE_ENABLED=True
+at 15:28 PT. Engine restarted. Within 4 minutes:
+
+- 15:30:17: ORPHAN-FLATTEN: YES 4ct on -26MAY031845-45
+- 15:30:23: ORPHAN-FLATTEN: NO  1ct on same ticker (different side!)
+- 15:30:30: ORPHAN-FLATTEN: NO  2ct
+- 15:30:36: ORPHAN-FLATTEN: YES 1ct (back to YES)
+- 15:30:39+: YES 1ct flatten attempts every 3s for ~50s
+
+Position changing between YES and NO sides every 3-6 seconds.
+Our engine has no logic to do that — clear signal of external
+activity on the account.
+
+By 15:32 PT: 12 resting flatten orders stacked, 1.22 YES position
+showing. With unfilled flatten orders piling up, ANY fill cluster
+would have triggered oversell. Triggered IMMEDIATE STOP per
+"oversell / wayward pattern" decision rule.
+
+Cancellation: by the time I queried, the resting orders had
+auto-resolved (presumably the position changes from external
+activity rendered them moot). Final state: 0 resting, FLAT, BAL
+$25.07 (down $0.12 from $25.19 pre-restart).
+
+State has remained stable post-stop — BAL constant, no further
+position activity. Engine STAYS STOPPED pending user clarification:
+1. Is there really another engine still trading?
+2. Or was the position-cycling reactionary to our orphan-flatten?
+3. Either way, we cannot validate strategy alpha while another
+   actor is creating positions.
