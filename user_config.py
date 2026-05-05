@@ -2029,7 +2029,23 @@ PAPER_FVG_ENABLED                = True   # paper-shadow logging (already
                                           # was shadow-logging before; this
                                           # makes it explicit. Live wiring
                                           # comes next session.)
-PAPER_FVG_LIVE_MODE              = True   # 2026-05-05 LIVE FLIP. Validated:
+PAPER_FVG_LIVE_MODE              = False  # 2026-05-05 06:27 PT EMERGENCY DISABLE.
+                                          # Loss: $35.53 -> $28.80 (-$6.73)
+                                          # via SYNC RECLAIM bug. FVG live
+                                          # fills landed in _open_position=None
+                                          # because FVG state is in
+                                          # self._paper_fvg, not _open_position.
+                                          # SYNC RECLAIM (BB_PURE-era path)
+                                          # adopted the orphan, placed
+                                          # BB_PURE tiered TP at 16c instead
+                                          # of FVG tier_tp_price, position
+                                          # bled to bid=8c. Re-enable only
+                                          # after FVG live integrates with
+                                          # _open_position machinery (so
+                                          # SYNC RECLAIM stays out of FVG
+                                          # positions). KEEP FALSE.
+# PAPER_FVG_LIVE_MODE prior comment block (preserved for context):
+# 2026-05-05 LIVE FLIP. Validated:
                                           # 23/23 tier classification tests
                                           # pass; 10/10 live-wiring tests
                                           # pass (test_fvg_live_wiring.py);

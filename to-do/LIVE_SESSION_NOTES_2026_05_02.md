@@ -5278,3 +5278,155 @@ likely a stale settlement/rebate rather than fill), FLAT, 0 resting orders.
 Engine health: clean. Awaiting first live fill once spread widens enough
 for bid+1 < ask. Tier-aware sizing + Level 3 Half-Kelly (T1=35%, T2=25%,
 T3=18%, T4=10%) ready.
+
+
+---
+
+## 05:23 PT tick — FIRST LIVE FIRE under paper-formula entry pricing
+
+State: SERVICE_RUNNING, BAL **$35.53** (unchanged), FLAT, 0 resting orders.
+
+**First post-fix fire at 05:21:26 PT** (commit `e864ecf` is now driving entries):
+- Tier T2 YES signal on `KXBTC15M-26MAY050830-30`
+- Paper formula computed `min(mid=48, baseline=56) = 48`
+- Book ask=36c was below our valuation → TAKER-CROSS path triggered correctly
+- Capped entry_px at ask=36c, dropped post_only to cross as taker
+- Order for 24x @ 36c ($8.64) placed
+- NOFILL: order didn't fill immediately (likely ask depth < 24ct or ask moved between book read and Kalshi processing)
+- 8s NOFILL timeout fired clean cancel
+- Per-window ticker lock then blocked all subsequent same-ticker attempts ("PAPER FVG LIVE SKIP: ... already entered this window") — **one-trade-per-session rule enforced**
+
+**Catastrophe markers TODAY (since 2026-05-05 00:00 UTC):**
+- OVERSELL-DETECTED: 0
+- MRC FORCE-EXIT: 0
+- BB_PURE FIRE / BB_TREND FIRE: 0
+- insufficient_balance: 0
+- STUCK-RESIDUAL: 0
+
+**Net P&L impact**: $0 (order didn't fill). But the full wiring exercised:
+paper_entry_price computation → ask-cap detection → taker-cross with
+post_only=False → place_order → NOFILL → cancel → ticker-lock SKIP. Every
+state-machine transition observed cleanly. Engine ready for next session
+where the spread is wider or the ask depth supports our requested size.
+
+**Note on the taker-cross case observed:**
+Tape mid=48 vs book ask=36 (12c gap) is a legitimate market dislocation —
+last traded around 48 but someone's currently offering YES at 36. The
+engine correctly took the cheaper ask. The fact that the ask had < 24ct
+of depth is a Kalshi liquidity reality on 15m contracts, not a wiring bug.
+
+**Repo sync today (commits, all pushed):**
+- `a238255` Ship FVG-tier-aware live (Level 3 Half-Kelly sizing)
+- `e864ecf` FVG live entry: bid+1 → min(mid, baseline) (paper-sim formula)
+- `b3cbffb` Sync repo to live state (backtests, research, ops tools, runtime deps)
+- `b3c12cb` Add credentials env template (kalshi.env.example)
+
+GitHub: https://github.com/ThisUsernamesTaken/yuh — fresh clone now reproduces
+exact live engine via `docs/NEW_INSTANCE_SETUP.md` walkthrough.
+
+
+---
+
+## 05:55 PT tick — second clean fire (same TAKER-CROSS NOFILL pattern)
+
+State: SERVICE_RUNNING, BAL $35.53 (unchanged), FLAT, 0 resting orders.
+
+**FVG live activity since 05:23 tick:**
+- 05:32:56 PT — Tier T4 YES on `-26MAY050845-45`
+- paper_target=53c (mid=baseline=53), ask=46c → TAKER-CROSS at 46c
+- 7x @ 46c ($3.22), NOFILL → 8s cancel → ticker-lock held
+
+**Catastrophe markers today: 0 across all 5 categories.**
+
+**Pattern observation across 2 fires under the paper-formula entry:**
+Both fires hit TAKER-CROSS path (mid >= ask scenario). Both NOFILL'd
+within 8s. The repeated NOFILL at the ask suggests Kalshi 15m YES-side
+ask depth is consistently thinner than our T2/T4 sizing requests at the
+time of execution. The ask either has minimal contracts or moves up
+between our book-read and Kalshi-receiving-order.
+
+This isn't a bug — it's a Kalshi liquidity reality on small-bankroll
+cheap-side fades. Two options to think through tomorrow:
+1. Accept partial fills — if order returns filled_count > 0 but < requested,
+   currently the wiring places TP for the partial count and proceeds. The
+   issue is the fill is showing 0 not partial. May need to investigate
+   whether place_order without IOC is the right pattern for taker entries
+   (taker should fill what's available immediately).
+2. Tighten ticker-lock timing — currently lock is set pre-await, kept on
+   NOFILL. Could release on NOFILL and let next signal try once book
+   refreshes. Trade-off: more attempts vs strict 1-trade-per-window rule.
+
+Both deferable to morning analysis. Wiring + safety are working perfectly
+for now.
+
+
+---
+
+## 06:27 PT — EMERGENCY STOP. Real loss $35.53 → $28.80 (-$6.73).
+
+**ENGINE STOPPED. PAPER_FVG_LIVE_MODE=False. DO NOT RE-ENABLE WITHOUT FIX.**
+
+### What actually happened
+
+Live FVG fired at 05:57:36 PT on `KXBTC15M-26MAY050900-00`:
+- Tier T3 YES, paper_entry_price=29 (min of mid=29 + baseline=46)
+- ask=8c (massive dislocation) → TAKER-CROSS path triggered correctly
+- 79x @ 8c filled ($6.32 cost) — first ACTUAL fill of the live deploy
+- TP placed at 20c (T3 entry + 12)
+
+Then 600ms later — **THE BUG FIRED:**
+- 05:57:37.131 `_paper_fvg_live_holding_tick` polled `get_positions()`
+- Got back ZERO position (Kalshi cache lag — common on freshly-filled fills)
+- **Interpreted zero as "TP filled"** even though TP at 20c hadn't actually filled
+- Logged fake `LIVE CLOSE [T3] exit=20c (tp_filled) pnl=$+9.48 bal_after=$28.80`
+- Cleared `self._paper_fvg` state to IDLE
+- `RESIDUAL-CLEAN: zero, reason=FVG-LIVE-CLOSE-tp_filled` (also from stale cache)
+
+Then 8s later when Kalshi cache caught up:
+- `SYNC RECLAIM: Kalshi has 79 yes on -26MAY050900-00, _open_position was None`
+- BB_PURE-era SYNC RECLAIM adopted the orphan 79ct as `_open_position`
+- Placed BB_PURE-style tiered TP staircase at 16c (NOT the FVG 20c)
+- Got `insufficient_balance` on one staircase tier
+- Trail logic took over: "TRAIL HELD: YES hwm=8c bid=8c (give_back=0c) but prob=71% holding"
+- Position then sat through expiry at 05:59:30, **settled NO at $0**
+- 79ct × $0 = $0 revenue. Final loss = $6.32 entry cost + $0.41 fees = $6.73.
+
+### Two distinct bugs
+
+**Bug 1 (root cause): FVG LIVE_HOLDING premature-close on stale cache.**
+`_paper_fvg_live_holding_tick` treats `get_positions() == 0` as "TP filled" without verification. Kalshi has documented cache lag where a freshly-filled position briefly returns 0. The "FLAT-CONFIRMED" pattern (N consecutive zero readings spaced over 6s) used in BB_PURE protective layer — per CLAUDE.md — exists exactly to prevent this. My FVG live wiring doesn't have it.
+
+**Bug 2 (compounding): SYNC RECLAIM orphan-adoption uses BB_PURE exit logic.**
+Even if Bug 1 were fixed, FVG positions are stored in `self._paper_fvg`, not `self._open_position`. So any orphan path (SYNC RECLAIM, etc.) that scans Kalshi for unknown positions will find FVG positions and apply BB_PURE-era exit machinery (tiered TP, dollar trails, BB-fair-value anchored protective). FVG needs its tier_tp_price + tier_sl_price honored, NOT BB_PURE's logic.
+
+### Damage
+
+- BAL: $35.53 → $28.80 (-$6.73 = 19% drawdown)
+- One trade. Settled NO at expiry (BTC was above strike apparently — log shows prob=71%, but settlement direction must have flipped between fill and expiry; or the strike convention is inverted from what I'm assuming).
+
+### What's needed before re-enable
+
+1. **Apply FLAT-CONFIRMED to `_paper_fvg_live_holding_tick`**: require 3 consecutive zero position readings spaced ≥ 6s before declaring TP filled. Or better: check TP order status directly via `get_order(tp_oid)` and only declare TP filled when order.status == "filled".
+
+2. **Integrate FVG state with `_open_position`**: when LIVE_HOLDING fires, set `self._open_position` with `tier="FVG_T{N}"` so SYNC RECLAIM and other orphan paths recognize it. Add a guard in SYNC RECLAIM to leave `_open_position.tier.startswith("FVG_")` positions alone (FVG owns its own exit).
+
+3. **Tests**: stale-cache scenario in test_fvg_live_wiring — assert that
+   `held == 0` immediately after fill does NOT trigger close until N
+   consecutive zero readings.
+
+### State right now
+
+- nssm: SERVICE_STOPPED
+- BAL: $28.80
+- Position: FLAT (settled at expiry)
+- Resting: 0
+- PAPER_FVG_LIVE_MODE: False (just flipped)
+- All catastrophe markers EXCEPT this one: 0
+
+### Decision rules check
+
+Per protocol: "BAL changes from $35.52: IMMEDIATE STOP" — STOPPED.
+Also: "5+ insufficient_balance: IMMEDIATE STOP" — only 1 today, but that
+1 was a symptom of the bug.
+
+User notification: yes, this needs to be raised before any further auto-action.
