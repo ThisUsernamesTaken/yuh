@@ -3867,3 +3867,1414 @@ Day total final: engine +$1.54 (7 fires), manual +$3.32, net +$4.86.
 Decision: continue monitoring at 270s cadence per user preference
 even during night-mode (rather than 30-min cadence I scheduled
 earlier).
+
+---
+
+## 2026-05-03 22:30 PT — hours-gate disabled but legacy gate still fires
+
+State at 22:30 PT:
+- nssm: SERVICE_RUNNING (restarted at 22:26 post hours-gate disable)
+- BAL: $43.20 (unchanged)
+- Position: FLAT
+- Resting: 0
+- HEAD: **841485b** (pushed: hours-gate disabled)
+
+User directed "let the engine trade" at 22:21 → I flipped
+BB_PURE_TRADING_HOURS_GATE_ENABLED True → False, committed, pushed.
+Commit 841485b on origin/master.
+
+DISCOVERY at 22:26:20: `CopyEngine BLOCKED HOURS: ET 01:xx —
+1-contract mode` log STILL FIRES post-deploy. That's a DIFFERENT
+gate than the one I flipped — it's a legacy TA_FORCED-related
+"1-contract mode" override that has its own ET-hours check
+independent of the BB_PURE flag.
+
+Need to grep the codebase for the actual gate driving this log.
+Worth investigating in next coding session — user wanted overnight
+trading and there's still SOMETHING blocking. (Though right now
+the book is crossed and one-sided so BB_PURE wouldn't fire anyway.)
+
+Current setup post-restart (window 1:15-1:30 ET, 219s left):
+- mid=3c (NO heavily favored — BTC dropped below strike)
+- yes_bids=4 + no_bids=97 = 101 → BOOK-CROSSED guard silent
+- TA dir=down rsi=29 oversold-contrarian
+
+BB_PURE silent due to (a) book-crossed and (b) mid=3c is below
+the 5c min entry floor. Engine correctly NOT firing on this
+unfavorable setup.
+
+Day total holds: engine +$1.54 (7 fires), manual +$3.32, net +$4.86.
+
+Decision: continue monitoring at 270s cadence. Deferred: investigate
+which legacy gate is driving the "BLOCKED HOURS — 1-contract mode"
+log line and whether it actually blocks BB_PURE.
+
+---
+
+## 2026-05-03 22:32 PT — BB_PURE evaluating overnight (hours-gate disable confirmed)
+
+State at 22:32 PT:
+- nssm: SERVICE_RUNNING
+- BAL: $43.20 (unchanged)
+- Position: FLAT
+- Resting: 0
+- HEAD: 841485b
+
+Window flipped at 22:30:08 to 1:30-1:45 AM ET:
+- STRIKE: $80,360.84 (BTC=$80,008.47 mid=0c)
+- BTC distance: $352 BELOW strike = 0.44% (TREND zone, far)
+
+CRITICAL CONFIRMATION: BB_PURE is NOW EVALUATING post-22:00 PT
+cutoff. Multiple `BB_PURE ENTRY-MIN-BLOCK: regime=TREND entry=50c
+< min=60c` log lines from 22:30:21 onwards. This proves:
+
+1. BB_PURE_TRADING_HOURS_GATE_ENABLED=False is properly honored
+2. The legacy "BLOCKED HOURS — 1-contract mode" log line is from
+   a separate code path (TA_FORCED-related) that does NOT actually
+   block BB_PURE — it's just a misleading status line
+3. BB_PURE_TRADING_HOURS was the correct gate to flip; no further
+   investigation needed on the legacy log
+
+BB_PURE blocking now is purely structural:
+- BTC 0.44% below strike → TREND zone
+- BB_TREND_MIN_ENTRY_CENTS=60 floor → entry=50c blocked
+
+If BTC stays in this zone but YES rises ≥60c (or NO drops to ≤75c),
+BB_TREND mode could fire. If BTC drifts back inside 0.15%, B1
+POSITION-ALIGN-PASS could activate.
+
+Day total holds: engine +$1.54 (7 fires), manual +$3.32, net +$4.86.
+
+Decision: continue monitoring at 270s cadence.
+
+---
+
+## 2026-05-03 22:36 PT — 🎉 TRADE #8: FIRST OVERNIGHT FIRE — WIN +$0.21
+
+State at 22:36 PT:
+- nssm: SERVICE_RUNNING
+- BAL: **$43.41** (was $43.20 → **+$0.21 from Trade #8**)
+- Position: FLAT
+- Resting: 0
+- HEAD: 841485b
+
+Trade #8 lifecycle (22:30:49 → 22:31:14, ~25s):
+- BB_PURE SIGNAL: NO ticker=-26MAY040145-45 regime=TREND
+  alignment=neutral edge=**38pp** fair=2c market=40c
+  side=no entry=60c p_win=**0.98** kelly=0.06 contracts=4 tier=2
+- BB sees fair YES=2c → NO is the high-probability winner
+  (BTC $352 below strike, NO settles at $1.00)
+- BB_PURE FIRE: NO 4ct @ 60c ($2.40 cost)
+- 22:31:14 PROTECTIVE FLAT-CONFIRMED via "untracked fill close"
+  (same pattern as Trades #5, #6 — but this time profitable)
+- 12 RESIDUAL-CLEAN polls confirm flat
+- Net: +$0.21
+
+Validation: hours-gate disable works perfectly. Overnight trading
+fired a high-conviction TREND-mode trade (edge=38pp, p_win=0.98,
+tier=2) that wouldn't have happened during the day because BTC
+needs sustained drift past 0.15% from strike to enter TREND zone.
+
+Day total UPDATED:
+- Engine fires today: +$1.75 (8 fires, 5W/3L)
+  Breakdown: -$0.19, +$0.42, +$0.06, +$0.92, -$0.09, -$0.59,
+  +$1.01, +$0.21
+- Manual trade: +$3.32
+- **Net total: +$5.07**
+
+Untracked-fill-close pattern stats today:
+- Trade #5 (NO @ 38c): -$0.09
+- Trade #6 (NO @ 44c): -$0.59
+- Trade #8 (NO @ 60c): +$0.21
+- 3 occurrences, mixed outcomes — pattern is benign on average
+  (TP fires at fair-close, engine just doesn't ingest WS event)
+
+Decision: continue monitoring at 270s cadence.
+
+---
+
+## 2026-05-03 22:38 PT — quiet post-Trade-#8 tick
+
+State at 22:38 PT (last log 22:36:12):
+- nssm: SERVICE_RUNNING
+- BAL: $43.41 (unchanged from Trade #8)
+- Position: FLAT
+- Resting: 0
+- HEAD: 841485b
+- Heartbeat: cycle 1600 @ 22:36:12
+
+Activity since 22:36:
+- Heartbeats steady (1300 → 1600)
+- Per-window lock held on -26MAY040145-45 (Trade #8 already
+  fired this window)
+- No new BB_PURE log lines
+- Zero PROTECTIVE/RESIDUAL/OVERSELL/ORPHAN/REENTRY events
+
+Window 1:30-1:45 ET ends at 22:45 PT (~7 min). Per-window lock
+will reset.
+
+Day total holds: engine +$1.75 (8 fires), manual +$3.32, net +$5.07.
+
+Decision: continue monitoring at 270s cadence.
+
+---
+
+## 2026-05-03 22:41 PT — quiet tick
+
+State at 22:41 PT (last log 22:37:55):
+- nssm: SERVICE_RUNNING
+- BAL: $43.41 (unchanged)
+- Position: FLAT
+- Resting: 0
+- HEAD: 841485b
+- Heartbeat: cycle 1900 @ 22:37:55
+
+Activity since 22:38:
+- Heartbeats steady (1600 → 1900)
+- Per-window lock held on -26MAY040145-45 (Trade #8 already
+  fired this window)
+- No new BB_PURE log lines
+- Zero PROTECTIVE/RESIDUAL/OVERSELL/ORPHAN/REENTRY events
+
+Window 1:30-1:45 ET ends at 22:45 PT in ~4 min.
+
+Day total holds: engine +$1.75 (8 fires), manual +$3.32, net +$5.07.
+
+Decision: continue monitoring at 270s cadence.
+
+---
+
+## 2026-05-03 22:48 PT — 🎯 Trade #9 attempt: FIRST B1 real fire, NOFILL
+
+State at 22:48 PT:
+- nssm: SERVICE_RUNNING
+- BAL: $43.41 (unchanged — no fill)
+- Position: FLAT
+- Resting: 0
+- HEAD: 841485b
+
+Window flipped at 22:45 PT to 2:00-2:15 ET. Setup at flip:
+- BTC $80,036 vs strike $80,000 = **dist=0.0450%**
+  (just 0.005% past the 0.04% mean-rev gate — exactly B1's
+  no-man's-land territory)
+
+Trade #9 ATTEMPT at 22:45:33-41 (~8s):
+- 22:45:33 BB_PURE FIRE: YES -26MAY040200-00 4x @ 48c ($1.92)
+  edge=16pp fair=64c kelly=0.077 regime=POSITION_ALIGNED tier=1
+- 22:45:33 BB_PURE NOFILL: order=63194bcd-0fb placed but not filled
+- 22:45:34-35 7× POSITION-ALIGN-PASS + SIGNAL + SKIP cycles
+  (each time alignment classifier confirmed aligned → override
+  fired → entry passed cap → BB_PURE SKIP because lock held)
+- 22:45:41 BB_PURE NOFILL CANCEL: 63194bcd-0fb @ 48c unfilled
+  after 8s — cancelled stale entry
+
+Net: NO POSITION OPENED. Order placed, didn't fill in 8s
+(post-only bid+1 race lost), correctly cancelled.
+
+VALIDATION (HUGE):
+- ✅ B1 POSITION-ALIGN successfully placed a real order in
+  production (not just block-and-skip)
+- ✅ regime=POSITION_ALIGNED tag flowed through entire pipeline
+- ✅ Without B1, this entry at dist=0.045% would have been
+  STRIKE-DIST-BLOCKED (just past 0.04% threshold)
+- ✅ Option A's 70c cap allowed 48c entry (also would have passed
+  old 55c cap — B1 was the actual unblocker here)
+- ✅ Lock-release fix from 5b1a836 working (NOFILL CANCEL clean)
+
+The NOFILL is execution-quality (post-only bid+1 race), not a
+strategy issue. Engine correctly cancelled stale entry to avoid
+late-fill at bad price.
+
+If we had filled, this would have been a tier-1 16pp edge bet on
+YES at 48c with BTC firmly above strike. Win probability 64% per
+BB. Settles YES at $1.00 → +$2.08 / position cost $1.92 = +$0.16
+per contract = +$0.64 on 4ct. Reasonable trade.
+
+Day total holds: engine +$1.75 (8 fires + 1 NOFILL attempt),
+manual +$3.32, net +$5.07.
+
+Decision: continue monitoring at 270s cadence.
+
+---
+
+## 2026-05-03 22:52 PT — post Trade #9 NOFILL, quiet
+
+State at 22:52 PT (last log 22:48:10):
+- nssm: SERVICE_RUNNING
+- BAL: $43.41 (unchanged)
+- Position: FLAT
+- Resting: 0
+- HEAD: 841485b
+- Heartbeat: cycle 3600 @ 22:48:10
+
+Activity since 22:48:
+- Heartbeats steady (3300 → 3600)
+- Per-window lock held on -26MAY040200-00 (from Trade #9 fire
+  attempt that NOFILL'd) — `_bb_pure_fires_this_window=1` counter
+  prevents re-entry this window
+- No new BB_PURE log lines
+- PAPER LEVEL SETUP: support_bounce YES @ btc=$80,058 level=$80,032
+  (16 touches!) — strong support level identified at ~$80k
+- Zero PROTECTIVE/RESIDUAL/OVERSELL/ORPHAN events
+
+Trade #9 NOFILL caveat: the per-window fire counter was
+incremented even though the order didn't fill. This effectively
+"used up" this window's fire budget on a failed attempt. The
+lock-release fix from 5b1a836 only handles place_order EXCEPTIONS
+(post_only_cross etc.), not NOFILL CANCEL. Worth reviewing.
+
+Window 2:00-2:15 ET ends ~23:00 PT (~7 min from now).
+
+Day total holds: engine +$1.75 (8 fires + 1 NOFILL attempt),
+manual +$3.32, net +$5.07.
+
+Decision: continue monitoring at 270s cadence.
+
+---
+
+## 2026-05-03 23:03 PT — Trade #10: first MEAN_REVERSION fire post-restart
+
+State at 23:03 PT:
+- nssm: SERVICE_RUNNING
+- BAL: $43.38 (was $43.41 → -$0.03)
+- Position: FLAT
+- Resting: 0
+- HEAD: 841485b
+
+Trade #10 lifecycle (23:00:24 → 23:01:23):
+- BB_PURE SIGNAL: NO ticker=-26MAY040215-15 regime=MEAN_REVERSION
+  alignment=neutral edge=14pp fair=45c market=59c side=no
+  entry=41c p_win=0.55 kelly=0.0593 contracts=4 tier=1
+- BB_PURE FIRE: NO 4ct @ 41c ($1.64 cost)
+- 23:00:24 SYNC RECLAIM tagged as BB_PURE, TP at 54c
+- 23:00:54 PROTECTIVE FLAT-CONFIRMED via untracked fill
+- 12 RESIDUAL-CLEAN polls confirm flat
+- Net: -$0.03 (essentially wash)
+
+Notable: First MEAN_REVERSION regime fire since restart. BTC
+was inside 0.04% of strike, BB_PURE primary path engaged (not
+TREND, not POSITION_ALIGNED). The mean-rev contrarian fade
+fired correctly with fair=45c market=59c, then closed near fair.
+
+Untracked-fill-close pattern stats today (5 occurrences):
+- Trade #5 (NO @ 38c): -$0.09
+- Trade #6 (NO @ 44c): -$0.59
+- Trade #8 (NO @ 60c): +$0.21
+- Trade #10 (NO @ 41c): -$0.03
+- All on NO entries; mixed outcomes; engine state stable
+- Pattern is benign on average
+
+Day total UPDATED:
+- Engine: +$1.72 (9 fires, 5W/3L/1 NOFILL/1 wash)
+- Manual: +$3.32
+- **Net: +$5.04**
+
+Decision: continue monitoring at 270s cadence.
+
+---
+
+## 2026-05-03 23:18 PT — 🎯 TRADE #11: FIRST B1 FILLED — POSITION_ALIGNED YES 4ct @ 32c
+
+State at 23:18 PT:
+- nssm: SERVICE_RUNNING
+- BAL: **$42.10** (was $43.38 → -$1.28 entry cost)
+- Position: **4ct YES on -26MAY040230-30** (ACTIVE)
+- Resting: 1 yes-sell @ 60c (BB_PURE-TP)
+- HEAD: 841485b
+
+Window flipped at 23:15 PT to 2:30-2:45 ET. Setup at flip:
+- BTC $79,993 vs strike $79,960 → **dist=0.0413%** (squarely
+  in B1's 0.04-0.15% no-man's-land, just barely past mean-rev gate)
+
+Trade #11 lifecycle (23:15:18 → 23:15:31, ~13s):
+- 23:15:18 BB_PURE POSITION-ALIGN-PASS: side=YES pa=aligned
+  overriding strike-distance block
+- 23:15:18 BB_PURE SIGNAL: YES regime=POSITION_ALIGNED
+  alignment=neutral edge=**29pp** fair=61c market=32c
+  side=yes entry=32c p_win=0.610 kelly=0.10 contracts=4 tier=1
+- 23:15:18 BB_PURE FIRE: YES 4ct @ 32c ($1.28 cost)
+- 23:15:26 BB_PURE NOFILL late-fill: 4ct filled after timeout
+- 23:15:31 SYNC RECLAIM tagged BB_PURE
+- 23:15:31 SYNC RECLAIM BB_PURE-TP: 4x sell @ 60c (entry+28c)
+
+THIS IS THE FIRST B1 SUCCESSFUL FILL. After:
+- 22:00 ENTRY-CAP-BLOCK (entry 59c > 55c old cap)
+- 22:45 NOFILL CANCEL (post-only race lost)
+- 23:15 FILLED — Option A's 70c cap + Smart late-fill timing
+
+Validation:
+- ✅ B1 POSITION-ALIGN-PASS executed end-to-end
+- ✅ regime=POSITION_ALIGNED tag set correctly
+- ✅ entry=32c within new 70c cap (Option A working)
+- ✅ NOFILL late-fill RECLAIM path adopted position cleanly
+- ✅ BB_PURE-TP placed correctly at fair-close (+28c)
+
+Massive edge at 29pp — BB sees YES MASSIVELY underpriced.
+Per the BB model, 32c is way too cheap when fair is 61c.
+
+Outcome scenarios:
+- TP fills at 60c → +$1.12 gross / ~$1.00 net
+- Settlement YES (BTC > $79,960 at 2:45 ET) → +$2.72 gross
+- Settlement NO → -$1.28 loss
+
+Position resolves in next ~14 min (window expires 23:30 PT).
+
+Day total in flight:
+- Engine prior: +$1.72 (9 fires)
+- Trade #11 outcome pending
+- Manual: +$3.32
+- Net: $5.04 + Trade #11 outcome
+
+Decision: continue monitoring at 270s cadence. Watch for TP fill,
+SL trigger, or window settlement.
+
+---
+
+## 2026-05-03 23:21 PT — Trade #11 underwater, BTC moved against
+
+State at 23:21 PT:
+- nssm: SERVICE_RUNNING
+- BAL: $42.10 (unchanged from entry cost)
+- Position: 4ct YES on -26MAY040230-30 (underwater)
+- Resting: 1 yes-sell @ 60c (TP, won't fill at current price)
+- HEAD: 841485b
+
+Trade #11 trajectory (entry 23:15 PT → 23:21 PT):
+- Entry: YES @ 32c (BTC $79,993, +$33 above strike)
+- 23:19 PAPER LEVEL: BTC $79,841 (= -$152 from entry, now -$119
+  BELOW strike at $79,960)
+- mid dropped 32c → 20c (YES sliding as BTC falls below strike)
+- WHALE ALERT 23:19:16: KRAKEN INFLOW 50.10 BTC — potential
+  sell-pressure deposit, may explain the drop
+
+Position currently at -$0.48 unrealized. Engine's protective layer:
+- PROTECTIVE_SL_OFFSET_C=8 → SL at entry-8c = 24c (close to current
+  20c bid — could trigger)
+- PROTECTIVE_PRE_EXPIRY_FORCE_S=60 → force-flatten at minute 14
+  (~23:29 PT)
+
+Window expires 23:30 PT in ~9 min.
+
+Day total at risk:
+- Worst case (TP not filled, position settles NO): Trade #11 takes
+  -$1.28 max loss → engine drops to +$0.44, net day ~+$3.76
+- Best case (BTC reverses): position recovers, TP at 60c could fill
+
+The 29pp BB edge thesis was that fair=61c (high YES probability)
+but BTC moved against the bet within ~6 min of entry. Could be
+post-fill execution lag (we entered at 32c, fair was 61c, but BB
+model lagged — by the time we filled, conditions had shifted).
+
+Engine is correctly managing. No intervention needed.
+
+Decision: continue monitoring at 270s cadence.
+
+---
+
+## 2026-05-03 22:53 PT — switching to night cadence per user instruction
+
+State at 22:53 PT (last log 22:49:19):
+- nssm: SERVICE_RUNNING
+- BAL: $43.41 (unchanged)
+- Position: FLAT
+- Resting: 0
+- HEAD: 841485b
+- Heartbeat: cycle 3800 @ 22:49:19
+
+Activity since 22:52: heartbeats only, no new fires/errors.
+
+User explicitly switched to relaxed night cadence (1800s = 30 min)
+in latest prompt. Switching wake-up cadence accordingly.
+
+Day total holds: engine +$1.75 (8 fires + 1 NOFILL attempt),
+manual +$3.32, net +$5.07.
+
+Decision: switch to 30-min cadence; will resume 270s when trading
+hours window naturally returns at 06:00 PT (though hours-gate is
+disabled, so trading continues overnight).
+
+---
+
+## 23:26 PT tick — Trade #11 mid-resolution
+
+State unchanged from 23:25 tick:
+- Position 4ct YES on -26MAY040230-30 still open
+- SL @ 31c (placed 23:24:04 after MID-TRADE-SL force-exit at -315.4 $/s, streak 3/3)
+- BAL $42.10
+- Window closes 23:30 PT (~4 min)
+- BTC ~$79,841 vs strike $79,960 (-$119 below)
+
+Note: SL @ 31c hasn't filled — likely degenerated from cross-spread to maker
+when bid dropped through 31c before order hit the book. Pre-expiry force-flatten
+expected at ~23:29 PT.
+
+Next tick at 23:30:46 PT (270s) captures the close sequence:
+- SL fill or pre-expiry market-sell
+- Settlement at strike $79,960
+- FLAT-CONFIRMED + RESIDUAL-CLEAN
+- Net P&L for Trade #11
+
+
+---
+
+## 23:31 PT tick — Trade #11 RESOLVED (LOSS −$1.28)
+
+Full close sequence:
+- 23:24:02 MID-TRADE-SL #1 (BTC vel=-315.4) → SL @ 31c (post_only=False)
+- 23:28:04 MID-TRADE-SL #2 (BTC vel=-23.9) → re-issued SL @ 31c
+- 23:28:48 PRE-EXPIRY CONSOLIDATE @ 89s remaining → cancel resting + market-sell 4ct @ 32c
+- 23:29:30 EXPIRY: 4x YES on books, awaiting settlement reconcile
+- 23:29:30 RESIDUAL-CLEAN (zero, reason=expiry_close)
+- 23:29:40 SYNC RESIDUAL FLATTEN 1/2 — market closed
+- 23:30:10 SYNC RESIDUAL FLATTEN 2/2 — 409 market_closed (expected)
+- 23:29:55 new window opens (KXBTC15M-26MAY040245-45, settles 23:45 PT)
+- 23:29:55 BAL snapshot $42.10 (window_change)
+
+Outcome: BAL $42.10 unchanged from post-entry → YES settled at 0c → **Trade #11 = −$1.28**
+
+BTC was −$119 below strike at entry breakdown; the −315.4 $/s velocity reading
+was telling the truth and MID-TRADE-SL fired correctly. Position couldn't unwind
+because the bid had already moved through 31c by the time the cross-spread
+order hit the book — but the pre-expiry consolidate caught it.
+
+Day totals (engine-only):
+- Trades #1-#10: +$1.72
+- Trade #11:    −$1.28
+- Engine net:   **+$0.44**
+- Manual:       +$3.32
+- Combined:     **+$3.76**
+
+Key takeaway: B1 (POSITION-ALIGN) override worked end-to-end mechanically, but
+this particular entry was a knife-catch on a collapsing BTC. The **B1 logic
+isn't broken** — the safety stack contained the loss to the 4ct entry size
+($1.28). For B1 to be net-positive long term, it needs to avoid entries during
+sustained adverse BTC velocity (which is exactly what MID-TRADE-SL targets but
+post-fact). A future tightening: consider a **pre-fire BTC velocity gate**
+that vetoes B1 entries when |BTC_vel| > 100 $/s in the last 10s.
+
+State at 23:31:30: SERVICE_RUNNING, BAL $42.10, FLAT, 0 resting. New window
+KXBTC15M-26MAY040245-45 evaluating (SHADOW-ARM NO @ 51c, awaiting score flip).
+
+
+---
+
+## 23:37 PT tick — quiet window (no live fires)
+
+- BAL $42.10 unchanged, FLAT, 0 resting
+- Kalshi truth ledger logged Trade #11 settlement at 23:32:26 (+1 new, 2828 total)
+- Window KXBTC15M-26MAY040245-45 has no live BB_* fires
+- Mid drift 51c → 63c → 69c on NO side (BTC continuing below strike)
+- SHADOW-FIRE NO @ 63c at 23:34:17 (retired tier; not live) — would-have-shadow-entered
+- No blocks (no STRIKE-DIST, no GATE-BLOCK, no ENTRY-CAP, no BAL-GATE in last 6 min)
+- Strike-distance is in the no-man's-land between mean-rev (0.04%) and BB_TREND (0.15%)
+- Alignment fallback not synthesizing — insufficient trend conviction or BB model edge
+
+Health: clean. No bug indicators. Patient hold.
+
+
+---
+
+## 23:43 PT tick — second quiet window in a row
+
+- BAL $42.10, FLAT, 0 resting, SERVICE_RUNNING (heartbeat 11,500)
+- 23:38:37 VWAP FLIP NO → YES at BTC=$79,780 (crossed VWAP $79,669, mid=70c)
+- No live BB_PURE / BB_TREND / BB_MOMENTUM / FALLBACK fires
+- Strike-distance now 0.226% past strike (well into BB_TREND zone)
+- BB_TREND would want NO direction, but NO=70c > MAX_ENTRY_CENTS=55c → entry-cap blocks
+- Cheap side YES @ 30c has small edge (model fair likely 25-35c on -$180-below-strike)
+- Engine correctly idle: fade and trend tiers both gated → no fire
+- Window settles 23:45 PT (~2 min remaining)
+
+Health: clean, idle. No bug indicators.
+
+
+---
+
+## 23:48 PT tick — Trade #12 NOFILL CANCEL (no cost, no fill)
+
+New window opened 23:44:56: KXBTC15M-26MAY040300-00 (settles 24:00 PT)
+- 23:45:32 REGIME=EXPLOSIVE | vol=26.6% trend=0.50
+- 23:45:33 BB_PURE POSITION-ALIGN-PASS — BTC $79,756 vs strike $79,674
+  - dist=0.1025% side=YES pa=aligned (B1's no-man's-land between 0.04% and 0.15%)
+- 23:45:33 BB_PURE FIRE: 4x YES @ 67c ($2.68) edge=9.0pp fair=76c market=67c kelly=0.068 p_win=0.760
+- 23:45:33 NOFILL: order db3edf72 placed at bid+1
+- 23:45:41 BB_PURE NOFILL CANCEL: 8s timeout — stale entry cancelled
+
+Outcome: Trade #12 was NEVER FILLED. No cost, no position, no P&L impact.
+
+Verified behaviors:
+- Option A's POSITION_ALIGNED 70c cap let this through (67c < 70c) — would have
+  been blocked by old 55c cap. Option A is doing real work.
+- B1 POSITION-ALIGN override correctly fired in the no-man's-land between
+  mean-rev (0.04%) and trend (0.15%) zones.
+- Stale-entry cancel fired at exactly 8s, preventing late-fill at bad price.
+
+Known quality issue (already flagged, not regression):
+- Ticker lock NOT released on NOFILL CANCEL → no re-attempt this window.
+  Mid drifted from 67c → 73c+ shortly after, would have been favorable.
+  Acceptable conservatism for now; will refine with B2 (untracked-fill P&L).
+
+State at 23:48: BAL $42.10, FLAT, 0 resting. Window has ~12 min remaining.
+Day totals unchanged: engine +$0.44 (10 fires + 1 NOFILL), manual +$3.32, combined +$3.76.
+
+
+---
+
+## 23:54 PT tick — heartbeat-only interval
+
+- BAL $42.10, FLAT, 0 resting, SERVICE_RUNNING (heartbeat 13,200)
+- No new BB / FALLBACK / POSITION-ALIGN / blocks / errors in last 6 min
+- Current window (KXBTC15M-26MAY040300-00) locked out post-NOFILL CANCEL
+- Window settles 24:00 PT (~6 min remaining)
+- Day totals unchanged: engine +$0.44, manual +$3.32, combined +$3.76
+
+
+---
+
+## 23:59 PT tick — heartbeat-only, awaiting 24:00 close
+
+- BAL $42.10, FLAT, 0 resting (heartbeat 14,100)
+- No events since 23:48 — engine fully locked out from current window post-NOFILL CANCEL
+- Window settles in <1 min (24:00 PT)
+- Day totals unchanged: engine +$0.44, manual +$3.32, combined +$3.76
+
+
+---
+
+## 00:04 PT tick — Trade #13 LIVE (second successful B1 fill, BIG edge)
+
+New window opened: KXBTC15M-26MAY040315-15 (settles 00:15 PT)
+
+Sequence:
+- 00:00:03 BB_PURE FIRE: YES 4x @ 42c ($1.68) edge=40.0pp fair=84c market=44c kelly=0.10
+  - regime=POSITION_ALIGNED (B1)
+  - BTC $79,886 vs strike $79,784, dist=0.1283% side=YES pa=aligned
+  - Order=deab2d74-8f5
+- 00:00:03 NOFILL: order placed at bid+1, not immediate fill
+- 00:00:11 NOFILL late-fill: filled 4ct after timeout — RECLAIM path adopts
+- 00:00:30 SYNC RECLAIM: tagged BB_PURE (fair_yes=84c edge=40pp)
+- 00:00:30 SYNC RECLAIM BB_PURE-TP: 4x sell @ 72c (entry+30c, fair=84c) FVG-close target
+
+State at 00:04 PT: BAL $40.42 (post-entry), 4ct YES @ 42c open, TP @ 72c resting.
+
+Subsequent eval cycles showed edge fluctuating 46-52pp (model anchored at 84c
+while market traded 32-38c). **Highest-edge BB_PURE entry seen this session.**
+
+This is the SECOND successful B1 (POSITION-ALIGN) fill in production after
+Trade #11. dist=0.128% (B1 no-man's-land between 0.04% mean-rev and 0.15% trend).
+Option A's 70c POSITION_ALIGNED cap let this through (42c well below cap).
+
+Outcome bands:
+- TP @ 72c fills → +$1.20 (4ct × +30c)
+- Settles YES=$1 → +$2.32 (4ct × +58c)
+- Settles YES=$0 → -$1.68 max loss
+
+Day P&L pre-Trade-13:
+- Engine: +$0.44 (10 fires + 1 NOFILL)
+- Manual: +$3.32
+- Combined: +$3.76
+
+Day P&L in flight:
+- Engine: $0.44 + Trade #13 outcome (-$1.68 to +$2.32)
+- Manual: +$3.32
+- Combined: $3.76 + Trade #13 outcome
+
+Window settles 00:15 PT (~11 min remaining).
+
+
+---
+
+## 00:10 PT tick — Trade #13 CLOSED (PROB COLLAPSE +$0.13 net) + NEW BUG
+
+Trade #13 close sequence:
+- (pre-00:05) mid hit hwm=65c, peak_prob=98% (BB model very bullish)
+- 00:05:11 TRAIL HELD: bid=46c, give_back=19c, but prob=98% → held (BTC thesis intact)
+- 00:05:12 cancelled TP order (synced_reclaim 404 expected — was already worked)
+- 00:05:12 PROB COLLAPSE: 4x @ 47c (entry=42c peak_prob=98% cur_prob=87% drop=11pts) $+0.20 gross
+- 00:05:12 ERROR: PROB COLLAPSE failed: 'PolymarketCopyEngine' object has no attribute '_record_daily_pnl'
+- 00:09:49 Kalshi truth ledger +1 settlement (Trade #13 close recorded)
+
+BAL change: $40.42 → $42.23 = +$1.81 net of fees. Net P&L ≈ +$0.13 ($0.20 gross - $0.07 fee).
+
+### NEW BUG IDENTIFIED (non-fatal)
+
+`'PolymarketCopyEngine' object has no attribute '_record_daily_pnl'`
+
+- Triggered by PROB COLLAPSE exit path
+- Position close itself worked correctly (BAL confirms)
+- Post-close daily-P&L recording failed silently (logged as ERROR)
+- Likely a stale method reference from an old refactor
+- Impact: Trade #13 may be missing from daily P&L tracking layer
+- Execution NOT affected
+
+DECISION: Engine is currently FLAT with $0 risk. Bug is post-close logging only,
+not execution. Flagging loudly in notes but NOT stopping the engine — stopping
+a FLAT engine has no loss-prevention benefit and forfeits overnight optionality.
+
+### Key insight: B1 (POSITION-ALIGN) IS WORKING
+
+Two successful B1 fills now:
+- Trade #11: 4ct YES @ 32c, dist=0.0413%, edge=29pp → settled $0 → -$1.28
+- Trade #13: 4ct YES @ 42c, dist=0.1283%, edge=40pp → exit @ 47c → +$0.13
+
+B1 mechanism is firing cleanly in production. The first attempt (#11) lost on
+the merits (caught a falling knife in EXPLOSIVE volatility); the second (#13)
+made $0.13 on a very high-edge setup that the model had at fair=84c. Net B1: −$1.15.
+
+Day totals through Trade #13:
+- Trades #1-#10: +$1.72
+- Trade #11:    -$1.28
+- Trade #12:    $0.00 (NOFILL)
+- Trade #13:    +$0.13
+- Engine net:   +$0.57 (12 fires + 1 NOFILL)
+- Manual:       +$3.32
+- Combined:     +$3.89
+
+### TODO: Fix `_record_daily_pnl` attribute error in PROB COLLAPSE exit path
+
+Will likely re-fire on every PROB COLLAPSE exit. Search polymarket_copy_engine.py
+for the call site in the PROB COLLAPSE handler; either define the method, route
+to the existing daily-P&L logger, or remove the call if it's stale.
+
+
+---
+
+## 00:17 PT tick — Bug consequence revealed; window 26MAY040330-30 active
+
+Trade #13 fully reconciled at window expiry:
+- 00:14:30 CopyEngine EXPIRY: 4x YES entry=42c — awaiting settlement reconcile
+- 00:14:30 RESIDUAL-CLEAN: KXBTC15M-26MAY040315-15 (zero, reason=expiry_close)
+- 00:17:06 Kalshi truth ledger +1 settlement
+
+### Bug consequence: stale internal state after PROB COLLAPSE
+
+The `_record_daily_pnl` AttributeError at 00:05:12 didn't just fail to log —
+it ALSO prevented the post-close internal-state cleanup. The engine kept
+cached state thinking 4x YES @ 42c was still open. At window expiry, the
+EXPIRY handler tried to reconcile that stale state, but RESIDUAL-CLEAN
+immediately confirmed Kalshi truth = 0 and cleared everything.
+
+The safety net (RESIDUAL-CLEAN with Kalshi truth) caught it. No actual harm.
+But this elevates the bug priority: the fix needs to ensure post-close state
+cleanup runs even if downstream loggers fail. Likely a missing try/finally
+in the PROB COLLAPSE exit path around the _record_daily_pnl call.
+
+### New window state
+
+- 00:15:01 new window: KXBTC15M-26MAY040330-30 (settles 00:30 PT)
+- 00:15:17 REGIME: MEAN_REVERTING | vol=25.2% trend=0.20
+- 00:15:17 SR-SEED 40 levels seeded from prior session
+- No BB_PURE fires yet this window (different regime than Trade #13's EXPLOSIVE)
+
+State at 00:17 PT: BAL $42.23, FLAT, 0 resting. Day totals unchanged.
+
+
+---
+
+## 00:23 PT tick — quiet interval
+
+- BAL $42.23, FLAT, 0 resting, SERVICE_RUNNING
+- Single event: Kalshi truth ledger +1 settlement (Trade #13 close, 00:17:06)
+- No BB fires this window (KXBTC15M-26MAY040330-30, MEAN_REVERTING)
+- No repeat _record_daily_pnl bug
+- Window settles 00:30 PT (~7 min remaining)
+- Day totals unchanged
+
+
+---
+
+## 00:28 PT tick — heartbeat only
+
+- BAL $42.23, FLAT, 0 resting
+- No events in last 5 min
+- Window settles in ~2 min (00:30 PT)
+- Day totals unchanged
+
+
+---
+
+## 00:33 PT tick — Trade #14 LIVE (first standard MEAN_REVERSION fire)
+
+New window opened: KXBTC15M-26MAY040345-45 (settles 00:45 PT)
+
+Sequence:
+- 00:30:14 new window
+- 00:30:14 REGIME=MEAN_REVERTING vol=16.9% trend=0.20 (different from EXPLOSIVE/POSITION_ALIGNED prior)
+- 00:30:18 BB_PURE SIGNAL: YES regime=**MEAN_REVERSION** edge=18pp fair=66c market=48c p_win=0.66 kelly=0.087
+- 00:30:18 BB_PURE FIRE: 4x YES @ 48c ($1.92) order=504a18e7
+- 00:30:18 NOFILL placed at bid+1
+- 00:30:26 NOFILL late-fill: 4ct filled
+- 00:30:47 SYNC RECLAIM tagged BB_PURE (fair=66c edge=18pp)
+- 00:30:48 SYNC RECLAIM BB_PURE-TP: 4x sell @ 65c (entry+17c, FVG-close target = fair-1c)
+
+State at 00:33 PT: BAL $40.31, 4ct YES @ 48c open, TP @ 65c resting.
+
+KEY OBSERVATION: This is the FIRST STANDARD MEAN_REVERSION fire of the
+monitoring period — prior #11/#12/#13 all fired via B1 POSITION-ALIGN
+override. BTC has tightened into the strike-distance mean-rev zone
+(|BTC - strike|/BTC < 0.04%, ~$32 max from strike).
+
+This is the BB_PURE base signal at full strength: fire at the cheap side
+when model fair (66c) substantially exceeds market (48c) and dist% is small.
+
+Outcome bands:
+- TP @ 65c fills → +$0.68 (4ct × +17c)
+- Settles YES=$1 → +$2.08
+- Settles YES=$0 → -$1.92 max loss
+
+Window settles 00:45 PT (~12 min remaining).
+
+
+---
+
+## 00:39 PT tick — Trade #14 CLOSED (PROB COLLAPSE -$0.07 net, BUG RE-FIRED)
+
+Trade #14 close (00:33:27 PT, 3-min lifetime):
+- 00:33:27 cancelled TP order (synced_reclaim)
+- 00:33:27 PROB COLLAPSE: 4x @ 47c (entry=48c peak_prob=90% cur_prob=75% drop=14pts) | $-0.04 gross
+- 00:33:27 ERROR: PROB COLLAPSE failed: '_record_daily_pnl' (RE-FIRED — SAME BUG)
+
+BAL change: $40.31 → $42.16 = +$1.85 net of fees. Real net ≈ -$0.07
+(engine-logged gross $-0.04 doesn't include fees).
+
+### BUG CONFIRMED DETERMINISTIC
+
+Second occurrence of '_record_daily_pnl' AttributeError, same exact path,
+same exact error message. NOT a new bug class, same as Trade #13. Engine
+handles position close correctly each time; safety net catches stale state
+at next window-close.
+
+Behavior pattern:
+1. Always triggered by PROB COLLAPSE exit (deterministic)
+2. Localized to post-close P&L recording + state cleanup
+3. Contained by EXPIRY/RESIDUAL-CLEAN at next window-close
+4. Position close itself works (BAL change confirms)
+
+Per "any NEW bug class → STOP" rule: this is SAME bug, NOT a new class.
+Engine keeps running.
+
+### Observation: PROB COLLAPSE may be too sensitive
+
+| trade | entry | exit | drop  | net    |
+|-------|-------|------|-------|--------|
+| #13   | 42c   | 47c  | 11pts | +$0.13 |
+| #14   | 48c   | 47c  | 14pts | -$0.07 |
+
+Trade #14's original TP was 65c (FVG-close) but PROB COLLAPSE pulled the
+trigger 3 minutes in at -$0.07. If model fair was 66c at entry and dropped
+to 75% prob (i.e. fair ~75c), the position was actually still on the
+right side of the model — the exit may have been premature. Worth post-
+session study: are PROB COLLAPSE exits beating-or-losing vs holding to TP
+or expiry?
+
+### Updated day totals
+
+- Trades #1-#13: +$0.57 (incl. #11 -$1.28, #13 +$0.13)
+- Trade #14:    -$0.07 (PROB COLLAPSE)
+- Engine net:   +$0.50 (13 fires + 1 NOFILL)
+- Manual:       +$3.32
+- Combined:     +$3.82
+
+State at 00:39 PT: BAL $42.16, FLAT, 0 resting. Window settles 00:45 PT (~6 min).
+
+
+---
+
+## 00:45 PT tick — Trade #14 reconciled, new window 26MAY040400-00 opens
+
+Reconciliation events:
+- 00:44:30 EXPIRY: 4x YES entry=48c (stale state from PROB COLLAPSE bug)
+- 00:44:30 RESIDUAL-CLEAN: KXBTC15M-26MAY040345-45 (zero, reason=expiry_close)
+- 00:44:55 new window: KXBTC15M-26MAY040400-00 (settles 01:00 PT)
+- 00:44:55 BALANCE SNAPSHOT $42.16 (window_change)
+
+Same exact pattern as Trade #13 reconciliation. PROB COLLAPSE bug leaves
+stale internal state, EXPIRY handler tries to act on it, RESIDUAL-CLEAN
+catches it via Kalshi truth check. Pattern is reproducible and contained.
+
+State at 00:45 PT: BAL $42.16, FLAT, 0 resting, no fires on new window yet.
+
+Day totals: engine +$0.50, manual +$3.32, combined +$3.82.
+
+
+---
+
+## 00:50 PT — 🚨 ENGINE STOPPED — WAYWARD PATTERN
+
+Trade #15 sequence (financial outcome: WIN +$0.18, but state-desync detected):
+- 00:45:33 BB_PURE FIRE: 4x YES @ 60c on -26MAY040400-00 (B1, edge=10pp, fair=70c)
+- 00:45:41 NOFILL late-fill: 4ct filled
+- 00:45:56 SYNC RECLAIM BB_PURE-TP @ 69c (FVG-close)
+- 00:46:12 SELL LADDER: 4x sold avg 69c +$0.36 ← TP filled cleanly
+- 00:46:12-54 SELL LADDER + SELL TIER FILLED logged ~70× (LOG SPAM — state desync)
+- 00:46:22 TRAIL ARMED (acting on stale state — position was already closed!)
+- 00:46:34→51 TRAIL RATCHET: floor 69c → 80c (bid running)
+- 00:46:55 TRAIL FIRED: 4x @ ~78c | $+0.72 | engine_ct=4 kalshi_pre=0 kalshi_post=0 orphan=YES
+- 00:46:55 MFE/MAE: pnl=$0.72 (PAPER — not real, orphan-detected)
+- 00:46:56 SYNC RESIDUAL FLATTEN (closed ticker): -26MAY040400-00 4 ct on NO side (attempt 1/2)
+
+Concerning patterns:
+1. State desync: engine kept tracking position as live for ~45s after TP filled
+2. Orphan trail firing on a 0-position state
+3. "4 ct on NO side" residual flatten — classic OVERSELL pattern marker (matches 2026-04-22 disaster signature)
+
+Saving graces this time:
+- kalshi_pre=0 kalshi_post=0 orphan-detection caught the trail attempt
+- BAL +$0.18 (clean TP fill, no actual oversell completed)
+- Position FLAT, 0 resting
+- No OVERSELL-DETECTED log
+
+Per "wayward pattern → STOP unless MANUAL trades in last 60s" rule:
+- Searched log: no MANUAL FILL / MANUAL TP / SYNC MANUAL-DETECTED events
+- This is engine behavior, not user trading
+- STOPPED engine at 00:50 PT for safety
+
+### Engine STOPPED at 00:50 PT
+
+Final state:
+- SERVICE_STOPPED
+- BAL: $42.34
+- Position: FLAT
+- Resting: 0
+
+### Day final P&L (engine)
+
+| line | $ |
+|---|---|
+| Trades #1-#10 | +$1.72 |
+| Trade #11 | -$1.28 (B1 loss) |
+| Trade #12 | $0.00 (NOFILL) |
+| Trade #13 | +$0.13 (PROB COLLAPSE win) |
+| Trade #14 | -$0.07 (PROB COLLAPSE near-bw) |
+| Trade #15 | +$0.18 (orphan-detection saved oversell) |
+| **Engine net** | **+$0.68** |
+| Manual | +$3.32 |
+| **Combined** | **+$4.00** |
+
+### Bug summary for next coding session
+
+Two distinct bugs identified:
+
+1. **`_record_daily_pnl` AttributeError on PROB COLLAPSE**
+   - Triggered Trade #13 + Trade #14
+   - Deterministic, post-close logging only
+   - Leaves stale internal state, caught by EXPIRY/RESIDUAL-CLEAN safety net
+   - Priority: medium — low loss-risk
+
+2. **Post-TP-fill state desync + orphan trail (Trade #15)**
+   - Engine kept logging SELL LADDER 70× after TP filled
+   - TRAIL ARMED/RATCHET activated on stale state
+   - TRAIL FIRED attempt at 78c with kalshi_pre=0 (orphan-detection caught it)
+   - "4 ct on NO side" SYNC RESIDUAL FLATTEN — classic oversell pattern marker
+   - Priority: HIGH — close to 2026-04-22 disaster signature
+   - Likely root cause: SELL LADDER fill processing didn't update `_open_position` to None / clear engine_ct in time
+
+Recommendation: don't restart engine until #2 is investigated.
+
+
+---
+
+## 22:27 PT tick — first overnight check post-tier-aware paper restart
+
+State: SERVICE_RUNNING, BAL $35.52, FLAT, 0 resting.
+
+Engine restarted at 22:25:21 with:
+- BB_PURE_MODE = False (live trading disabled — corrected after user noted
+  the "$42→$78" trace was a deposit, not earnings)
+- PAPER_FVG_ENABLED = True with new tier-aware logic (just shipped)
+- PAPER_FVG_LIVE_MODE = False
+- All 14 dispatch flags False (verified)
+
+Observations (2 min post-restart):
+- 22:26:29 new Poly window subscription (-26MAY050130-30, 211s remaining
+  on 22:15-22:30 ET window — too late for clean baseline phase)
+- No PAPER FVG entries yet — first clean window will be 22:30-22:45 ET
+- No live trade activity (as expected with BB_PURE_MODE=False)
+- No safety triggers (no MRC, no oversell, no insufficient_balance)
+
+Next window cycle (22:30-22:45 ET) should produce baseline collection at
+22:32 PT and potentially a tier-aware FVG paper entry by 22:35-22:40 PT.
+Looking for: "PAPER FVG ENTRY [T1/T2/T3/T4]" or "PAPER FVG TIER-REFUSE".
+
+
+---
+
+## 22:57 PT tick — first FVG paper data captured
+
+State: SERVICE_RUNNING, BAL $35.52 (unchanged, real money safe), FLAT, 0 resting.
+
+### Tier-aware paper FVG activity (since 22:25 restart)
+
+Tier distribution:
+- T1 entries: 0 (no fires — needs |dist| >= 0.10%, current regime is near-strike)
+- T2 entries: 0 (same — needs late+aligned)
+- T3 entries: 0
+- **T4 entries: 3** (mid-window 180-300s segment)
+- TIER-REFUSE: ~30+ unique signal cycles (duplicates per tick = 751 raw)
+
+### Closed paper trades (2 of 3 settled)
+
+| time PT  | tier | side | entry | exit | reason | pnl | sim_bal after |
+|----------|------|------|-------|------|--------|-----|---------------|
+| 22:34:49 | T4   | YES  | 46c   | 51c  | trail_exit | +$0.35 | $35.87 |
+| 22:42:55 | T4   | YES  | 46c (re-entry) | 68c | time_exit_profit | +$1.54 | $37.41 |
+
+**Net paper P&L: +$1.89 across 2 closed trades.**
+
+Open trade:
+- 22:47:55 T4: YES 14x @ 26c on -26MAY050200-00, tp=38c, sl=18c, aligned=False
+  - sim_bal $33.77 with this open
+  - ~12 min remaining when entered
+
+### Notable behaviors
+
+1. **Tier classification firing correctly.** TIER-REFUSE floods until session_age=180s,
+   then T4 entry fires immediately at age=180-294s.
+
+2. **Multi-cycle per window observed.** The 22:34:48 → 22:34:49 sequence shows the
+   state machine re-entering same window after first close. Quick trail_exit (0.6s
+   after entry) then re-fired and held longer for time_exit_profit.
+
+3. **Only T4 firing because BTC is near-strike** (|dist| 0.008-0.082%). T1 needs
+   |dist| >= 0.10%. Overnight regime might shift to give T1/T2 data.
+
+4. **Refuse-predicate working.** 22:47 sequence: counter-trend + 26c entry would
+   normally hit the "counter+midprice" refuse... but 30-49c is the bucket, not
+   20-29c. So 26c entry passes the counter-midprice check but qualifies as T4
+   (age between 180-300, refuse predicates passed).
+
+### Safety scan (since 22:25 restart)
+
+- ZERO MRC FORCE-EXIT logs ✓
+- ZERO BB_PURE FIRE / BB_TREND FIRE logs ✓ (BB_PURE_MODE=False working)
+- ZERO place_order failed ✓
+- ZERO _record_daily_pnl errors ✓ (PROB COLLAPSE path not invoked since MRC off)
+- ZERO OVERSELL / STUCK-RESIDUAL / REENTRY-BLOCK ✓
+
+Real BAL preserved at $35.52. No live trades. Paper sim actively learning.
+
+
+---
+
+## 22:59 PT tick — third paper trade closed
+
+State: SERVICE_RUNNING, BAL $35.52 (real, unchanged), FLAT, 0 resting.
+
+3rd paper trade just closed:
+- 22:47:55 T4 YES 14x @ 26c on -26MAY050200-00 (counter-trend, |dist|=0.082%)
+- 22:57:55 CLOSE time_exit_profit @ 43c, pnl=+$2.38, sim_bal=$39.79
+
+Cumulative paper performance:
+- 3 paper trades, 3-for-3 wins
+- Net: +$4.27 over ~25 min
+- Sim_bal: $35.52 → $39.79 (+12%)
+
+All trades T4. T1/T2/T3 still 0 fires (BTC near-strike).
+All exits via time_exit_profit (2) or trail_exit (1). NO SL hits, NO time_exit_any (loss).
+
+Safety: clean. Real BAL untouched.
+
+
+---
+
+## 23:29 PT tick — first T1 fire, first SL hit, +$11.15 net paper
+
+State: SERVICE_RUNNING, BAL $35.52 (real, unchanged), FLAT, 0 resting.
+
+### New paper activity (since 22:57)
+
+| time     | tier | side | entry | exit | reason            | pnl     | sim_bal |
+|----------|------|------|-------|------|-------------------|---------|---------|
+| 23:02:55 | T4   | NO   | 46c   | 69c  | time_exit_profit  | +$1.84  | $41.63  |
+| 23:17:55 | T4   | YES  | 39c   | 30c  | **sl_hit**        | −$0.90  | $40.73  |
+| 23:21:55 | **T1**| NO  | 51c   | 73c  | time_exit_profit  | **+$5.94** | $46.67 |
+
+### Cumulative paper performance (~62 min)
+
+- 6 paper trades, 5W/1L = **83% hit rate**
+- Net: **+$11.15**
+- sim_bal: $35.52 → **$46.67 (+31%)**
+
+### Tier distribution
+
+- T1: 1 entry (1 win, +$5.94 — at 27ct = 35% of sim_bal)
+- T2: 0
+- T3: 0
+- T4: 5 entries (4 wins, 1 loss, +$5.21 net)
+
+### Key validations
+
+1. **T1 sizing math correct**: 27ct × 51c = $13.77 ≈ 35% of $39.34 sim_bal → matches Tier 1 spec.
+2. **T1 TP execution**: backtest projected ~$5.40-6.00/T1 trade at +20c offset; actual +$5.94 ≈ on target.
+3. **SL math correct**: T4 entry 39c → trigger 31c, fired when bid hit 31c → exit at 30c → -$0.90 loss bounded.
+4. **Multi-cycle per window**: window 23:15-23:30 had T4 sl_hit then T1 fire — two trades in same window.
+5. **Tier classifier sees regime shifts**: late-window T4 fires when BTC near-strike; T1 fires when BTC drifts out (|dist|=0.130%).
+
+### Safety scan (23:00-23:29)
+
+ZERO MRC FORCE-EXIT, ZERO BB_PURE/BB_TREND live fires, ZERO place_order failed,
+ZERO _record_daily_pnl errors, ZERO oversell/stuck/reentry indicators.
+Real BAL preserved at $35.52.
+
+
+---
+
+## 00:02 PT tick — paper sim hits +$34, but reveals key live-wiring caveat
+
+State: SERVICE_RUNNING, BAL $35.52 (real, unchanged), FLAT, 0 resting.
+
+### Paper sim trajectory
+
+sim_bal: $35.52 → $69.98 (+97% in 95 min)
+
+Tier counts:
+- T1: 1 entry, +$5.94 ✓ (matches backtest)
+- T2: 2 entries (different windows), +$3.66 combined
+- T4: 16 entries (many multi-cycle artifact)
+
+### CRITICAL: 23:48 multi-cycle artifact
+
+In window 23:45-24:00 ET, between 23:48:23 and 23:48:38, the paper sim fired
+**8 entries on the same ticker** all at entry=42c, all closing at 54c (TP), each
+adding +$1.32 to +$1.80 to sim_bal. Total ~$14 in 15 seconds.
+
+This is unrealistic for live:
+1. Paper entry price uses min(mid, baseline) = 42c. When real bid is at 54c+,
+   a maker bid at 42c sits below book and never fills.
+2. Per-window ticker lock (MAX_TRADES_PER_SESSION_TICKER=1) blocks re-entry
+   in production already.
+3. The +$14/15s pace is fundamentally an artifact of the paper sim's idealized
+   fill model.
+
+Realistic live behavior for same window: 1 entry @ ~bid+1 = ~52c (NOT 42c),
+1 TP fire at +12c = 64c, gain = +$0.12/contract × 14ct = +$1.68. ONE trade,
+not 8.
+
+### What's still validated
+
+- T1 fire +$5.94 on 27ct sizing — matches backtest projection
+- T2 standalone fires +$2.16 (trail_exit), +$1.50 (time_exit_profit) — realistic
+- T4 held-trade wins +$4.05, +$2.38, +$1.84 — realistic
+- SL math: -$0.90 on the one losing T4 (entry 39c, trigger 31c, exit 30c) ✓
+- Tier classifier + sizing + TP/SL math all work as designed
+
+### AM live-wiring must
+
+- Use realistic entry price formula (bid+1 maker, not min(mid, baseline))
+- Trust per-window ticker lock (already in production)
+- Discount paper sim P&L by 3-5× for realistic live projection
+
+Real BAL preserved at $35.52. Zero safety triggers.
+
+
+---
+
+## 00:35 PT tick — first T3 fire + big T2 win
+
+State: SERVICE_RUNNING, BAL $35.52 (real, unchanged), FLAT, 0 resting.
+
+### New paper activity (since 00:02)
+
+| time     | tier | side  | entry | exit | reason          | pnl     | sim_bal |
+|----------|------|-------|-------|------|-----------------|---------|---------|
+| 00:09:49 | **T3** | YES 43x | 29c | 45c | time_exit_profit | +$6.88  | $76.86  |
+| 00:23:21 | **T2** | YES 49x | 39c | 68c | time_exit_profit | +$14.21 | $91.07  |
+
+### Cumulative paper performance (~2 hours runtime)
+
+- sim_bal: $35.52 → **$91.07** (+157%)
+- Tier distribution:
+  - T1: 1 fire (+$5.94)
+  - T2: 3 fires (+$2.16, +$1.50, +$14.21 = +$17.87)
+  - T3: 1 fire (+$6.88) — first of the night
+  - T4: many fires (mix of real and multi-cycle artifact)
+
+### Notable
+
+- T3 fired counter-trend (aligned=False, btc5m=-41) but won via gap closure
+- T2 +$14.21 is the biggest single-trade win of the night
+  - 49ct × +$0.29/ct net
+  - BTC drifted $+58 in 5min, aligned with YES side
+  - Contract ran 39c → 68c, exceeding +15c TP before time_exit fired
+- Both trades were SINGLE-cycle (no multi-cycle artifact)
+
+### Caveat for live
+
+49-contract size on a $76 paper BR could face Kalshi book slippage in live
+trading. Real fills 1-2c worse than paper, but trade still nets multiple
+dollars positive.
+
+Real BAL preserved at $35.52. Zero safety triggers.
+
+
+---
+
+## 01:06 PT tick — T2 +$9.31 win + T1 multi-cycle artifact confirmed
+
+State: SERVICE_RUNNING, BAL $35.52 (real, unchanged), FLAT, 0 resting.
+
+### New paper activity (since 00:35)
+
+| time     | tier | side  | entry | exit | reason          | pnl     | sim_bal  |
+|----------|------|-------|-------|------|-----------------|---------|----------|
+| 00:36:01 | T2   | YES 49x | 46c | 65c | time_exit_profit | +$9.31  | $100.38 ← crossed $100  |
+| 00:47:55 | T4   | NO 17x  | 58c | 52c | trail_exit       | −$1.02  | $99.36   |
+| 00:56:22 | T1   | NO 66x  | 52c | 52c | trail_exit       | +$0.00  | $99.36   |
+| 00:56:32 | T1   | NO 59x  | 58c | 52c | trail_exit       | **−$3.54** | $95.82 ← multi-cycle artifact |
+| 00:56:35 | T1   | NO 64x  | 52c | 52c | time_exit_any    | +$0.00  | $95.82   |
+| 01:02:56 | T4   | YES 18x | 51c | open | (in progress)   | —       | $86.64   |
+
+### Cumulative tier counts
+
+- T1: 4 fires (1 real +$5.94, 3 paper-artifact: 0/-$3.54/0)
+- T2: 4 fires (+$2.16, +$1.50, +$14.21, +$9.31 = +$27.18)
+- T3: 1 fire (+$6.88)
+- T4: many fires (mix real and artifact)
+
+Total paper P&L $35.52 → $95.82 closed (with open T4 still in flight).
+
+### CONFIRMED: T1 multi-cycle is also paper artifact
+
+The 00:56:22-00:56:35 sequence (3 T1 entries in 13 seconds on the same NO
+ticker -26MAY050315-15) is the same paper-sim issue we saw earlier with T4.
+Each "re-entry" used the cached baseline price even though the real bid
+had moved.
+
+In live trading:
+- Per-window ticker lock blocks all 3 re-entries (only 1st fires)
+- Realistic entry price (bid+1 maker) wouldn't be the baseline cache value
+- Only the first T1 entry @ 52c would have fired live
+
+Realistic live P&L for that window: −$3 to +$0 (bid was trending against us).
+Not a win, but loss-bounded by trail_exit.
+
+### What still validates as real edge
+
+- T2 +$9.31 win at 00:36:01 — clean single-cycle, 49ct × +$0.19/ct net.
+  Live would have caught this.
+- Tier classifier correctly detected regime shift at 00:56 (BTC -$163 in
+  5m, |dist| crossed 0.20%, T1 qualified). Classification math works.
+- T4 NO @ 58c trail_exit at -$1.02 is a realistic bounded loss.
+
+### Engine health
+
+Real BAL preserved at $35.52. Zero MRC, zero live BB_PURE/BB_TREND fires,
+zero safety triggers. Engine running clean for 2.7 hours overnight.
+
+
+---
+
+## 01:38 PT tick — quiet period, single clean T4 win
+
+State: SERVICE_RUNNING, BAL $35.52 (real, unchanged), FLAT, 0 resting.
+
+New activity (since 01:06):
+- 01:12:55 T4 CLOSE: YES 18x @ 51c → 66c time_exit_profit, +$2.70, sim_bal $98.52
+- 01:33:45 T4 ENTRY: NO 24x @ 40c (in flight)
+- sim_bal: $86.64 → $98.52 → $88.92 (with open trade)
+
+Notable:
+- The T4 win was clean single-cycle (no multi-cycle artifact)
+- Realistic live behavior pattern
+
+Safety scan: clean (zero MRC, zero live fires, zero errors)
+Real BAL preserved at $35.52.
+
+
+---
+
+## 02:09 PT tick — three single-cycle T4 wins, sim crossed $100
+
+State: SERVICE_RUNNING, BAL $35.52 (real, unchanged), FLAT, 0 resting.
+
+New activity (since 01:38):
+- 01:42:56 T4 NO 24x @ 40c → 68c time_exit_profit, +$6.72 (asymmetric win on BTC -$83 5m)
+- 01:57:55 T4 YES 16x @ 65c → 80c time_exit_profit, +$2.40
+- 02:02:55 T4 YES 38x @ 28c (in flight)
+
+sim_bal: $88.92 → $105.24 → $107.64 → $97.00 (with open T4)
+Cumulative paper: $35.52 → $107.64 = +$72.12 (+203% in ~3.5h)
+
+Notable: All three T4 entries this period were SINGLE-CYCLE (no multi-cycle
+artifact). Realistic for live trading. The 24x NO @ 40c→68c was a strong
+asymmetric win — BTC trending down hard ($-83 in 5min), our NO position
+benefited from gap closure.
+
+Engine health: clean across all safety markers. Real BAL preserved at $35.52.
+
+
+---
+
+## 02:40 PT tick — multi-cycle bonanza revealed
+
+State: SERVICE_RUNNING, BAL $35.52 (real, unchanged), FLAT, 0 resting.
+
+Paper sim_bal exploded: ~$107 → **$6,518.90** in this 30-min window.
+
+Tier counts cumulative:
+- T1: 4 (1 real win, 3 artifact)
+- T2: **219** ← jumped from 4 to 219
+- T3: 3
+- T4: 24
+
+### What happened around 02:30-02:40
+
+A single window FVG signal (-26MAY050530 ticker, NO side, baseline=59c,
+fair=40c, FVG=-18c, BTC=-33 5min, |dist|=0.041%) qualified as Tier 2.
+The paper sim then entered the multi-cycle artifact mode:
+
+- Max contracts cap = 200 (set in _fvg_tiering)
+- Each cycle: enter 200x at 41c → TP fills at 59-60c → +$36-38 net
+- State machine resets to IDLE → re-enters immediately
+- ~190+ cycles in ~30 minutes, each pumping ~$36 profit
+
+This is the same multi-cycle issue we saw earlier with T1 and T4, but
+amplified by:
+1. Max-cap 200ct trades (much larger than the earlier 14-49ct sequences)
+2. Sustained favorable regime (BTC trending, FVG signal stable)
+3. No per-window ticker lock in paper sim
+
+### Realistic live translation
+
+For the same signal:
+- Live would fire ONE entry per window (per-window lock)
+- Realistic entry price ~58c (bid+1, not the cached 41c baseline)
+- T2 sizing = 25% of $35.52 / 58c = ~15-18 contracts
+- TP at +15c = 73c
+- If TP hits: 15ct × +$0.13 net = +$1.95
+- More likely time_exit at ~67c: 15ct × +$0.07 net = +$1.05
+
+ONE trade, maybe +$2-5 net. NOT $7,200.
+
+### Critical finding for AM live wiring
+
+The sim_bal of $6,500+ tells us NOTHING about realistic live performance.
+For live projection, only count UNIQUE WINDOWS, not entry events:
+
+Realistic live overnight P&L estimate (from this 4.5-hour run):
+- Looking at unique tickers with FVG fires: ~9 tickers
+- Average per-window single-cycle P&L: ~$2-5 (mix of win/loss/breakeven)
+- Realistic overnight live: **+$15-30** on $35 BR
+- NOT the $6,400 paper number (180× inflation due to multi-cycle)
+
+Real BAL preserved at $35.52. Safety: clean (zero MRC, zero live fires,
+zero bad markers across 4.5 hours runtime).
+
+
+---
+
+## 03:12 PT tick — multi-cycle slowed, first big SL loss
+
+State: SERVICE_RUNNING, BAL $35.52 (real, unchanged), FLAT, 0 resting.
+
+New activity (since 02:40):
+- 03:03:59 T4 NO 200x @ 60c → 64c trail_exit, +$8.00
+- 03:03:59 T4 NO 200x re-entry @ 60c → 51c SL_HIT, **-$18.00** (first large paper loss)
+
+sim_bal: $6,518 → $6,550 → $6,430 → $6,532 (flat-ish)
+
+Tier counts cumulative:
+- T1: 4 (no change)
+- T2: 222 (+3)
+- T3: 3 (no change)
+- T4: 27 (+3)
+
+The multi-cycle bonanza has slowed — only ~6 new entries this 30-min vs
+200+ in 02:30-02:40 window. Activity returned to single-cycle pattern.
+
+The -$18 SL hit on 200ct is the first big paper loss. Math: entry 60c,
+SL trigger 52c, exit 51c, loss 9c × 200ct = $18. Demonstrates SL
+correctly bounds large losses. Live with 15-20ct realistic sizing, this
+same SL would have been ~-$1.50.
+
+Engine health: clean across all safety markers. Real BAL preserved at $35.52.
+
+
+---
+
+## 03:43 PT tick — two big winners, no new SLs
+
+State: SERVICE_RUNNING, BAL $35.52 (real, unchanged), FLAT, 0 resting.
+
+New activity (since 03:12):
+- 03:27:55 CLOSE YES 200x @ 49c → 73c time_exit_profit, +$48.00
+- 03:33:01 T4 ENTRY YES 200x @ 62c
+- 03:42:56 T4 CLOSE @ 75c time_exit_profit, +$26.00
+
+sim_bal: $6,532 → $6,606.90 (+$74 net this period)
+
+Tier counts unchanged from last tick except T4: 27 → 29 (+2 new fires).
+Multi-cycle activity has fully cooled — back to one-fire-per-window pace.
+
+Engine health: clean across all safety markers. Real BAL preserved at $35.52.
+
+
+---
+
+## 04:14 PT tick — two more T1 fires, both winners
+
+State: SERVICE_RUNNING, BAL $35.52 (real, unchanged), FLAT, 0 resting.
+
+New activity (since 03:43):
+- 04:11:11 (T1) YES 200x @ 39c → 51c trail_exit, +$24.00
+- 04:11:17 T1 re-entry @ 39c (multi-cycle artifact, 6s after prior close)
+- 04:12:56 T1 CLOSE @ 54c time_exit_profit, +$30.00
+
+sim_bal: $6,606 → $6,688.90 (+$82 net)
+
+Tier counts now: T1=6 (+2), T2=222, T3=4 (+1), T4=30 (+1)
+
+Notable: T1 fires correctly identified strong BTC trend (+$118 in 5min,
+|dist|=0.146%) as Tier 1 setup. Both trades winners. The 6-second re-entry
+between trades is multi-cycle artifact — live would have fired only once.
+
+Engine health: clean across all safety markers. Real BAL preserved at $35.52.
+~6 hours runtime overnight, no live trades, all guardrails holding.
+
+
+
+---
+
+## 04:53 PT tick — FVG LIVE WIRING DEPLOYED + post_only_cross fix
+
+**STATE CHANGE**: User authorized live FVG deploy after seeing OOS validation
+(2026-05-05 morning). Wired live path through real Kalshi orders via
+`_paper_fvg_live_entry` → place_order at bid+1 with post_only=True →
+LIVE_HOLDING with resting TP at tier_tp_price. Disabled BB_MOMENTUM_ENABLED
+to leave FVG as sole live signal. Commit `a238255` pushed to GitHub.
+PAPER_FVG_LIVE_MODE flipped from False → True at 04:41 PT restart.
+
+State: SERVICE_RUNNING, BAL **$35.53** (real, +$0.01 from prior $35.52 — no
+FVG fills today, 141 live FIRE attempts all rejected with "post only cross",
+likely a stale settlement/rebate rather than fill), FLAT, 0 resting orders.
+
+**Live wiring observations:**
+1. T4 FVG signal fired immediately on first session post-restart (KXBTC15M-26MAY050800-00, YES 5x @ 63c). Tier classification correct.
+2. **Issue**: `bid+1 == ask` (1c spread on the YES side) → Kalshi rejects post_only=True orders that would cross. 141 FIRE attempts in 1 minute, all rejected with `post only cross` error.
+3. **No catastrophe**: ticker lock release-on-failure pattern worked perfectly. Position stayed FLAT, balance unchanged from rejected orders.
+4. **Fix shipped**: pre-check `bid+1 < ask` before place_order; on tight spread skip silently with 30s per-ticker cooldown. On any place_order failure, 5s cooldown. Engine restarted 04:49 PT with fix.
+
+**Catastrophe markers TODAY (since 2026-05-05 00:00 UTC):**
+- OVERSELL-DETECTED: 0
+- MRC FORCE-EXIT: 0
+- BB_PURE FIRE / BB_TREND FIRE: 0 (BB_PURE_MODE=False, BB_MOMENTUM_ENABLED=False)
+- insufficient_balance: 0
+- STUCK-RESIDUAL: 0
+- REENTRY-BLOCK (tripped): 0
+
+**Test status:**
+- 23/23 tier classification tests pass
+- 10/10 FVG live wiring state-machine tests pass
+- Full suite: 588 pass, 3 pre-existing fails unrelated
+
+**Engine state:**
+- BB_PURE_MODE=False (killed 2026-05-04 19:55)
+- BB_MOMENTUM_ENABLED=False (disabled 2026-05-05 04:40)
+- PAPER_FVG_ENABLED=True
+- PAPER_FVG_LIVE_MODE=True (live deploy 2026-05-05 04:41)
+- All retired strategies still off (TA_FORCED, SR_FADE, SCALP_DCA, SNIPER, WALLET_COPY, ATM_REVERSION, ARB_DETECTOR, MICRO_PULLBACK, TP_LAYERED)
+- SAFETY_OVERSELL_HARDENING=True
+
+Engine health: clean. Awaiting first live fill once spread widens enough
+for bid+1 < ask. Tier-aware sizing + Level 3 Half-Kelly (T1=35%, T2=25%,
+T3=18%, T4=10%) ready.

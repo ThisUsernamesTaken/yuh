@@ -3895,3 +3895,678 @@ This subsumes some of today's pain:
   validation.
 
 ---
+
+## 2026-05-04 — ContractMomentumAnalyzer (MRC) wired LIVE
+
+### What shipped
+Implemented and wired the per-fill momentum/reversion/covariance analyzer
+described in `RESEARCH_MOMENTUM_REVERSION_COVARIANCE.md`. The research doc
+prescribed a shadow-mode validation phase before going live; user explicitly
+requested LIVE deployment, so all subsystems are on by default. Implementation
+follows §4 + §9 of the research doc.
+
+### Files created
+- `contract_momentum.py` (new, ~280 lines): self-contained module with
+  `ContractMomentumAnalyzer` class. Stdlib only. All update logic is wrapped
+  in try/except so a broken analyzer cannot raise into the engine.
+
+### Files modified
+- `polymarket_copy_engine.py`:
+  - Top-of-file: `from contract_momentum import ContractMomentumAnalyzer`
+    behind a guarded import (`_MRC_AVAILABLE` flag).
+  - `_execute_bb_pure_signal` (~10389): instantiate analyzer with `side` on
+    fill and stash on `_open_position["_momentum_analyzer"]`.
+  - `_manage_position` (~18540): feed the analyzer with the current YES mid
+    and `seconds_left` every poll, before any exit decisions. Logs one
+    `MRC <ticker> ...` INFO line per cycle once warm.
+  - `_manage_position` (~18555): call new `_mrc_check_force_exit(pos)` before
+    `_maintain_protective_order`. Force-exit is profit-only (bid >= entry+2c).
+  - `_maintain_protective_order` (~15348): scale the BB_PURE TP premium by
+    `recommended_tp_multiplier` once analyzer is warm. Floor at +2c above
+    entry to avoid sub-fee scaling.
+  - New helper `_mrc_check_force_exit` (~15748): cancels resting TP and
+    cross-spread sells via `_place_capped_side_sell` (so OVERSELL-GUARD
+    + position-zero gate still apply).
+- `user_config.py` (bottom): new MRC config block.
+
+### Config (LIVE)
+```
+MRC_ENABLED                  = True   # master switch
+MRC_TP_MODULATION            = True   # scale TP by multiplier
+MRC_FORCE_EXIT               = True   # honor should_force_exit
+MRC_MIN_OBSERVATIONS         = 30     # warmup threshold
+MRC_TP_PREMIUM_FLOOR_C       = 2      # floor on scaled premium
+MRC_FORCE_EXIT_MIN_PROFIT_C  = 2      # only force-exit when in profit
+```
+
+### What to monitor in `data/engine.log`
+- `MRC <ticker> side=... mid=Nc cms=±X.XX cri=X.XX mrc=±X.XX path=... scr=X.XX
+  tp_mult=X.XX force_exit=...` — one INFO line per poll while a position is
+  open and the analyzer is warm. Confirms the analyzer is running.
+- `MRC TP-ADJUST: ... entry=Nc premium=Nc × X.XX → Nc (mrc=±X.XX path=...)` —
+  INFO when the multiplier actually changes the TP target.
+- `MRC FORCE-EXIT: ... %dct entry=Nc bid=Nc sell@Nc path=... mrc=±X.XX scr=X.XX`
+  — WARNING when force-exit triggers a cross-spread sell.
+
+### Expected behavior
+- First 30 polls of any new fill (~90s at 3s polls): analyzer is cold, neutral
+  outputs (multiplier=1.0, force_exit=False). Engine behaves exactly as
+  before during this window.
+- After warmup: TP target may shift ±30% relative to legacy BB_PURE math
+  (floored at entry+2c). Force-exit fires on adverse path signatures
+  (M_TOP for YES, W_BOTTOM for NO, plus adverse staircase / V-shape).
+
+### Concerning behavior — flip kill-switch if seen
+- `MRC FORCE-EXIT` firing more than 1×/window or at a loss → set
+  `MRC_FORCE_EXIT = False`.
+- `MRC TP-ADJUST` flipping multiplier multiple times per cycle (churn) →
+  set `MRC_TP_MODULATION = False`.
+- Any unexpected `MRC ... error: ...` DEBUG/WARNING line → analyzer is
+  fail-softing; investigate but do not panic.
+- Engine cycle time stretches noticeably above 1s sustained → set
+  `MRC_ENABLED = False` and analyze.
+
+### Kill switch
+Edit `user_config.py`: `MRC_ENABLED = False` and restart the service. The
+analyzer is purely additive — disabling it returns the engine to its
+pre-2026-05-04 behavior with zero state cleanup needed.
+
+### Restart record
+- `nssm restart BTCBiasEngine` — clean restart 2026-05-04 07:32 PT.
+- Service status: `SERVICE_RUNNING`.
+- No errors, tracebacks, or MRC-related warnings in the first ~60s of log.
+- BAL at restart: $76.84. Position: FLAT. Session-lock restored from disk
+  for KXBTC15M-26MAY041045-45 (108s old).
+
+### Validation deferred (per research doc §7)
+The research doc specifies a 200-fill / 7-day shadow phase plus PnL-uplift
+acceptance criteria before going live. User opted to skip shadow and go
+LIVE. If results disappoint, follow §7 retroactively: pull `data/trades.db`
+correlated with the in-cycle MRC log lines to compute hypothetical
+PnL-with-vs-without per subsystem, then disable individual flags as needed.
+
+---
+
+## 2026-05-04 08:43 PT — Claude — MRC sub-15-min micro-timeframes added
+
+### Context
+User confirmed MRC was already integrated (62 refs in engine, _MRC_AVAILABLE
+gate, per-fill analyzer, TP-ADJUST + FORCE-EXIT log lines, MRC FEED in the
+maintenance loop). Service was running but hadn't fired yet today
+(DOMINANT-SKIP scanner activity only — no fills, no MRC log emission).
+User asked for two explicit micro-timeframe windows on top of the
+existing CMS/CRI/MRC stack to capture sub-15-min signals.
+
+### What was added in `contract_momentum.py`
+
+Two rolling buffers fed off the same per-poll observations as the macro
+buffer:
+- **5s window** (`MICRO_5S_LEN=2`, `MICRO_5S_NORM_C=0.5`): last 2 obs ≈
+  5–6s. `micro_momentum_5s` = (last-first) / 0.5c, clamped ±1.
+- **25s window** (`MICRO_25S_LEN=8`, `MICRO_25S_NORM_C=2.0`,
+  `MICRO_25S_REV_NORM_C=1.5`): last 8 obs ≈ 24s. `micro_momentum_25s` =
+  net move / 2c, clamped ±1. `micro_reversion_25s` = stdev of mids / 1.5c,
+  clamped 0..1.
+
+**Cross-timeframe signal** (`micro_alignment`, ±1):
+- Either reading inside `MICRO_DEAD_ZONE` (0.05) → 0.0 (neutral).
+- Same sign → `+(m5+m25)/2` clamped → continuation likely.
+- Opposite sign → `-(|m5|+|m25|)/2` clamped → divergence / reversion likely.
+
+**TP modulation (layered ON TOP of base recommend, then clamped):**
+- `align > +0.5` → TP × 1.20 (widen — strong continuation).
+- `align < -0.5` → TP × 0.75 (tighten — reversion warning).
+- Else → unchanged. Final clamp `[TP_MULT_FLOOR=0.7, TP_MULT_CEIL=1.3]`
+  absorbs combinations that would overshoot.
+
+**Early-reversion force-exit:**
+- `side=yes`: `m25 > +0.30` AND `m5 < -0.20` → force_exit (5s flipped
+  while 25s still trending up favorably).
+- `side=no`: `m25 < -0.30` AND `m5 > +0.20` → force_exit.
+- Engine still gates by `MRC_FORCE_EXIT_MIN_PROFIT_C` (default 2c) so we
+  never bail at a loss.
+
+Activation gate: micro layer only kicks in once the macro analyzer is
+warm (`obs_count >= MIN_OBS=30`) AND the 25s window has ≥4 obs. The
+analyzer's existing fail-soft `try/except` in `update()` still wraps
+everything.
+
+### Engine log enrichment
+Both `MRC TP-ADJUST` (line ~15390) and `MRC FORCE-EXIT` (line ~15797) log
+lines now include the four micro readings:
+```
+MRC TP-ADJUST: ... micro5s=±X.XX micro25s=±X.XX rev25s=X.XX align=±X.XX
+MRC FORCE-EXIT: ... micro5s=±X.XX micro25s=±X.XX rev25s=X.XX align=±X.XX
+```
+Read with `getattr(an, "micro_*", 0.0)` — graceful if older analyzer.
+
+### Smoke tests
+- `python -c "from contract_momentum import ContractMomentumAnalyzer; ..."` → OK
+- Functional: 10 obs of rising mid → `m5=1.0 m25=1.0 rev25=0.76 align=1.0` ✓
+- `python -c "from polymarket_copy_engine import PolymarketCopyEngine; ..."` → OK
+- `nssm restart BTCBiasEngine` → `SERVICE_RUNNING`. Clean startup, no
+  tracebacks. Skip-window disabled (window mid-flight).
+
+### Why these thresholds
+- 0.5c per-step on the 5s window matches the typical Kalshi 1c spread —
+  half-spread moves in either direction saturate the signal, which is
+  appropriate for "is this oscillating right now" signaling.
+- 2c net on the 25s window is one tick beyond typical noise (1c spread)
+  but well below the 8c SL distance — i.e. movements that should still
+  feel like trend, not just churn.
+- Dead zone 0.05 prevents chatter when both readings are essentially noise.
+- 1.20 × / 0.75 × multipliers chosen to be material but not flip-flop
+  inducing once combined with the macro 0.7–1.3 clamp.
+
+### What to watch in log
+- Mass of `micro5s/micro25s` near zero on entries → market is dead;
+  sizing/edge filters upstream should already be holding back.
+- `align=+0.X` recurring while `mrc=+0.X` suggests we have BOTH macro
+  and micro signaling continuation — should produce wider TPs.
+- `align=-0.X` near force-exit firings is the new MRC trigger — track
+  the realized PnL of those force-exits separately from path-driven ones.
+
+### Kill switches
+Disabling `MRC_ENABLED = False` in `user_config.py` continues to disable
+the entire MRC subsystem (micro layer included). No new kill-switch
+flag was added — micro is intentionally not separately gated; if it
+churns, kill MRC entirely and reassess.
+
+---
+
+## 2026-05-04 09:25 PT — Five Exit Management Enhancements (LIVE)
+
+User authorized all 5 enhancements live (no shadow). Engine restarted
+09:25 PT, heartbeat 100 cycles, zero errors. All gated by config flags
+in `user_config.py` lines 1903-1922; every block wrapped in try/except.
+
+### Implementation 1 — S/R TP Cap
+
+**Where:** [polymarket_copy_engine.py:15482-15522](btc-bias-engine/polymarket_copy_engine.py:15482) (inside `_maintain_protective_order`, after MFE trail and Kalshi-Lag, before three-state machine).
+
+**What it does:** Reads `self._sr_state[ticker]` (already maintained
+every cycle via `contract_sr.update`). For YES positions, calls
+`contract_sr.nearest_resistance(state, yes_mid)` and caps `tp_target` at
+`level - 1` if the resistance sits below the current TP. For NO
+positions, calls `nearest_support(state, yes_mid)` and translates to
+NO-bid scale (`100 - level - 1`). Skipped if `samples_seen <
+SR_TP_CAP_MIN_SAMPLES` (default 30) or `level_strength <
+SR_TP_CAP_MIN_STRENGTH` (default 0.4).
+
+**Config flags:**
+- `SR_TP_CAP_ENABLED = True` (master)
+- `SR_TP_CAP_MIN_STRENGTH = 0.4`
+- `SR_TP_CAP_MIN_SAMPLES = 30`
+
+**Log marker:** `SR TP-CAP [<ticker>]: side=<s> yes_mid=<m>c resistance=<l>c(str=<s>) original_tp=<o>c capped_tp=<n>c`
+
+**To disable:** `SR_TP_CAP_ENABLED = False`.
+
+### Implementation 2 — Wall Consumption SL/Hold
+
+**Where:** [polymarket_copy_engine.py:15592-15641](btc-bias-engine/polymarket_copy_engine.py:15592) (inside `_maintain_protective_order`, after mid-trade BTC velocity SL, before tape-exit block).
+
+**What it does:** Calls `self._detect_wall_consumption(ticker, side,
+WALL_CONSUMPTION_LOOKBACK_S)` for both opposing and same side.
+- Opposing-side `AGGRESSIVE_BUY` (≥30 ct/s) AND profitable → escalate
+  `target_state="sl"`, `target_px = bid - 1` (cross-spread exit).
+- Same-side `AGGRESSIVE_BUY` AND already in TP state AND profitable →
+  return False from the function, suppressing this cycle's placement
+  (existing TP keeps resting; no new order; lets favorable momentum
+  run further).
+
+Never escalates a losing trade. Fail-soft: missing `_book_depth_history`
+or zero samples → no action.
+
+**Config flags:**
+- `WALL_CONSUMPTION_EXIT_ENABLED = True`
+- `WALL_CONSUMPTION_LOOKBACK_S = 5.0`
+
+**Log markers:**
+- `WALL-EXIT [<ticker>]: opposing aggression detected (opp=<side> rate=<r> ct/s samples=<n>) — forcing exit ...`
+- `WALL-HOLD [<ticker>]: favorable aggression (same=<side> rate=<r> ct/s samples=<n>) — holding past TP, skipping placement this cycle`
+
+**To disable:** `WALL_CONSUMPTION_EXIT_ENABLED = False`.
+
+### Implementation 3 — Kalshi Lag TP Modulation
+
+**Where:** [polymarket_copy_engine.py:15427-15475](btc-bias-engine/polymarket_copy_engine.py:15427) (inside `_maintain_protective_order`, after MFE trail, before S/R TP cap).
+
+**What it does:** Reads `self._microstructure.last_score.kalshi_lag`
+and `direction`. Threshold (default 0.3):
+- |lag| > threshold AND pressure direction == our side → multiply TP
+  premium by `KALSHI_LAG_TP_WIDEN_MULT` (default 1.15) — hold longer.
+- |lag| > threshold AND pressure direction == opposite side → multiply
+  TP premium by `KALSHI_LAG_TP_TIGHTEN_MULT` (default 0.85) — close out
+  before edge closes.
+- Floor: new premium ≥ 1c (never inverts trade).
+
+Acts on (tp_target − entry), not the absolute price. S/R TP cap runs
+*after* this and clamps the result.
+
+**Config flags:**
+- `KALSHI_LAG_TP_ENABLED = True`
+- `KALSHI_LAG_TP_THRESHOLD = 0.3`
+- `KALSHI_LAG_TP_WIDEN_MULT = 1.15`
+- `KALSHI_LAG_TP_TIGHTEN_MULT = 0.85`
+
+**Log marker:** `KALSHI-LAG TP [<ticker>]: side=<s> lag=<l> dir=<d> premium <p>c × <m> → <n>c (tp <o>c → <t>c)`
+
+**To disable:** `KALSHI_LAG_TP_ENABLED = False`.
+
+### Implementation 4 — Tape Exit-Pressure Gate (LIVE)
+
+**Where:** Wiring already existed at [polymarket_copy_engine.py:15692-15733](btc-bias-engine/polymarket_copy_engine.py:15692). No code changes — config flips only.
+
+**Config flips:**
+- `BB_PURE_TAPE_EXIT_SHADOW_ENABLED = False → True` (prerequisite — the
+  block is gated on shadow being enabled too).
+- `BB_PURE_TAPE_EXIT_GATE_ENABLED = False → True` (actually escalates
+  to SL when massive opposite-side flow hits).
+
+Thresholds unchanged: 30s window, $300 minimum opposite-$, 3× dominance
+ratio, ≥2 large opposing buys (`BB_PURE_TAPE_EXIT_*` family).
+
+**Log marker:** `PROTECTIVE TAPE-EXIT-SHADOW [<t>]: holding=<S> opp_$=<x> our_$=<y> opp_lc=<n> (window=30s) — GATE-LIVE: forcing SL`
+
+(Note: log prefix still says "TAPE-EXIT-SHADOW" — the suffix changes
+from "shadow only, no action" to "GATE-LIVE: forcing SL" when active.)
+
+**To disable:** flip either flag back to False.
+
+### Implementation 5 — MRC Force Exit + Path Signature (defensive backstop)
+
+**Existing wiring:** `_mrc_check_force_exit` at [polymarket_copy_engine.py:15753](btc-bias-engine/polymarket_copy_engine.py:15753) runs *before* `_maintain_protective_order` (call site at [line 18758](btc-bias-engine/polymarket_copy_engine.py:18758)). It honors `should_force_exit` and cross-spread sells when profitable. `should_force_exit` already encompasses M_TOP / W_BOTTOM / staircase-against (per `MRC_FORCE_EXIT` comment in user_config.py).
+
+**New defensive backstop:** [polymarket_copy_engine.py:15643-15677](btc-bias-engine/polymarket_copy_engine.py:15643) — inside `_maintain_protective_order`, after wall-consumption block, escalates `target_state="sl"` when:
+- analyzer is warm AND
+- (`should_force_exit` is True OR `path_signature == "M_TOP"` for YES OR
+  `path_signature == "W_BOTTOM"` for NO) AND
+- bid > entry (profit-only).
+
+This is a backstop in case `_mrc_check_force_exit` couldn't flatten
+(cancel race, place_order exception). It moves the resting protective
+order to a defensive price even when the cross-spread sell didn't fire.
+
+**Config flags:**
+- `MRC_ENABLED = True` (existing master)
+- `MRC_FORCE_EXIT = True` (existing — honors `should_force_exit` in `_mrc_check_force_exit`)
+- `MRC_PATH_SIG_PROTECTIVE_ESC = True` (new — backstop escalation in `_maintain_protective_order`)
+
+**Log markers:**
+- `MRC FORCE-EXIT: <t> side=<s> ...` (existing — primary path)
+- `MRC PATH-EXIT [<t>]: side=<s> path=<p> force_exit=<f> mrc=<c> bid=<b>c entry=<e>c — escalating to SL (defensive)` (new backstop)
+
+**To disable:**
+- Backstop only: `MRC_PATH_SIG_PROTECTIVE_ESC = False`.
+- Primary force-exit: `MRC_FORCE_EXIT = False`.
+- Whole MRC subsystem: `MRC_ENABLED = False`.
+
+### Validation status
+
+- Import: `python -c "from polymarket_copy_engine import PolymarketCopyEngine; print('OK')"` → OK.
+- Service: `nssm restart BTCBiasEngine` → SERVICE_RUNNING.
+- Logs since restart (09:25 PT): zero ERROR / Traceback / Exception lines, heartbeat hitting 100 cycles cleanly. SR-SEED loaded 40 levels from prior session (KXBTC15M-26MAY041215-15 → -26MAY041230-30) — S/R cap will have data on the first BB_PURE entry of the next window.
+
+### What the next instance should verify (first trade with all 5 active)
+
+The next engine fire is the first live test. Verify these markers:
+
+1. **SR TP-CAP** — Should appear if a strong YES level (≥0.4 strength,
+   ≥30 samples) sits between entry and the BB_PURE FVG-close target.
+   Compare original_tp vs capped_tp; ensure cap is *between* entry and
+   resistance, never below entry.
+2. **KALSHI-LAG TP** — Will fire whenever pressure direction is set
+   AND |kalshi_lag| > 0.3. Side-aligned widens, opposed tightens. New
+   premium should be ≥ 1c.
+3. **WALL-EXIT** — Watch for false positives in the first ~10s of a
+   ticker before `_book_depth_history` ring fills (samples < 3 should
+   gate this — verify by reading the log line's `samples=N` field).
+4. **WALL-HOLD** — Confirms favorable aggression suppresses TP. The
+   protective layer returns False that cycle; next cycle re-evaluates.
+   If WALL-HOLD chains for many seconds while bid drifts back toward
+   entry, that's a regression to flag.
+5. **MRC PATH-EXIT** — Should rarely fire (defensive backstop). If it
+   fires *without* a preceding `MRC FORCE-EXIT` log line on the same
+   ticker, that's a real backstop save and worth investigating.
+6. **TAPE-EXIT-SHADOW with "GATE-LIVE: forcing SL"** — Replaces the
+   prior "shadow only, no action" suffix. Per shadow-mode log history
+   (2026-05-02 sample), fires roughly 1–3× per losing-side scalp; if
+   it fires more than ~5× in any single position, the gate is too hot
+   and `BB_PURE_TAPE_EXIT_DOM_RATIO` should be raised from 3.0 to 4.0.
+
+### Layer interaction summary (top→bottom in `_maintain_protective_order`)
+
+```
+1.  pre-expiry / shutdown / flat-confirmed (existing)
+2.  truth-count + position-zero gate (existing)
+3.  TP target initial computation (BB_PURE: fair − inside_fair, tier-clamped)
+4.  MRC TP modulation — × recommended_tp_multiplier (existing)
+5.  MFE trail re-arm — overrides tp_target with trail_price when armed (existing)
+6.  KALSHI-LAG TP — multiplies premium by widen/tighten mult (NEW)
+7.  S/R TP cap — clamps tp_target below defended resistance/support (NEW)
+8.  Three-state machine: TP / SL / HOLD on bid vs entry vs sl_trigger (existing)
+9.  Mid-trade BTC velocity SL (existing)
+10. WALL CONSUMPTION SL/HOLD — opposing AGGRESSIVE_BUY → SL; same → return False (NEW)
+11. MRC PATH-SIG defensive escalation (NEW backstop)
+12. TAPE EXIT-PRESSURE — opposite massive flow → SL (LIVE — gate flipped True)
+13. Resting-order preflight + cancel-and-verify replan (existing)
+```
+
+Tier 0 (steps 10-12) can escalate state to SL; never can de-escalate
+SL → HOLD. The bid-driven SL trigger (step 8) remains the floor.
+
+---
+
+## 2026-05-04 — Claude (Opus 4.7): Three-Fix Bundle (FLAT-CONFIRM recheck + BB_PURE velocity veto + MRC wiring)
+
+User-authorized bundle of three additive defensive fixes. All wrapped in
+try/except, all gated by their own config flag. Engine restarted clean
+(SERVICE_RUNNING, no errors). Live trading continues uninterrupted.
+
+### Why these three together
+
+- Today's BB_PURE FIRES (4 of them, 09:45 / 10:00 / 10:30 / 11:45 PT)
+  all routed through `BB_PURE NOFILL → late-fill → RECLAIM`. The RECLAIM
+  path reconstructs `_open_position` from scratch and never attached the
+  MRC `_momentum_analyzer`, which is why MRC produced ZERO log lines all
+  day (FIX 3, root cause).
+- FLAT-CONFIRMED has a known cache-lag failure mode: Kalshi's positions
+  endpoint flips 0→N seconds after the engine has already torn down its
+  TP. Engine then sees the re-detected position as "manual" and leaves
+  it uncovered for the rest of the window (FIX 1).
+- BB_PURE has been firing on the side opposite to the BTC dollar
+  velocity — buying NO into a strong up-move, buying YES into a strong
+  down-move. The 30s tick velocity contradicts the entry thesis directly
+  in those cases; veto is cheap insurance (FIX 2).
+
+### FIX 1 — FLAT-CONFIRMED 5-second cache-lag recheck
+
+**Files**:
+- [polymarket_copy_engine.py:14971-15082](btc-bias-engine/polymarket_copy_engine.py:14971) — new `_flat_confirm_recheck` async helper
+- [polymarket_copy_engine.py:15441-15471](btc-bias-engine/polymarket_copy_engine.py:15441) — schedule recheck after `_clear_position` succeeds
+- [polymarket_copy_engine.py:20299-20413](btc-bias-engine/polymarket_copy_engine.py:20299) — BB_PURE-only over-fill RE-ADOPT branch in SYNC MANUAL-DETECTED handler
+- [user_config.py:1928-1929](btc-bias-engine/user_config.py:1928) — `FLAT_CONFIRM_RECHECK_ENABLED`, `FLAT_CONFIRM_RECHECK_DELAY_S`
+
+**Why**: Prior FLAT-CONFIRMED behavior was correct for the "real close"
+case but failed open on cache-lag. After clearing state on N=3 zero
+readings, a one-shot `asyncio.create_task` schedules a 5s delayed
+re-poll of `/positions`. If the ticker re-appears, the engine
+reconstructs `_open_position` (mirroring SYNC RECLAIM shape) and
+attaches the MRC analyzer (also benefits from FIX 3). The engine then
+resumes protective + TP placement instead of treating the position as
+manual.
+
+The SYNC MANUAL-DETECTED (over-fill) branch had the same shape of bug:
+in BB_PURE-only mode (no manual / wallet / sniper / SR / SCALP / TA
+strategies enabled), an over-fill on a recently-touched ticker
+mathematically cannot be a user manual trade. That path now RE-ADOPTS
+instead of leaving alone.
+
+**Config flags** (defaults shown):
+- `FLAT_CONFIRM_RECHECK_ENABLED = True`
+- `FLAT_CONFIRM_RECHECK_DELAY_S = 5.0`
+
+**Log markers to watch**:
+- `FLAT-CONFIRM RECHECK: re-polled after 5.0s, found {N}ct on {ticker} side={side} → RE-ADOPTING (entry={E}c strat={S})`
+- `FLAT-CONFIRM RECHECK: confirmed flat after 5.0s (ticker=... side=...) — no re-adopt needed`
+- `FLAT-CONFIRM RECHECK: re-polled after 5.0s, found {N}ct on {ticker} but engine already tracking {M}ct — skipping re-adopt (state already healthy)`
+- `CopyEngine SYNC OVERFILL-READOPT: ... — BB_PURE-only mode → RE-ADOPTING (was leave-alone)`
+
+**Disable individually**: set `FLAT_CONFIRM_RECHECK_ENABLED = False`.
+The over-fill RE-ADOPT branch is also gated on this flag; it falls back
+to legacy "leave alone" behavior.
+
+**Next instance should verify**:
+1. Search `engine.log` for `FLAT-CONFIRM RECHECK` after a known
+   FLAT-CONFIRMED event — both outcomes (re-adopt, confirmed flat)
+   should be logged.
+2. If a RE-ADOPT happens, confirm `_open_position` is repopulated by
+   grepping for `MRC` log lines on the recovered ticker — proves the
+   path actually re-engaged the protective layer.
+3. The `_recent_bb_pure_placements` dict has a 90s TTL inside SYNC
+   RECLAIM. If recheck runs >90s after the original BB_PURE FIRE,
+   `bb_fair`/`bb_mid`/`bb_edge` will be 0 in the snapshot — verify the
+   re-adopted position still works (TP placement falls back to entry +
+   `BB_PURE_TP_MIN_CENTS`).
+
+### FIX 2 — BB_PURE BTC velocity asymmetry veto at entry
+
+**Files**:
+- [polymarket_copy_engine.py:10078-10133](btc-bias-engine/polymarket_copy_engine.py:10078) — pre-entry veto block in `_execute_bb_pure_signal` (runs BEFORE the existing exit-liquidity gate)
+- [user_config.py:1930-1931](btc-bias-engine/user_config.py:1930) — `BB_PURE_VELOCITY_VETO_ENABLED`, `BB_PURE_VELOCITY_VETO_THRESHOLD`
+
+**Why**: `tick_velocity` is the signed 30-second BTC dollar change from
+`price_feed.tick_tracker`. If we are entering NO and BTC is moving up
+sharply, the strike is becoming MORE likely to settle YES — the BB
+mispricing will widen further before reverting (or never revert). YES
+into a strong down-move is the symmetric case. This is cheap pre-entry
+insurance against catching a falling knife on the inverse side.
+
+**Threshold**: `±2.0 $/s` (default). At 30s window, that is roughly
+±$60 of BTC movement over the velocity-measurement period — strong
+directional signal.
+
+**Volume asymmetry**: also read `cb_vol_above_strike` /
+`cb_vol_below_strike` from the volume tracker when available; logged
+alongside the veto for context but not currently used as a gate by
+itself (avoid over-fitting on initial release).
+
+**Config flags** (defaults shown):
+- `BB_PURE_VELOCITY_VETO_ENABLED = True`
+- `BB_PURE_VELOCITY_VETO_THRESHOLD = 2.0`
+
+**Log markers**:
+- `BB_PURE VELOCITY-VETO: NO entry blocked, btc_vel=+{vel}$/s ticker=... thresh=±2.00 vol_above={a} vol_below={b}`
+- `BB_PURE VELOCITY-VETO: YES entry blocked, btc_vel={vel}$/s ticker=... thresh=±2.00 vol_above={a} vol_below={b}`
+
+**Disable individually**: set `BB_PURE_VELOCITY_VETO_ENABLED = False`.
+
+**Next instance should verify**:
+1. Watch for `BB_PURE VELOCITY-VETO` log lines correlating with skipped
+   FIRES during volatile BTC moves.
+2. If the veto seems too aggressive (e.g., blocking >50% of valid
+   signals), tune `BB_PURE_VELOCITY_VETO_THRESHOLD` upward (3.0–4.0) —
+   threshold is intentionally conservative on first deploy.
+3. `tick_velocity` is stale-checked via `tt.is_stale`; if the price feed
+   stalls, the veto silently no-ops (this is correct — never block
+   entries on a broken feed).
+
+### FIX 3 — MRC analyzer wiring + 60s warmup window
+
+**Files**:
+- [contract_momentum.py:35-46](btc-bias-engine/contract_momentum.py:35) — `MIN_OBS = 30 → 20` (~90s → ~60s warmup at 3s polling), new `EMA_60S_ALPHA = 0.15`
+- [contract_momentum.py:99-103](btc-bias-engine/contract_momentum.py:99) — `_mid_ema_60s` state field
+- [contract_momentum.py:160-165](btc-bias-engine/contract_momentum.py:160) — `mid_ema_60s` property
+- [contract_momentum.py:213-225](btc-bias-engine/contract_momentum.py:213) — 60s mid-EMA update in main loop
+- [polymarket_copy_engine.py:20536-20566](btc-bias-engine/polymarket_copy_engine.py:20536) — MRC analyzer attach in SYNC RECONCILE Case A (count drift)
+- [polymarket_copy_engine.py:20756-20778](btc-bias-engine/polymarket_copy_engine.py:20756) — MRC analyzer attach in SYNC RECLAIM (BB_PURE & TA_FORCED)
+- [polymarket_copy_engine.py:19111-19139](btc-bias-engine/polymarket_copy_engine.py:19111) — MRC WARMUP log line (throttled, every 5 obs)
+- [user_config.py:1932-1933](btc-bias-engine/user_config.py:1932) — `MRC_RECLAIM_ATTACH_ENABLED`, `MRC_WARMUP_LOG_ENABLED`
+
+**Why MRC produced 0 log lines today**: ALL 4 of today's BB_PURE FIRES
+went through:
+```
+BB_PURE FIRE → place_order → returned filled=0 → BB_PURE NOFILL →
+return at line ~10352 (BEFORE _open_position dict is created) →
+8s later: BB_PURE NOFILL late-fill → SYNC RECLAIM at line ~20756 →
+constructs _open_position WITHOUT _momentum_analyzer
+```
+
+The `_execute_bb_pure_signal` MRC init at line ~10408 only runs when
+`filled > 0` immediately. The RECLAIM path was never wired up.
+
+**Fix**: attach the analyzer in BOTH the RECLAIM path AND the
+RECONCILE Case A path (count drift). Idempotent guard
+(`"_momentum_analyzer" not in self._open_position`) prevents
+double-init.
+
+**Warmup reduction**: `MIN_OBS = 30 → 20`. At 3s polling cadence, that's
+~60s instead of ~90s. The 15-minute trading window then gets ~13.5
+minutes of active MRC coverage instead of ~13 — a meaningful gain on
+short positions that close inside the first few minutes.
+
+**60s mid-EMA**: separate exponentially-smoothed mid stream alongside
+the existing CMS (which is EMA of *returns*, not levels). EMA_60S_ALPHA
+= 0.15 chosen so the EMA's effective memory is ~6.7 polls (~20s
+half-life), with long-tail influence reaching ~60s of data weight.
+Exposed as `analyzer.mid_ema_60s`. Currently informational only — not
+yet consumed by `_recommend()` (will revisit after observing live data).
+
+**Config flags** (defaults shown):
+- `MRC_RECLAIM_ATTACH_ENABLED = True`
+- `MRC_WARMUP_LOG_ENABLED = True`
+- (existing) `MRC_ENABLED = True`, `MRC_TP_MODULATION = True`, `MRC_FORCE_EXIT = True`
+
+**Log markers**:
+- `MRC RECLAIM-ATTACH: {ticker} side={side} analyzer initialized for reclaimed position`
+- `MRC RECONCILE-ATTACH: {ticker} side={side} analyzer initialized for reconciled position`
+- `MRC WARMUP: {n}/20 observations, {pct}% of window elapsed ({ticker})` (every 5 obs)
+- `MRC {ticker} side={side} mid={N}c cms={...} cri={...} mrc={...} path={...} scr={...} tp_mult={...} force_exit={...}` (existing, fires once warm)
+
+**Disable individually**:
+- Reclaim attach: `MRC_RECLAIM_ATTACH_ENABLED = False` (analyzer no
+  longer attached to RECLAIM/RECONCILE positions; behavior reverts to
+  pre-FIX-3 — only `_execute_bb_pure_signal` immediate-fill path
+  attaches).
+- Warmup log: `MRC_WARMUP_LOG_ENABLED = False` (suppresses the warmup
+  progress log lines; warm-state logs continue).
+- Whole MRC layer: `MRC_ENABLED = False` (master switch, existing).
+
+**Next instance should verify**:
+1. Watch for `MRC RECLAIM-ATTACH` log line within ~10s of the next
+   BB_PURE FIRE / late-fill.
+2. Watch for `MRC WARMUP: N/20` log lines climbing during the first
+   ~60s of any position (every 5 obs = every ~15s).
+3. Watch for warm-state `MRC {ticker} ...` logs after warmup completes
+   — should fire on every cycle (~3s) once warm.
+4. If the analyzer is attached but never warms up, check that the
+   `_kalshi_ws` book is delivering valid mids on the position's ticker
+   (analyzer's `is_stale` short-circuit may be involved).
+
+### Validation completed before this entry
+
+- `python -c "from polymarket_copy_engine import PolymarketCopyEngine; print('OK')"` → OK
+- `python -c "from contract_momentum import ContractMomentumAnalyzer; ..."` → MIN_OBS=20, EMA_60S_ALPHA=0.15 confirmed
+- Smoke-fed 25 observations into a fresh analyzer → `obs_count=25`,
+  `is_warm=True`, `mid_ema_60s=51.845`, `cms=0.384` — all paths exercise
+  cleanly
+- All four new config flags load via `user_config` import
+- `nssm restart BTCBiasEngine` (admin) → `SERVICE_RUNNING`
+- `engine.log` startup clean: no ERROR, CRITICAL, Traceback, or
+  Exception lines after restart
+
+### Critical reminders for the next instance
+
+1. **All three fixes are additive and gated.** Any one can be disabled
+   independently via its config flag without touching the others.
+2. **Every change is wrapped in try/except.** A broken analyzer / stale
+   feed / unexpected dict shape will degrade silently to legacy behavior
+   — the engine will not crash.
+3. **MRC RECLAIM-ATTACH is the load-bearing fix.** Today's data showed
+   100% of BB_PURE fills routing through RECLAIM, which means without
+   FIX 3 the entire MRC layer (TP modulation, FORCE-EXIT, PATH-SIG
+   defensive escalation) was effectively dead code. With FIX 3, those
+   layers actually engage on live positions for the first time.
+4. **The over-fill RE-ADOPT path is BB_PURE-only-mode-gated.** If
+   wallet copy / SR_FADE / TA_FORCED / SCALP_DCA / SNIPER are ever
+   re-enabled, this branch silently disables itself (correctly — there
+   are then real other-source fills that could be flattened).
+
+## 2026-05-04 — TP TAKER-CONVERT, PRE-EXPIRY TAKER, MRC TP DAMPENING
+
+Three additive, config-gated fixes to remediate (a) silent Kalshi
+post_only_cross rejections on TPs that were already in-the-money,
+(b) pre-expiry consolidate orders that rested instead of crossing,
+and (c) MRC TP cancel/replace flicker. All fixes wrapped in
+try/except with silent fallback to legacy behavior; engine cannot
+crash on any of them.
+
+### FIX 1 — TP TAKER-CONVERT (drop post_only when bid >= TP target)
+
+**File**: `polymarket_copy_engine.py`
+**Function**: `_maintain_protective_order`
+**Lines**: 16164-16178 (inserted inside the `else` branch of the
+existing `if target_state == "sl"` block at the cancel/place point)
+**Config flag**: `TP_TAKER_CONVERT_ENABLED` (default True)
+**Log marker**: `TP TAKER-CONVERT: bid={bid}c >= tp={tp}c, crossing spread`
+
+Before placing a protective TP sell, when the contract bid is already
+at or above the TP target, the order would be rejected by Kalshi as
+post_only_cross and we'd fall back to silent retry forever. We now
+flip to `place_post_only=False` and `place_px=int(bid)` so the order
+crosses the spread and fills.
+
+Only applies when `target_state == "tp"` and `bid >= target_px > 0`.
+SL state is untouched (already crosses via existing SL EXECUTION FIX).
+
+### FIX 2 — PRE-EXPIRY TAKER (cross at bid, not mid, with post_only=False)
+
+**File**: `polymarket_copy_engine.py`
+**Function**: `_pre_expiry_consolidate`
+**Lines**: 14908-14955 (replaces the inline place block)
+**Config flag**: `PRE_EXPIRY_TAKER_ENABLED` (default True)
+**Log marker**: `PRE-EXPIRY TAKER: selling {ct}x @ bid={bid}c (was mid={mid}c)`
+
+The pre-expiry consolidate path now explicitly:
+- Computes our-side `mid_px` (for log diagnostics — shows what we
+  would have placed at had this fix not landed)
+- Uses `actual_bid` as the limit price, falling back to `1c` if the
+  bid is missing (fire sale to guarantee exit)
+- Places with `post_only=False`
+- Logs the explicit "PRE-EXPIRY TAKER" marker so we can grep for
+  proof of crossing behavior
+
+Behavior is now deterministic: T-90s → cancel resting → cross spread
+at bid → exit. Idempotent via `_pre_expiry_consolidating` flag (set
+in the existing path; unchanged).
+
+### FIX 3 — MRC TP DAMPENING (rate-limit + multiplier hysteresis)
+
+**File**: `polymarket_copy_engine.py`
+**Function**: `_maintain_protective_order` (TP modulation block)
+**Lines**: 15614-15663 (in-place rewrite of the MRC TP-ADJUST block)
+**Config flags**: `MRC_TP_MIN_INTERVAL_S` (default 10),
+`MRC_TP_HYSTERESIS` (default 0.15)
+**Log marker**: `MRC TP-DAMPED: skipping adjustment, last_change={N}s ago, delta={d}`
+
+Two-stage dampening on the MRC `recommended_tp_multiplier`:
+1. **Rate limit**: when `_last_tp_placement_time` is within
+   `MRC_TP_MIN_INTERVAL_S` (10s default), skip the adjustment and
+   leave `tp_target` unchanged.
+2. **Hysteresis**: when the new multiplier differs from the previous
+   `_last_mrc_multiplier` by less than `MRC_TP_HYSTERESIS` (0.15
+   default), skip the adjustment.
+
+Both stages log a `MRC TP-DAMPED` line so we can grep oscillation
+suppression in flight.
+
+State is stored on the `pos` dict:
+- `pos["_last_tp_placement_time"]` — float, timestamp
+- `pos["_last_mrc_multiplier"]` — float, last-applied multiplier
+
+Both keys are only written *after* a successful adjustment, so first
+adjustment after warmup always fires. Failures still drop into the
+existing `MRC TP modulation error: ...` debug fallback.
+
+### Post-implementation checks
+
+- `python -c "from polymarket_copy_engine import PolymarketCopyEngine; print('OK')"` → OK
+- `nssm restart BTCBiasEngine` → SERVICE_RUNNING
+- `tail -15 data/engine.log` → clean restart, no Traceback / ERROR /
+  CRITICAL in startup; STARTUP RECOVERY adopted existing 156-ct NO
+  position (entry~44c) cleanly, so the new TP/MRC code paths are
+  active on a real live position immediately.
+
+### Operational notes for next instance
+
+- All three fixes are independently disablable via their config
+  flags. None depend on each other.
+- The TP TAKER-CONVERT will fire whenever a profitable bid touches
+  the resting TP — expect it on every winner from now on; the log
+  marker is the canary that the path is engaged.
+- The MRC TP DAMPENING tracks state per-position via the position
+  dict, so it correctly resets between trades.
+- The PRE-EXPIRY TAKER fix only changes behavior when `_uc()` returns
+  the default — no effect if the user opts out via the config flag.
+
