@@ -505,9 +505,20 @@ SESSION_STOP_PERSIST_BUCKETS_S   = [
 #
 # DEFAULT OFF. Session-1 ships only the math + method definition. Session 2
 # wires it into the cascade. Session 3 flips the flag for live testing.
-BB_PURE_MODE                     = True   # 2026-04-30 PM: Session 2 wired
-                                          # — bypasses composite cascade,
-                                          # trades pure BB mispricing
+BB_PURE_MODE                     = False  # 2026-05-04 PT 19:55: KILLED.
+                                          # Backtest verdict: -$0.024/trade.
+                                          # The "$42 → $78 today" was a user
+                                          # deposit, NOT engine earnings —
+                                          # corrected. Without that data point
+                                          # we have no evidence BB_PURE makes
+                                          # money. BB_TREND lives inside this
+                                          # code path so this also disables
+                                          # BB_TREND (+$0.88/day projected,
+                                          # acceptable loss for the night).
+                                          # Tonight's strategy: FVG tier-aware
+                                          # paper-shadow only. No live trades.
+                                          # Tomorrow: wire FVG live, flip
+                                          # PAPER_FVG_LIVE_MODE=True.
 BB_PURE_MIN_EDGE_PP              = 8.0    # Min mispricing pp to fire (static)
 # ─── BB_TREND mode (2026-05-03) ─────────────────────────────────────────
 # Sibling alpha to mean-reversion: when BTC has drifted firmly in one
@@ -932,10 +943,13 @@ KALSHI_TAPE_RETENTION_S              = 360.0  # 6 min — covers 5-min
 # exit." Symmetric to the entry absorption signal but on a 30s reactive
 # window. When smart money aggresses against our side, bail before the
 # bid catches up.
-BB_PURE_TAPE_EXIT_SHADOW_ENABLED     = False  # 2026-05-02 reset: was True.
-                                              # Same log-pollution reason.
-BB_PURE_TAPE_EXIT_GATE_ENABLED       = False  # actually force SL on exit
-                                              # (start False — shadow first)
+BB_PURE_TAPE_EXIT_SHADOW_ENABLED     = False  # 2026-05-04 PT 16:30:
+                                              # POST-CATASTROPHE KILL-SWITCH.
+                                              # Was re-enabled in dispatch
+                                              # bundle that drained $68. See
+                                              # to-do/CATASTROPHE_2026_05_04.md.
+BB_PURE_TAPE_EXIT_GATE_ENABLED       = False  # 2026-05-04 PT 16:30: KILLED
+                                              # alongside the shadow flag.
 BB_PURE_TAPE_EXIT_WINDOW_S           = 30.0   # how recent the spike must be
 BB_PURE_TAPE_EXIT_MASSIVE_USD        = 300.0  # min $ on opposite side to
                                               # call it "massive"
@@ -1042,7 +1056,14 @@ BB_PURE_MAX_EXIT_LOSS_CENTS           = 25    # exit must be available within 25
 # +$9.99 hold-to-settle baseline. MFE-TRAIL exits hit 81-91%.
 #
 # Default OFF — flip to True to enable live.
-BB_MOMENTUM_ENABLED                  = True   # ENABLE bb_momentum cascade
+BB_MOMENTUM_ENABLED                  = False  # 2026-05-05: disabled to leave
+                                              # FVG-tier-aware as the sole
+                                              # live signal. User directive:
+                                              # "We should be running either
+                                              # tier one or two of the FVG
+                                              # engine you back tested.
+                                              # nothing else makes money
+                                              # sense like that data did".
 BB_MOMENTUM_MIN_BTC_MOVE_300S        = 30.0   # require >=$30 over 5min
 BB_MOMENTUM_MIN_BTC_MOVE_30S         = 10.0   # confirmation: >=$10 in last 30s
 BB_MOMENTUM_REQUIRE_SAME_DIRECTION   = True   # 30s + 300s must agree
@@ -1887,3 +1908,156 @@ ATM_SESSION_PROBE_END_AGE_S = 180.0
 ATM_SESSION_PROBE_MIN_BTC_MOVE_USD = 10.0
 ATM_SESSION_PROBE_MAX_ENTRY_CENTS = 55
 ATM_SESSION_PROBE_MAX_SPREAD_CENTS = 8
+
+# ─── MRC — Contract Momentum/Reversion/Covariance (2026-05-04) ──────
+# Per-fill analyzer that watches the contract's own mid stream as a
+# probability evolution and produces a TP multiplier + force-exit flag.
+# Additive: any internal failure neutralizes outputs but never crashes
+# the engine. See contract_momentum.py + RESEARCH_MOMENTUM_REVERSION_
+# COVARIANCE.md. Disable by flipping MRC_ENABLED=False.
+MRC_ENABLED                  = False  # 2026-05-04 PT 16:30: KILLED.
+                                      # MRC FORCE-EXIT loop with max() truth
+                                      # gate (not min) opened 143 NO contracts
+                                      # via Kalshi sell-to-open semantics →
+                                      # full account drain. Park until the
+                                      # _safe_sell_count helper lands.
+MRC_TP_MODULATION            = False  # 2026-05-04 PT 16:30: KILLED.
+MRC_FORCE_EXIT               = False  # 2026-05-04 PT 16:30: KILLED — root
+                                      # cause of catastrophic loss.
+MRC_MIN_OBSERVATIONS         = 30     # warmup threshold (observations on the analyzer's buffer)
+MRC_TP_PREMIUM_FLOOR_C       = 2      # absolute floor on scaled premium (entry + N cents)
+MRC_FORCE_EXIT_MIN_PROFIT_C  = 2      # only force-exit when bid >= entry + N (profit gate)
+
+# ─── Exit Management Enhancements (2026-05-04) ──────────────────────
+# Five additive enhancements to BB_PURE's protective layer that consume
+# already-running data feeds (S/R levels, wall consumption, Kalshi lag,
+# tape exit pressure, MRC path signature) for sharper TP/SL decisions.
+# Each is gated by its own flag, wrapped in try/except, and falls back
+# silently to baseline behavior if the data path is cold.
+SR_TP_CAP_ENABLED                = False  # 2026-05-04 PT 16:30: KILLED.
+                                          # Untested live, parked with the
+                                          # other dispatch flags.
+SR_TP_CAP_MIN_STRENGTH           = 0.4   # min level_strength to consult
+SR_TP_CAP_MIN_SAMPLES            = 30    # min samples_seen on the SR state before consulting
+WALL_CONSUMPTION_EXIT_ENABLED    = False  # 2026-05-04 PT 16:30: KILLED.
+WALL_CONSUMPTION_LOOKBACK_S      = 5.0   # lookback window for consumption rate
+KALSHI_LAG_TP_ENABLED            = False  # 2026-05-04 PT 16:30: KILLED.
+KALSHI_LAG_TP_THRESHOLD          = 0.3   # |kalshi_lag| above which we adjust
+KALSHI_LAG_TP_WIDEN_MULT         = 1.15  # tp_target premium × this when lag favors hold
+KALSHI_LAG_TP_TIGHTEN_MULT       = 0.85  # tp_target premium × this when lag closing
+MRC_PATH_SIG_PROTECTIVE_ESC      = False  # 2026-05-04 PT 16:30: KILLED with MRC.
+
+# ─── Three-Fix Bundle (2026-05-04) ──────────────────────────────────
+# FIX 1: FLAT-CONFIRMED 5-second cache-lag recheck. After FLAT-CONFIRMED
+# fires and clears engine state, schedule a one-shot async recheck of
+# Kalshi positions. If the position re-appears (cache lag), RE-ADOPT
+# instead of leaving it uncovered. Also triggers in SYNC MANUAL-DETECTED
+# (over-fill) when in BB_PURE-only mode.
+FLAT_CONFIRM_RECHECK_ENABLED     = False  # 2026-05-04 PT 16:30: KILLED.
+                                          # The RE-ADOPT branch off this
+                                          # path turned cache-lag glitches
+                                          # into adopted phantom positions.
+                                          # Restore "leave alone" until the
+                                          # exposure-cap circuit-breaker is
+                                          # in place.
+FLAT_CONFIRM_RECHECK_DELAY_S     = 5.0
+# FIX 2: BB_PURE BTC velocity asymmetry veto at entry. Blocks NO entries
+# when BTC is moving up fast and YES entries when BTC is moving down
+# fast — the dollar-velocity signal directly contradicts the entry
+# thesis. Threshold is in $/s (tick_velocity is signed 30s BTC change).
+BB_PURE_VELOCITY_VETO_ENABLED    = False  # 2026-05-04 PT 16:30: KILLED for
+                                          # cleanliness with rest of dispatch
+                                          # bundle. Re-enable individually
+                                          # after paper validation.
+BB_PURE_VELOCITY_VETO_THRESHOLD  = 2.0
+# FIX 3: MRC warmup reduction (90s → 60s effective) is in
+# contract_momentum.py (MIN_OBS = 20). MRC analyzer attachment in
+# RECLAIM/RECONCILE paths gated below.
+MRC_RECLAIM_ATTACH_ENABLED       = False  # 2026-05-04 PT 16:30: KILLED with MRC.
+
+# ─── Dispatch flags that defaulted True in code ─────────────────────
+# These were not declared in user_config.py originally — they got their
+# default True from _uc("FLAG", True) calls in polymarket_copy_engine.py.
+# Explicitly setting them False here makes the kill switch authoritative
+# regardless of how _uc resolves missing names.
+TP_TAKER_CONVERT_ENABLED         = False  # 2026-05-04 PT 16:30: KILLED.
+                                          # In-flight live during dispatch
+                                          # session — addresses a real Kalshi
+                                          # post_only-cross silent reject, but
+                                          # flipping post_only mid-cycle had
+                                          # no test coverage before live ship.
+                                          # Re-enable individually after
+                                          # _safe_sell_count helper lands.
+PRE_EXPIRY_TAKER_ENABLED         = False  # 2026-05-04 PT 16:30: KILLED.
+                                          # Re-enable individually after the
+                                          # MIN-truth gate is in place.
+
+# ─── Per-ticker exposure cap (2026-05-04 post-catastrophe) ─────────
+# Hard upper bound on how much of the bankroll any single ticker can tie
+# up across both YES and NO sides. Today's loss had 156 contracts × 44c
+# = $68 on a $70 bankroll = 97% concentration on one expiry. The cap
+# refuses any state change (entry, DCA, RECONCILE BACKFILL) that would
+# push exposure above this fraction.
+#
+# 0.25 chosen so a 5%-Kelly entry can DCA up to 5x with cushion before
+# tripping. Tighten to 0.15 for bankrolls > $200 if desired.
+MAX_TICKER_EXPOSURE_FRAC         = 0.25
+EXPOSURE_CAP_ENABLED             = True   # master switch for the cap
+MRC_WARMUP_LOG_ENABLED           = True
+
+# ─── FVG Tier Sizing (2026-05-04 post-OOS-validation) ──────────────────
+# The OOS-validated 70/30 split (scripts/backtest_oos_level3.py) showed
+# Tier 1 fill rate of 97.4% live (99% backtest), Tier 2 92.2% (93%
+# backtest). See to-do/BACKTEST_2026_05_04.md for the full validation.
+#
+# THESE KNOBS ARE READ BY ``_fvg_tiering.py`` BUT NOT YET WIRED INTO THE
+# LIVE ENGINE PATH (as of 2026-05-04 evening). The FVG paper sim
+# continues to shadow-log via ``_paper_fvg_tick``. Live wiring + paper-
+# mode validation is the next-session task.
+#
+# Tier definitions:
+#   T1 (35% bankroll, TP+20c): late_300+ AND aligned AND |btc_dist| >= 0.10%
+#   T2 (25% bankroll, TP+15c): late_300+ AND aligned (NOT in T1)
+#   T3 (18% bankroll, TP+12c): late_300+ alone
+#   T4 (10% bankroll, TP+12c): 180s <= age < 300s
+#
+# Refuse predicates (Tier 0):
+#   - session_age_s < 180s
+#   - counter-trend AND 30 <= entry_c <= 49
+#   - |btc_5m_move| < $20 AND counter-trend
+PAPER_FVG_ENABLED                = True   # paper-shadow logging (already
+                                          # was shadow-logging before; this
+                                          # makes it explicit. Live wiring
+                                          # comes next session.)
+PAPER_FVG_LIVE_MODE              = True   # 2026-05-05 LIVE FLIP. Validated:
+                                          # 23/23 tier classification tests
+                                          # pass; 10/10 live-wiring tests
+                                          # pass (test_fvg_live_wiring.py);
+                                          # 6+ hrs paper-sim showed
+                                          # T1/T2 fills matching OOS-validated
+                                          # 97.4%/92.2%. Engine routes FVG
+                                          # signals through real Kalshi
+                                          # orders via _paper_fvg_live_entry
+                                          # with full safety stack
+                                          # (ticker-lock, MIN-TRUTH gate,
+                                          # OVERSELL-GUARD, residual
+                                          # reconciler, daily-loss halt).
+# Tier sizing fractions (Level 3 — Half-Kelly, OOS-validated)
+FVG_TIER_FRAC_T1                 = 0.35
+FVG_TIER_FRAC_T2                 = 0.25
+FVG_TIER_FRAC_T3                 = 0.18
+FVG_TIER_FRAC_T4                 = 0.10
+# Tier TP offsets (cents above entry)
+FVG_TIER_TP_T1                   = 20
+FVG_TIER_TP_T2                   = 15
+FVG_TIER_TP_T3                   = 12
+FVG_TIER_TP_T4                   = 12
+# SL is uniform across tiers (8c, matches PROTECTIVE_SL_OFFSET_C)
+FVG_TIER_SL_OFFSET               = 8
+# Daily loss circuit breaker — halt FVG live for the day if this
+# fraction of starting-day bankroll is lost.
+FVG_DAILY_LOSS_HALT_FRAC         = 0.20
+# When PAPER_FVG_LIVE_MODE flips to True, also raise the exposure cap
+# to allow Tier 1's 35% slot. This knob lets us flip both flags
+# atomically.
+FVG_LIVE_MAX_TICKER_EXPOSURE_FRAC = 0.40   # only used when LIVE_MODE=True

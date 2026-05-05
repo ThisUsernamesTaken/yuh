@@ -102,8 +102,14 @@ def test_residual_same_side_market_sells():
         books={"KXBTC15M-X": _FakeBook(yes_bid=42, no_bid=57)},
         open_position={"ticker": "KXBTC15M-X", "count": 3, "side": "yes"},
     )
-    # After first sell, get_positions returns empty (all sold)
+    # 2026-05-04 MIN-TRUTH FIX: _place_capped_side_sell now calls
+    # get_positions for its own zero-gate, in addition to the reconciler's
+    # initial check and post-sell verify. Provide enough sticky entries:
+    #   call 1: reconciler initial check       → position=3
+    #   call 2: sell-cap MIN-TRUTH zero-gate   → position=3
+    #   call 3 (sticky): post-sell verify      → []
     eng._client._fetch_sequence = [
+        [{"ticker": "KXBTC15M-X", "position": 3, "side": "yes"}],
         [{"ticker": "KXBTC15M-X", "position": 3, "side": "yes"}],
         [],
     ]
@@ -120,14 +126,21 @@ def test_residual_same_side_market_sells():
 def test_residual_oversell_inverse_detected():
     """Expected YES, but Kalshi shows NO position — the oversell signature.
     This is the 2026-04-22 incident pattern we want the reconciler to catch.
+
+    2026-05-04: NO inventory uses Kalshi's signed convention (position=-N
+    for N contracts of NO). The MIN-TRUTH sell-cap reads via
+    _get_verified_side_position_count which expects this signing — needs
+    -5 here, not 5.
     """
     eng = _make_engine(
-        positions=[{"ticker": "KXBTC15M-X", "position": 5, "side": "no"}],
+        positions=[{"ticker": "KXBTC15M-X", "position": -5, "side": "no"}],
         books={"KXBTC15M-X": _FakeBook(yes_bid=30, no_bid=65)},
         open_position={"ticker": "KXBTC15M-X", "count": 5, "side": "yes"},
     )
+    # 2026-05-04 MIN-TRUTH FIX: extra entry for sell-cap zero-gate.
     eng._client._fetch_sequence = [
-        [{"ticker": "KXBTC15M-X", "position": 5, "side": "no"}],
+        [{"ticker": "KXBTC15M-X", "position": -5, "side": "no"}],
+        [{"ticker": "KXBTC15M-X", "position": -5, "side": "no"}],
         [],
     ]
     # Capture logs to confirm OVERSELL-DETECTED prefix emitted.
@@ -214,14 +227,20 @@ def test_manual_overfill_skipped():
 
 
 def test_engine_owned_residual_still_flattens():
-    """Engine fill was 30ct, residual is 8ct — within the 1.5x cap. Flatten."""
+    """Engine fill was 30ct, residual is 8ct — within the 1.5x cap. Flatten.
+
+    2026-05-04: NO inventory uses Kalshi's signed convention (position=-8
+    for 8ct of NO held).
+    """
     eng = _make_engine(
-        positions=[{"ticker": "KXBTC15M-V", "position": 8, "side": "no"}],
+        positions=[{"ticker": "KXBTC15M-V", "position": -8, "side": "no"}],
         books={"KXBTC15M-V": _FakeBook(yes_bid=22, no_bid=75)},
         open_position={"ticker": "KXBTC15M-V", "count": 30, "side": "no"},
     )
+    # 2026-05-04 MIN-TRUTH FIX: extra entry for sell-cap zero-gate.
     eng._client._fetch_sequence = [
-        [{"ticker": "KXBTC15M-V", "position": 8, "side": "no"}],
+        [{"ticker": "KXBTC15M-V", "position": -8, "side": "no"}],
+        [{"ticker": "KXBTC15M-V", "position": -8, "side": "no"}],
         [],
     ]
     asyncio.run(eng._reconcile_residual_position("KXBTC15M-V", "no", "unittest"))

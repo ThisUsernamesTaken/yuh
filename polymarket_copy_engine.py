@@ -79,6 +79,17 @@ except ImportError as _mtf_import_err:
     PriceFeedTask = None       # type: ignore[assignment,misc]
     MTFConfluenceScorer = None # type: ignore[assignment,misc]
 
+# Contract Momentum Analyzer (2026-05-04) — additive exit-management layer.
+# Watches the contract's own mid stream as a probability evolution and produces
+# a TP multiplier + force-exit flag. Imported with a guard so its absence
+# never breaks the engine. See RESEARCH_MOMENTUM_REVERSION_COVARIANCE.md.
+try:
+    from contract_momentum import ContractMomentumAnalyzer
+    _MRC_AVAILABLE = True
+except ImportError:
+    ContractMomentumAnalyzer = None  # type: ignore[assignment,misc]
+    _MRC_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 # ── Load user overrides (if user_config.py exists) ──
@@ -963,8 +974,12 @@ class PolymarketCopyEngine:
         }
 
         # Paper FVG baseline tracker state
+        # 2026-05-04: extended with LIVE_PENDING / LIVE_HOLDING states +
+        # live-order metadata so PAPER_FVG_LIVE_MODE=True routes the same
+        # tier-aware decision through real Kalshi orders. Paper sim path is
+        # unchanged when LIVE_MODE=False.
         self._paper_fvg: dict = {
-            "state": "IDLE",           # IDLE | BASELINE | ENTRY | HOLDING | CLOSED
+            "state": "IDLE",           # IDLE | BASELINE | HOLDING | LIVE_PENDING | LIVE_HOLDING
             "session_id": "",
             "session_open_ts": 0.0,
             "baseline_mids": [],       # first 90s of mid readings for baseline
@@ -985,6 +1000,21 @@ class PolymarketCopyEngine:
             "hwm_bid": 0,
             "cycles_this_session": 0,
             "halted": False,
+            # ── LIVE-MODE state (used when PAPER_FVG_LIVE_MODE=True) ──
+            "live_ticker": "",          # ticker of the live fire (for residual)
+            "live_side": "",            # "yes" | "no"
+            "live_tier": 0,             # 1..4
+            "live_entry_px": 0,         # entry fill price (cents)
+            "live_filled_count": 0,     # actual contracts filled
+            "live_entry_order_id": "",  # entry order_id (for cancel on NOFILL)
+            "live_entry_placed_ts": 0.0,
+            "live_tp_order_id": "",     # resting TP order_id
+            "live_tp_px": 0,            # tier_tp_price target
+            "live_sl_trig": 0,          # tier_sl_price trigger
+            "live_entry_ts": 0.0,
+            "live_balance_at_entry": 0, # balance at entry, for daily-loss halt
+            "live_day_start_balance": 0,  # session-day starting balance
+            "live_day_start_date": "",
         }
 
         # ── ATM Reversion paper-only tier (Codex handoff 2026-04-25) ──────────
@@ -3226,6 +3256,27 @@ class PolymarketCopyEngine:
         if pf["session_id"] != ticker:
             if pf["state"] == "HOLDING":
                 self._paper_fvg_close("session_expired")
+            elif pf["state"] in ("LIVE_HOLDING", "LIVE_PENDING"):
+                # 2026-05-05: a live position straddled a window roll —
+                # cancel any resting orders and reconcile residual on the
+                # OLD ticker before resetting state for the new ticker.
+                # Capture the rollover context BEFORE state reset, then
+                # schedule cleanup as a background task.
+                _rollover_ctx = {
+                    "ticker": pf.get("live_ticker", "") or "",
+                    "side": pf.get("live_side", "") or "",
+                    "tp_oid": pf.get("live_tp_order_id", "") or "",
+                    "entry_oid": pf.get("live_entry_order_id", "") or "",
+                    "filled": int(pf.get("live_filled_count", 0) or 0),
+                }
+                try:
+                    asyncio.create_task(
+                        self._paper_fvg_live_session_rollover(_rollover_ctx)
+                    )
+                except Exception:
+                    logger.exception(
+                        "PAPER FVG LIVE: session-rollover scheduling failed"
+                    )
             pf["session_id"] = ticker
             pf["state"] = "BASELINE"
             pf["baseline_mids"] = []
@@ -3290,41 +3341,145 @@ class PolymarketCopyEngine:
                     side = "no"
                     entry_price = min(100 - mid, 100 - baseline)
 
-                # Size based on spread to fair value
-                spread = abs(fair - mid)
-                if spread < 5:
-                    spread = 5
-                import math as _mfvg
-                contracts = _mfvg.ceil(400 / spread)  # target $4
-                contracts = max(3, min(contracts, 20))
-                cost = contracts * entry_price
-
-                if cost <= pf["sim_balance_cents"] * 0.15:  # 15% cap
-                    pf["state"] = "HOLDING"
-                    pf["entry_side"] = side
-                    pf["entry_price"] = entry_price
-                    pf["entry_ts"] = now
-                    pf["entry_btc"] = btc
-                    pf["entry_fair"] = int(fair)
-                    pf["entry_prob"] = prob.probability
-                    pf["entry_edge"] = int(abs(fvg_vs_baseline))
-                    pf["entry_vol"] = prob.volatility
-                    pf["entry_btc_dist_pct"] = btc_dist_pct
-                    pf["sim_contracts"] = contracts
-                    pf["sim_balance_cents"] -= cost
-                    pf["hwm_bid"] = entry_price
-
-                    # TP: where BTC distance would reprice the contract
-                    # A 0.03% BTC move from current position typically shifts contract 15-25c
-                    tp_from_btc_shift = entry_price + max(int(spread * 0.8), 8)
-                    pf["tp_price"] = min(tp_from_btc_shift, 95)
-
-                    logger.info(
-                        "PAPER FVG ENTRY: %s %dx @ %dc | baseline=%dc fair=%dc fvg=%+dc (thresh %dc) | btc_dist=%.3f%% | tp=%dc | %.0fs left",
-                        side.upper(), contracts, entry_price, baseline, int(fair),
-                        int(fvg_vs_baseline), fvg_threshold, btc_dist_pct,
-                        pf["tp_price"], seconds_remaining,
+                # ════════════════════════════════════════════════════════
+                # 2026-05-04 TIER-AWARE PAPER VALIDATION
+                # 2026-05-05 LIVE WIRING (PAPER_FVG_LIVE_MODE)
+                # ════════════════════════════════════════════════════════
+                # Tier-aware sizing + TP/SL. When PAPER_FVG_LIVE_MODE=True,
+                # the same tier decision routes through real Kalshi orders
+                # via _paper_fvg_live_entry. When False, paper sim runs as
+                # before (used overnight for validation).
+                #
+                # Tier definitions + sizing fractions: see _fvg_tiering.py
+                # OOS-validated 2026-05-04 (97.4% T1 fill / 92.2% T2).
+                # ════════════════════════════════════════════════════════
+                try:
+                    from _fvg_tiering import (
+                        classify_tier, compute_size_contracts,
+                        tier_tp_price, tier_sl_price,
                     )
+                except Exception as _imp_err:
+                    logger.error(
+                        "PAPER FVG: _fvg_tiering import failed: %s — "
+                        "skipping entry (paper sim halted for this signal)",
+                        _imp_err,
+                    )
+                    return
+
+                # btc_5m_move proxy: BTC delta since session open. Real
+                # tick_tracker integration is the next-session refinement.
+                btc_at_open = pf.get("btc_strike", btc) or btc
+                btc_5m_proxy = btc - btc_at_open
+                aligned = (
+                    (side == "yes" and btc_5m_proxy > 0) or
+                    (side == "no" and btc_5m_proxy < 0)
+                )
+
+                features = {
+                    "session_age_s": int(session_age),
+                    "aligned": bool(aligned),
+                    "btc_dist_abs_pct": float(btc_dist_pct),
+                    "btc_5m_move": float(btc_5m_proxy),
+                    "entry_c": int(entry_price),
+                }
+                tier = classify_tier(features)
+                if tier == 0:
+                    logger.info(
+                        "PAPER FVG TIER-REFUSE: side=%s entry=%dc age=%ds "
+                        "aligned=%s |dist|=%.3f%% btc5m_proxy=%+.0f — "
+                        "predicate refused",
+                        side.upper(), entry_price, int(session_age),
+                        aligned, btc_dist_pct, btc_5m_proxy,
+                    )
+                    return
+
+                # ── LIVE branch: hand off to live-order helper ──────────
+                live_mode = bool(_uc("PAPER_FVG_LIVE_MODE", False))
+                if live_mode:
+                    await self._paper_fvg_live_entry(
+                        ticker=ticker,
+                        side=side,
+                        tier=int(tier),
+                        baseline=int(baseline),
+                        fair=int(fair),
+                        fvg_vs_baseline=int(fvg_vs_baseline),
+                        prob=prob,
+                        btc=btc,
+                        btc_5m_proxy=btc_5m_proxy,
+                        aligned=bool(aligned),
+                        btc_dist_pct=float(btc_dist_pct),
+                        session_age=int(session_age),
+                        seconds_remaining=seconds_remaining,
+                    )
+                    return
+
+                # ── PAPER branch (overnight validation path) ────────────
+                # Size via tier fraction (Level 3 sizing: T1=35%, T2=25%,
+                # T3=18%, T4=10%). EXPOSURE-CAP at 40% defends against
+                # misconfigured tier fractions.
+                contracts = compute_size_contracts(
+                    tier=tier,
+                    balance_cents=pf["sim_balance_cents"],
+                    entry_c=entry_price,
+                    max_exposure_frac=0.40,
+                    min_contracts=1,
+                    max_contracts_cap=200,
+                )
+                if contracts == 0:
+                    logger.info(
+                        "PAPER FVG TIER-UNDERSIZED: tier=%d sim_bal=$%.2f "
+                        "entry=%dc — refused (notional below 1ct floor)",
+                        tier, pf["sim_balance_cents"] / 100, entry_price,
+                    )
+                    return
+
+                cost = contracts * entry_price
+                # 40% exposure cap (slightly above Tier 1's 35% to account
+                # for rounding); strictly enforced by compute_size_contracts.
+                if cost > pf["sim_balance_cents"] * 0.40:
+                    logger.info(
+                        "PAPER FVG EXPOSURE-CAP: cost=%dc > 40%% of "
+                        "sim_bal=%dc — refusing",
+                        cost, pf["sim_balance_cents"],
+                    )
+                    return
+
+                pf["state"] = "HOLDING"
+                pf["entry_side"] = side
+                pf["entry_price"] = entry_price
+                pf["entry_ts"] = now
+                pf["entry_btc"] = btc
+                pf["entry_fair"] = int(fair)
+                pf["entry_prob"] = prob.probability
+                pf["entry_edge"] = int(abs(fvg_vs_baseline))
+                pf["entry_vol"] = prob.volatility
+                pf["entry_btc_dist_pct"] = btc_dist_pct
+                pf["sim_contracts"] = contracts
+                pf["sim_balance_cents"] -= cost
+                pf["hwm_bid"] = entry_price
+
+                # Tier metadata (logged + persisted in close)
+                pf["tier"] = int(tier)
+                pf["aligned_with_btc5m"] = bool(aligned)
+                pf["btc_5m_proxy"] = float(btc_5m_proxy)
+
+                # Tier-aware TP / SL (replaces the dynamic-spread formula
+                # which was the loser config — see backtest_fvg_focused.py).
+                pf["tp_price"] = min(tier_tp_price(tier, entry_price), 95)
+                pf["sl_trigger"] = max(1, tier_sl_price(tier, entry_price))
+
+                logger.info(
+                    "PAPER FVG ENTRY [T%d]: %s %dx @ %dc | "
+                    "tp=%dc sl=%dc baseline=%dc fair=%dc fvg=%+dc "
+                    "btc5m=%+.0f aligned=%s |dist|=%.3f%% age=%ds | "
+                    "%.0fs left | sim_bal=$%.2f",
+                    tier, side.upper(), contracts, entry_price,
+                    pf["tp_price"], pf["sl_trigger"],
+                    baseline, int(fair), int(fvg_vs_baseline),
+                    btc_5m_proxy, aligned, btc_dist_pct,
+                    int(session_age), seconds_remaining,
+                    pf["sim_balance_cents"] / 100,
+                )
 
         # ── HOLDING: track HWM and check exit conditions ──
         if pf["state"] == "HOLDING":
@@ -3351,17 +3506,624 @@ class PolymarketCopyEngine:
             if cur_bid >= pf["tp_price"]:
                 pf["_exit_price"] = pf["tp_price"]
                 self._paper_fvg_close("tp_filled")
-            # 2. Time decay: <2 min left, sell at current bid
+            # 2. SL hit (tier-aware paper validation, 2026-05-04). Mirrors
+            #    the proposed live SL: bid <= entry - 8c → cross-spread
+            #    exit at bid - 1. Only fires when sl_trigger was set
+            #    (older paper trades without tier metadata don't have it).
+            elif "sl_trigger" in pf and cur_bid <= pf["sl_trigger"]:
+                pf["_exit_price"] = max(1, cur_bid - 1)
+                self._paper_fvg_close("sl_hit")
+            # 3. Time decay: <2 min left, sell at current bid
             elif seconds_remaining < 120 and cur_bid > pf["entry_price"]:
                 pf["_exit_price"] = cur_bid
                 self._paper_fvg_close("time_exit_profit")
             elif seconds_remaining < 60:
                 pf["_exit_price"] = cur_bid
                 self._paper_fvg_close("time_exit_any")
-            # 3. Profit trail: HWM reached entry+5, bid dropped back
+            # 4. Profit trail: HWM reached entry+5, bid dropped back
             elif pf["hwm_bid"] >= pf["entry_price"] + 5 and cur_bid <= pf["hwm_bid"] - 4:
                 pf["_exit_price"] = cur_bid
                 self._paper_fvg_close("trail_exit")
+
+        # ── LIVE_PENDING: entry order placed, awaiting fill or timeout ──
+        # 2026-05-05: live wiring. The entry place_order call may have
+        # returned with filled_count=0 (post_only at bid+1 didn't cross)
+        # — the order rests at our limit. We poll Kalshi here for either
+        # a late fill or expiry of the NOFILL timeout.
+        if pf["state"] == "LIVE_PENDING":
+            try:
+                await self._paper_fvg_live_pending_tick(now=now)
+            except Exception:
+                logger.exception("PAPER FVG LIVE_PENDING tick error")
+
+        # ── LIVE_HOLDING: real position open, manage TP/SL/time-exit ──
+        # 2026-05-05: live wiring. Resting TP at tier_tp_price already
+        # placed. We poll Kalshi-side bid for SL trigger; if hit, cancel
+        # TP + cross-spread sell. On time-cap (60s left), cancel TP +
+        # market-sell at bid. Always reconcile residual via
+        # _reconcile_residual_position to catch any stranded inventory.
+        if pf["state"] == "LIVE_HOLDING":
+            try:
+                await self._paper_fvg_live_holding_tick(
+                    now=now,
+                    seconds_remaining=seconds_remaining,
+                )
+            except Exception:
+                logger.exception("PAPER FVG LIVE_HOLDING tick error")
+
+    # ═══════════════════════════════════════════════════════════════════
+    # 2026-05-05 LIVE FVG WIRING
+    # ═══════════════════════════════════════════════════════════════════
+    # When PAPER_FVG_LIVE_MODE=True, _paper_fvg_tick routes the tier-aware
+    # entry decision through these helpers. The flow:
+    #
+    #   _paper_fvg_live_entry()
+    #       → check ticker lock + balance floor + daily-loss halt
+    #       → size via tier fraction × real balance
+    #       → place buy at bid+1 (post_only=True)
+    #       → on filled>0: place resting TP at tier_tp_price → LIVE_HOLDING
+    #       → on filled=0: → LIVE_PENDING (8s NOFILL cancel timer)
+    #
+    #   _paper_fvg_live_pending_tick()
+    #       → if 8s elapsed and order still resting → cancel + IDLE
+    #       → if late-fill detected via get_positions → place TP → LIVE_HOLDING
+    #
+    #   _paper_fvg_live_holding_tick()
+    #       → if cur_bid <= sl_trig: cancel TP + market-sell + residual + IDLE
+    #       → if seconds_remaining < 60: cancel TP + sell-at-bid + residual + IDLE
+    #       → if Kalshi position now zero (TP filled): residual + IDLE
+    #
+    #   _paper_fvg_live_close()
+    #       → log close + persist DB row + call _reconcile_residual_position
+    #
+    # Safety: every sell goes through self._place_capped_side_sell which
+    # has the MIN-TRUTH gate, position-zero gate, and OVERSELL-GUARD baked
+    # in (per Phase A safety overhaul + 2026-05-04 catastrophe fix).
+    # The ticker lock is added pre-await for race protection and removed
+    # on place_order failure (per 2026-05-03 LOCK-RELEASE pattern).
+    # ═══════════════════════════════════════════════════════════════════
+
+    async def _paper_fvg_live_entry(
+        self, *, ticker: str, side: str, tier: int, baseline: int,
+        fair: int, fvg_vs_baseline: int, prob, btc: float,
+        btc_5m_proxy: float, aligned: bool, btc_dist_pct: float,
+        session_age: int, seconds_remaining: float,
+    ) -> None:
+        """Place a real Kalshi entry for the FVG signal. Mirrors the
+        BB_PURE place pattern: post_only at bid+1, ticker-lock pre-await,
+        lock-release on failure, NOFILL → LIVE_PENDING with cancel timer.
+        """
+        from _fvg_tiering import (
+            compute_size_contracts, tier_tp_price, tier_sl_price,
+        )
+        pf = self._paper_fvg
+
+        # ── Per-window ticker lock (race protection) ───────────────────
+        if ticker in self._entered_tickers_this_window:
+            logger.info(
+                "PAPER FVG LIVE SKIP: %s already entered this window",
+                ticker[-15:],
+            )
+            return
+
+        # ── Real balance for sizing ────────────────────────────────────
+        try:
+            _bal = await self._client.get_balance()
+            balance_cents = int(_bal.balance)
+        except Exception as e:
+            logger.warning("PAPER FVG LIVE: get_balance failed: %s", e)
+            return
+
+        # ── Daily-loss halt circuit breaker ────────────────────────────
+        # Track session-day starting balance; halt if current bal drops
+        # FVG_DAILY_LOSS_HALT_FRAC below.
+        import datetime as _dt
+        today_str = _dt.datetime.now().strftime("%Y-%m-%d")
+        if pf.get("live_day_start_date", "") != today_str:
+            pf["live_day_start_balance"] = balance_cents
+            pf["live_day_start_date"] = today_str
+            logger.info(
+                "PAPER FVG LIVE: new session day %s — start_bal=$%.2f",
+                today_str, balance_cents / 100,
+            )
+        day_start = pf.get("live_day_start_balance", balance_cents) or balance_cents
+        halt_frac = float(_uc("FVG_DAILY_LOSS_HALT_FRAC", 0.20))
+        if balance_cents < day_start * (1.0 - halt_frac):
+            logger.error(
+                "PAPER FVG LIVE DAILY-LOSS-HALT: bal=$%.2f < $%.2f "
+                "(start=$%.2f, halt at -%.0f%%) — halting for the day",
+                balance_cents / 100,
+                day_start * (1.0 - halt_frac) / 100,
+                day_start / 100, halt_frac * 100,
+            )
+            pf["halted"] = True
+            return
+
+        # ── Get bid for maker entry ────────────────────────────────────
+        ws = getattr(self, "_kalshi_ws", None)
+        book = None
+        if ws is not None and hasattr(ws, "get_book"):
+            try:
+                book = ws.get_book(ticker)
+            except Exception:
+                book = None
+        if book is None:
+            logger.info("PAPER FVG LIVE: no book for %s — abort", ticker[-15:])
+            return
+        if side == "yes":
+            entry_bid = int(getattr(book, "best_yes_bid", 0) or 0)
+        else:
+            entry_bid = int(getattr(book, "best_no_bid", 0) or 0)
+        if entry_bid <= 0 or entry_bid >= 99:
+            logger.info(
+                "PAPER FVG LIVE: invalid bid=%d for side=%s — abort",
+                entry_bid, side,
+            )
+            return
+        entry_px = entry_bid + 1
+        # Cheap-side cap (MAX_ENTRY_CENTS — defended again here).
+        max_entry = int(_uc("FVG_LIVE_MAX_ENTRY_CENTS", 75))
+        if entry_px > max_entry:
+            logger.info(
+                "PAPER FVG LIVE CHEAP-SIDE-BLOCK: entry_px=%dc > %dc — abort",
+                entry_px, max_entry,
+            )
+            return
+
+        # ── Size via tier fraction with real balance ───────────────────
+        max_exp = float(_uc("FVG_LIVE_MAX_TICKER_EXPOSURE_FRAC", 0.40))
+        contracts = compute_size_contracts(
+            tier=tier, balance_cents=balance_cents, entry_c=entry_px,
+            max_exposure_frac=max_exp, min_contracts=1,
+            max_contracts_cap=int(_uc("FVG_LIVE_MAX_CONTRACTS_CAP", 200)),
+        )
+        if contracts == 0:
+            logger.info(
+                "PAPER FVG LIVE TIER-UNDERSIZED: tier=%d bal=$%.2f "
+                "entry=%dc — refused",
+                tier, balance_cents / 100, entry_px,
+            )
+            return
+
+        cost_cents = contracts * entry_px
+        # Pre-fire balance gate: need ≥ 1.5× cost so a partial fill +
+        # taker-fee exit doesn't hit insufficient_balance.
+        if balance_cents < int(cost_cents * 1.5):
+            logger.warning(
+                "PAPER FVG LIVE BAL-FLOOR: bal=$%.2f < 1.5×cost=$%.2f "
+                "— refusing (avoid insufficient_balance on exit)",
+                balance_cents / 100, cost_cents * 1.5 / 100,
+            )
+            return
+
+        tp_px = min(tier_tp_price(tier, entry_px), 95)
+        sl_trig = max(1, tier_sl_price(tier, entry_px))
+
+        # ── Pre-await: add ticker lock for race protection ─────────────
+        self._add_session_lock(ticker)
+        try:
+            self._recent_placement_tickers[ticker] = time.time()
+        except Exception:
+            pass
+
+        logger.warning(
+            "PAPER FVG LIVE FIRE [T%d]: %s %s %dx @ %dc ($%.2f) | "
+            "tp=%dc sl=%dc | bal=$%.2f age=%ds aligned=%s "
+            "|dist|=%.3f%% fvg=%+dc",
+            tier, side.upper(), ticker[-15:], contracts, entry_px,
+            cost_cents / 100, tp_px, sl_trig,
+            balance_cents / 100, session_age, aligned,
+            btc_dist_pct, fvg_vs_baseline,
+        )
+
+        try:
+            order = await self._client.place_order(
+                ticker=ticker, side=side, price=entry_px,
+                count=contracts, post_only=True,
+            )
+        except Exception as e:
+            # Lock-release pattern (per 2026-05-03 BB_PURE precedent):
+            # if place_order failed, no order landed — release the lock
+            # so the next signal can retry on this ticker.
+            logger.error(
+                "PAPER FVG LIVE place_order failed: %s — releasing session lock for %s",
+                e, ticker[-15:],
+            )
+            self._remove_session_lock(ticker)
+            try:
+                self._recent_placement_tickers.pop(ticker, None)
+            except Exception:
+                pass
+            return
+
+        filled = int(getattr(order, "filled_count", 0) or 0)
+        oid = getattr(order, "order_id", "") or ""
+
+        pf["live_ticker"] = ticker
+        pf["live_side"] = side
+        pf["live_tier"] = int(tier)
+        pf["live_entry_px"] = int(entry_px)
+        pf["live_entry_order_id"] = oid
+        pf["live_entry_placed_ts"] = time.time()
+        pf["live_tp_px"] = int(tp_px)
+        pf["live_sl_trig"] = int(sl_trig)
+        pf["live_balance_at_entry"] = int(balance_cents)
+        pf["live_entry_ts"] = time.time()
+        # Cache signal-side metadata for close logging
+        pf["entry_side"] = side
+        pf["entry_price"] = int(entry_px)
+        pf["entry_btc"] = float(btc)
+        pf["entry_fair"] = int(fair)
+        pf["entry_prob"] = float(getattr(prob, "probability", 0.0) or 0.0)
+        pf["entry_edge"] = int(abs(fvg_vs_baseline))
+        pf["entry_vol"] = float(getattr(prob, "volatility", 0.0) or 0.0)
+        pf["entry_btc_dist_pct"] = float(btc_dist_pct)
+        pf["tier"] = int(tier)
+        pf["aligned_with_btc5m"] = bool(aligned)
+        pf["btc_5m_proxy"] = float(btc_5m_proxy)
+
+        if filled <= 0:
+            logger.warning(
+                "PAPER FVG LIVE NOFILL: order=%s placed at %dc — "
+                "letting LIVE_PENDING tick handle late-fill or 8s cancel",
+                oid[:12], entry_px,
+            )
+            pf["state"] = "LIVE_PENDING"
+            return
+
+        # ── FILLED: place resting TP, transition to LIVE_HOLDING ───────
+        pf["live_filled_count"] = int(filled)
+        pf["entry_price"] = int(entry_px)  # actual fill price (post_only=True so == entry_px)
+        pf["hwm_bid"] = int(entry_px)
+
+        try:
+            tp_order = await self._client.place_order(
+                ticker=ticker, side=side, price=tp_px,
+                count=filled, action="sell", post_only=True,
+            )
+            pf["live_tp_order_id"] = getattr(tp_order, "order_id", "") or ""
+            logger.warning(
+                "PAPER FVG LIVE FILL [T%d]: %dx @ %dc | TP placed @ %dc oid=%s",
+                tier, filled, entry_px, tp_px,
+                pf["live_tp_order_id"][:12],
+            )
+        except Exception as e:
+            logger.error(
+                "PAPER FVG LIVE: TP place failed (%s) — entering LIVE_HOLDING "
+                "without resting TP; SL/time-exit still active",
+                e,
+            )
+            pf["live_tp_order_id"] = ""
+
+        pf["state"] = "LIVE_HOLDING"
+
+    async def _paper_fvg_live_pending_tick(self, *, now: float) -> None:
+        """Handle a resting entry order that hasn't filled yet."""
+        pf = self._paper_fvg
+        timeout_s = float(_uc("FVG_LIVE_NOFILL_TIMEOUT_S", 8.0))
+        elapsed = now - float(pf.get("live_entry_placed_ts", now) or now)
+
+        # Check Kalshi truth — did we get a late fill?
+        try:
+            positions = await self._client.get_positions()
+        except Exception:
+            positions = []
+        held = 0
+        for p in positions:
+            if p.get("ticker") == pf.get("live_ticker"):
+                try:
+                    held = abs(int(p.get("position", 0) or 0))
+                except Exception:
+                    held = 0
+                break
+
+        if held > 0:
+            # Late fill detected — place TP and transition to LIVE_HOLDING.
+            try:
+                tp_order = await self._client.place_order(
+                    ticker=pf["live_ticker"], side=pf["live_side"],
+                    price=int(pf["live_tp_px"]), count=int(held),
+                    action="sell", post_only=True,
+                )
+                pf["live_tp_order_id"] = getattr(tp_order, "order_id", "") or ""
+            except Exception as e:
+                logger.error(
+                    "PAPER FVG LIVE late-fill TP place failed: %s", e,
+                )
+                pf["live_tp_order_id"] = ""
+            pf["live_filled_count"] = int(held)
+            pf["entry_price"] = int(pf["live_entry_px"])
+            pf["hwm_bid"] = int(pf["live_entry_px"])
+            pf["state"] = "LIVE_HOLDING"
+            logger.warning(
+                "PAPER FVG LIVE LATE-FILL [T%d]: %dx @ %dc | TP @ %dc oid=%s",
+                int(pf.get("live_tier", 0) or 0), held, pf["live_entry_px"],
+                pf["live_tp_px"], pf["live_tp_order_id"][:12],
+            )
+            return
+
+        # No fill yet — has the timeout elapsed?
+        if elapsed >= timeout_s:
+            oid = pf.get("live_entry_order_id", "") or ""
+            if oid:
+                try:
+                    await self._client.cancel_order(oid)
+                    logger.warning(
+                        "PAPER FVG LIVE NOFILL CANCEL: order=%s after %.1fs",
+                        oid[:12], elapsed,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "PAPER FVG LIVE NOFILL cancel failed: %s "
+                        "(may have filled or already gone)", e,
+                    )
+            # Reset to IDLE — ticker lock STAYS (one attempt per session).
+            pf["state"] = "IDLE"
+            pf["live_entry_order_id"] = ""
+
+    async def _paper_fvg_live_holding_tick(
+        self, *, now: float, seconds_remaining: float,
+    ) -> None:
+        """Manage a live FVG position: TP filled, SL trigger, time-exit."""
+        pf = self._paper_fvg
+        ticker = pf.get("live_ticker", "") or ""
+        side = pf.get("live_side", "") or ""
+        if not ticker or not side:
+            pf["state"] = "IDLE"
+            return
+
+        # ── 1. Has the resting TP filled? Verify via get_positions ─────
+        try:
+            positions = await self._client.get_positions()
+        except Exception:
+            positions = []
+        held = 0
+        for p in positions:
+            if p.get("ticker") == ticker:
+                try:
+                    held = abs(int(p.get("position", 0) or 0))
+                except Exception:
+                    held = 0
+                break
+
+        if held == 0:
+            # Position is flat per Kalshi truth — TP must have filled.
+            await self._paper_fvg_live_close(reason="tp_filled")
+            return
+
+        # ── 2. Read current bid for SL/time-exit checks ───────────────
+        ws = getattr(self, "_kalshi_ws", None)
+        book = None
+        if ws is not None and hasattr(ws, "get_book"):
+            try:
+                book = ws.get_book(ticker)
+            except Exception:
+                book = None
+        if book is None:
+            return  # try again next tick
+        if side == "yes":
+            cur_bid = int(getattr(book, "best_yes_bid", 0) or 0)
+        else:
+            cur_bid = int(getattr(book, "best_no_bid", 0) or 0)
+        if cur_bid > pf.get("hwm_bid", 0):
+            pf["hwm_bid"] = cur_bid
+
+        sl_trig = int(pf.get("live_sl_trig", 0) or 0)
+
+        # ── 3. SL hit → cancel TP + cross-spread sell at bid-1 ────────
+        if cur_bid > 0 and cur_bid <= sl_trig:
+            await self._paper_fvg_live_emergency_exit(
+                reason="sl_hit", cur_bid=cur_bid, held=int(held),
+            )
+            return
+
+        # ── 4. Time-cap < 60s → cancel TP + sell-at-bid ───────────────
+        if seconds_remaining < 60:
+            await self._paper_fvg_live_emergency_exit(
+                reason="time_exit_any", cur_bid=cur_bid, held=int(held),
+            )
+            return
+
+    async def _paper_fvg_live_emergency_exit(
+        self, *, reason: str, cur_bid: int, held: int,
+    ) -> None:
+        """Cancel resting TP + market-sell remaining holdings + reconcile.
+
+        Uses self._place_capped_side_sell which has MIN-TRUTH + OVERSELL-
+        GUARD baked in — never sells more than Kalshi-verified inventory.
+        """
+        pf = self._paper_fvg
+        ticker = pf.get("live_ticker", "") or ""
+        side = pf.get("live_side", "") or ""
+        tp_oid = pf.get("live_tp_order_id", "") or ""
+
+        # 1. Cancel resting TP first (cancel-first-verified pattern)
+        if tp_oid:
+            try:
+                await self._client.cancel_order(tp_oid)
+            except Exception as e:
+                logger.warning(
+                    "PAPER FVG LIVE EMERGENCY-EXIT (%s): TP cancel "
+                    "failed: %s — proceeding to sell anyway",
+                    reason, e,
+                )
+            pf["live_tp_order_id"] = ""
+
+        # 2. Cross-spread sell. price = max(1, bid-1) so we cross.
+        sell_px = max(1, int(cur_bid - 1) if cur_bid > 1 else 1)
+        try:
+            await self._place_capped_side_sell(
+                ticker=ticker, side=side,
+                price=sell_px, requested_count=int(held),
+                post_only=False,
+                reason=f"FVG-LIVE-{reason.upper()}",
+            )
+        except Exception as e:
+            logger.error(
+                "PAPER FVG LIVE EMERGENCY-EXIT (%s): sell failed: %s",
+                reason, e,
+            )
+
+        # 3. Close + residual reconcile
+        await self._paper_fvg_live_close(reason=reason, exit_px=sell_px)
+
+    async def _paper_fvg_live_close(
+        self, *, reason: str, exit_px: int | None = None,
+    ) -> None:
+        """Log close, persist DB row, and run residual reconciler.
+
+        Always runs the residual reconciler — that's the guarantee
+        against the 2026-04-22 oversell-to-short pattern.
+        """
+        pf = self._paper_fvg
+        ticker = pf.get("live_ticker", "") or ""
+        side = pf.get("live_side", "") or ""
+        if not ticker:
+            pf["state"] = "IDLE"
+            return
+
+        # Refresh balance for P&L attribution
+        try:
+            _bal = await self._client.get_balance()
+            bal_after = int(_bal.balance)
+        except Exception:
+            bal_after = 0
+
+        entry_px = int(pf.get("live_entry_px", 0) or 0)
+        contracts = int(pf.get("live_filled_count", 0) or 0)
+        exit_px_int = int(exit_px) if exit_px is not None else int(pf.get("live_tp_px", 0) or 0)
+        revenue = contracts * exit_px_int
+        cost = contracts * entry_px
+        pnl_cents = revenue - cost
+        bal_before = int(pf.get("live_balance_at_entry", 0) or 0)
+
+        logger.warning(
+            "PAPER FVG LIVE CLOSE [T%d]: %s %dx entry=%dc exit=%dc (%s) | "
+            "pnl=$%+.2f | bal_before=$%.2f bal_after=$%.2f",
+            int(pf.get("live_tier", 0) or 0),
+            side.upper(), contracts, entry_px, exit_px_int, reason,
+            pnl_cents / 100, bal_before / 100, bal_after / 100,
+        )
+
+        # Persist a row for analytics
+        try:
+            import sqlite3 as _sq
+            conn = _sq.connect("data/trades.db")
+            c = conn.cursor()
+            c.execute("""CREATE TABLE IF NOT EXISTS fvg_live_trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticker TEXT, tier INTEGER, side TEXT,
+                entry_price INTEGER, exit_price INTEGER,
+                contracts INTEGER, exit_reason TEXT,
+                bal_before_cents INTEGER, bal_after_cents INTEGER,
+                pnl_cents INTEGER,
+                entry_ts REAL, close_ts REAL,
+                aligned INTEGER, btc_dist_pct REAL, btc_5m_proxy REAL,
+                tp_price INTEGER, sl_trigger INTEGER,
+                created_at TEXT DEFAULT (datetime('now'))
+            )""")
+            c.execute(
+                "INSERT INTO fvg_live_trades VALUES "
+                "(NULL,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))",
+                (ticker, int(pf.get("live_tier", 0) or 0), side,
+                 entry_px, exit_px_int, contracts, reason,
+                 bal_before, bal_after, pnl_cents,
+                 float(pf.get("live_entry_ts", 0) or 0), time.time(),
+                 1 if pf.get("aligned_with_btc5m", False) else 0,
+                 float(pf.get("entry_btc_dist_pct", 0.0) or 0.0),
+                 float(pf.get("btc_5m_proxy", 0.0) or 0.0),
+                 int(pf.get("live_tp_px", 0) or 0),
+                 int(pf.get("live_sl_trig", 0) or 0)),
+            )
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.debug("PAPER FVG LIVE save failed: %s", e)
+
+        # Reset state to IDLE before residual reconcile so a residual
+        # error path can't double-fire close.
+        pf["state"] = "IDLE"
+        pf["live_tp_order_id"] = ""
+        pf["live_entry_order_id"] = ""
+
+        # Residual reconcile — A5 safety guarantee
+        try:
+            await self._reconcile_residual_position(
+                ticker=ticker, expected_side=side,
+                reason=f"FVG-LIVE-CLOSE-{reason}",
+            )
+        except Exception:
+            logger.exception(
+                "PAPER FVG LIVE: residual reconcile error (ticker=%s)",
+                ticker[-15:],
+            )
+
+    async def _paper_fvg_live_session_rollover(self, ctx: dict) -> None:
+        """Clean up a live position whose ticker rolled to next window.
+
+        Cancels any resting TP, cross-spread sells remaining inventory,
+        runs residual reconciler. Called as a background task because the
+        state machine has already moved to the new session.
+        """
+        ticker = ctx.get("ticker", "") or ""
+        side = ctx.get("side", "") or ""
+        if not ticker or not side:
+            return
+        logger.warning(
+            "PAPER FVG LIVE SESSION-ROLLOVER: ticker=%s side=%s — "
+            "cleaning up resting orders + residual",
+            ticker[-15:], side.upper(),
+        )
+        # Cancel resting TP if any
+        for _oid_key in ("tp_oid", "entry_oid"):
+            _oid = ctx.get(_oid_key, "") or ""
+            if _oid:
+                try:
+                    await self._client.cancel_order(_oid)
+                except Exception as e:
+                    logger.warning(
+                        "PAPER FVG LIVE ROLLOVER: cancel %s failed: %s",
+                        _oid_key, e,
+                    )
+        # Get current bid for cross-spread sell
+        try:
+            ws = getattr(self, "_kalshi_ws", None)
+            book = ws.get_book(ticker) if ws and hasattr(ws, "get_book") else None
+            if book is not None:
+                cur_bid = (
+                    int(getattr(book, "best_yes_bid", 0) or 0)
+                    if side == "yes"
+                    else int(getattr(book, "best_no_bid", 0) or 0)
+                )
+            else:
+                cur_bid = 1
+        except Exception:
+            cur_bid = 1
+        sell_px = max(1, int(cur_bid - 1) if cur_bid > 1 else 1)
+        # Try to flatten — _place_capped_side_sell will no-op if Kalshi
+        # truth says position is already 0 (TP filled before roll).
+        try:
+            await self._place_capped_side_sell(
+                ticker=ticker, side=side,
+                price=sell_px,
+                requested_count=int(ctx.get("filled", 0) or 0) or 1,
+                post_only=False,
+                reason="FVG-LIVE-ROLLOVER",
+            )
+        except Exception as e:
+            logger.warning(
+                "PAPER FVG LIVE ROLLOVER: capped-sell error: %s", e,
+            )
+        # Final residual reconcile
+        try:
+            await self._reconcile_residual_position(
+                ticker=ticker, expected_side=side,
+                reason="FVG-LIVE-ROLLOVER",
+            )
+        except Exception:
+            logger.exception(
+                "PAPER FVG LIVE ROLLOVER: residual reconcile error",
+            )
 
     def _paper_fvg_close(self, reason: str) -> None:
         """Close paper FVG trade and log to DB."""
@@ -10064,6 +10826,59 @@ class PolymarketCopyEngine:
             )
             return
 
+        # ── FIX 2 (2026-05-04): BTC velocity asymmetry veto ───────────
+        # If BTC is moving sharply against the side we're about to enter,
+        # the BB mispricing is almost certainly going to widen further
+        # before reverting. NO entry into a strong up-move = catching a
+        # falling knife on the inverse; YES entry into a strong down-move
+        # = same. tick_velocity is signed dollar change over the 30s
+        # window stored on price_feed.tick_tracker.
+        try:
+            if bool(_uc("BB_PURE_VELOCITY_VETO_ENABLED", True)):
+                _vthresh = float(_uc("BB_PURE_VELOCITY_VETO_THRESHOLD", 2.0))
+                _pf_v = getattr(self, "_price_feed", None)
+                _tt_v = getattr(_pf_v, "tick_tracker", None) if _pf_v else None
+                _vel = None
+                if _tt_v is not None and not getattr(_tt_v, "is_stale", True):
+                    _vel = float(getattr(_tt_v, "tick_velocity", 0.0) or 0.0)
+                if _vel is not None:
+                    _vol_above = None
+                    _vol_below = None
+                    try:
+                        _vt_v = getattr(_pf_v, "volume_tracker", None) if _pf_v else None
+                        _prob_v = getattr(_pf_v, "prob_engine", None) if _pf_v else None
+                        _strike_v = float(getattr(_prob_v, "strike", 0.0) or 0.0) if _prob_v else 0.0
+                        if (_vt_v is not None
+                                and not getattr(_vt_v, "is_stale", True)
+                                and _strike_v > 0):
+                            _vol_above = float(
+                                _vt_v.cumulative_volume_above(_strike_v) or 0.0)
+                            _vol_below = float(
+                                _vt_v.cumulative_volume_below(_strike_v) or 0.0)
+                    except Exception:
+                        _vol_above = None
+                        _vol_below = None
+                    _veto = False
+                    _veto_reason = ""
+                    if sig.side == "no" and _vel > _vthresh:
+                        _veto = True
+                        _veto_reason = "NO entry blocked, btc_vel=+%.2f$/s" % _vel
+                    elif sig.side == "yes" and _vel < -_vthresh:
+                        _veto = True
+                        _veto_reason = "YES entry blocked, btc_vel=%.2f$/s" % _vel
+                    if _veto:
+                        _vol_str = ""
+                        if _vol_above is not None and _vol_below is not None:
+                            _vol_str = " vol_above=%.1f vol_below=%.1f" % (
+                                _vol_above, _vol_below)
+                        logger.warning(
+                            "BB_PURE VELOCITY-VETO: %s ticker=%s thresh=±%.2f%s",
+                            _veto_reason, ticker[-15:], _vthresh, _vol_str,
+                        )
+                        return
+        except Exception as _vveto_err:
+            logger.debug("BB_PURE velocity-veto check failed: %s", _vveto_err)
+
         # ── Pre-fire EXIT-LIQUIDITY gate (2026-05-03) ──────────────────
         # Live regression observed 2026-05-03 11:30 PT: BB_PURE FIRE on
         # ticker 26MAY031445-45 (YES 7x @ 51c) entered cleanly, but when
@@ -10387,6 +11202,18 @@ class PolymarketCopyEngine:
                 sig, "entry_btc_above_strike", None),
             "_mom_best_seen_cents": int(entry_px),  # MFE tracker
         }
+        # 2026-05-04 MRC: per-fill contract-momentum analyzer. Additive —
+        # any failure inside .update() neutralizes its outputs but does
+        # not raise. Disabled via MRC_ENABLED in user_config.
+        try:
+            if (_MRC_AVAILABLE
+                    and ContractMomentumAnalyzer is not None
+                    and bool(_uc("MRC_ENABLED", True))):
+                self._open_position["_momentum_analyzer"] = (
+                    ContractMomentumAnalyzer(side=sig.side)
+                )
+        except Exception as _mrc_init_err:
+            logger.warning("MRC analyzer init failed: %s", _mrc_init_err)
         # 2026-05-02 Phase 0.1.2: defensive re-add via persist helper.
         self._add_session_lock(ticker)
 
@@ -14829,27 +15656,48 @@ class PolymarketCopyEngine:
                     await self._client.cancel_order(cur)
                 except Exception:
                     pass
-        # Place single market-equivalent sell at the current bid (post_only=False)
+        # FIX 2 (2026-05-04) PRE-EXPIRY TAKER: cross the spread at the
+        # current BID with post_only=False so the order actually fills.
+        # Earlier behavior could rest at mid with post_only and never fill.
+        # If bid is 0 or unavailable, fire-sale at 1c to guarantee exit.
         book = self._kalshi_ws.get_book(ticker) if (
             self._kalshi_ws and hasattr(self._kalshi_ws, "get_book")) else None
-        if side == "yes":
-            actual_bid = int(getattr(book, "best_yes_bid", 0) or 0) if book else 0
+        actual_bid = 0
+        mid_px = 0
+        try:
+            if book:
+                if side == "yes":
+                    actual_bid = int(getattr(book, "best_yes_bid", 0) or 0)
+                else:
+                    actual_bid = int(getattr(book, "best_no_bid", 0) or 0)
+                _our_mid = int(getattr(book, "mid_price_cents", 0) or 0)
+                mid_px = _our_mid if side == "yes" else max(0, 100 - _our_mid)
+        except Exception:
+            pass
+        _taker_enabled = True
+        try:
+            _taker_enabled = bool(_uc("PRE_EXPIRY_TAKER_ENABLED", True))
+        except Exception:
+            _taker_enabled = True
+        if _taker_enabled:
+            sell_px = max(1, actual_bid) if actual_bid > 0 else 1
+            _post_only_flag = False
         else:
-            actual_bid = int(getattr(book, "best_no_bid", 0) or 0) if book else 0
-        sell_px = max(1, actual_bid) if actual_bid > 0 else 1
+            sell_px = max(1, actual_bid) if actual_bid > 0 else 1
+            _post_only_flag = False
         try:
             _consolidate_order, _consolidate_count = await self._place_capped_side_sell(
                 ticker=ticker, side=side,
                 price=sell_px, requested_count=truth_ct,
-                post_only=False,
+                post_only=_post_only_flag,
                 reason="PRE-EXPIRY CONSOLIDATE",
                 known_position_count=truth_ct,
             )
             if not _consolidate_order:
                 raise RuntimeError("sell-cap blocked pre-expiry consolidate")
             logger.warning(
-                "PRE-EXPIRY CONSOLIDATE: placed sell %dct @ %dc",
-                _consolidate_count, sell_px,
+                "PRE-EXPIRY TAKER: selling %dx @ bid=%dc (was mid=%dc)",
+                _consolidate_count, sell_px, mid_px,
             )
         except Exception as e:
             logger.error("PRE-EXPIRY CONSOLIDATE place_order failed: %s", e)
@@ -14858,7 +15706,15 @@ class PolymarketCopyEngine:
         return True
 
     async def _get_verified_side_position_count(self, ticker: str, side: str) -> int:
-        """Return Kalshi-truth inventory count for ticker/side."""
+        """Return Kalshi-truth inventory count for ticker/side.
+
+        2026-05-04: made the YES/NO branches symmetric. Previously the NO
+        branch only used ``position_fp`` as a fallback when
+        ``raw_position < 0`` — which broke when the Kalshi response had
+        only ``position_fp`` set (e.g. ``{"position_fp": "-50"}`` without
+        the ``position`` int). Now both branches consult the resolved
+        signed count and just flip the sign for NO.
+        """
         try:
             positions = await self._client.get_positions()
         except Exception:
@@ -14875,12 +15731,136 @@ class PolymarketCopyEngine:
                 fp_position = int(float(p.get("position_fp", "0") or 0))
             except Exception:
                 fp_position = 0
+            # Prefer raw int; fall back to fp when raw is missing/zero.
+            signed = raw_position if raw_position != 0 else fp_position
             if normalized_side == "yes":
-                return max(0, raw_position, fp_position)
+                return max(0, signed)
             if normalized_side == "no":
-                return max(0, -raw_position, abs(fp_position) if raw_position < 0 else 0)
-            return abs(raw_position or fp_position)
+                return max(0, -signed)
+            return abs(signed)
         return 0
+
+    async def _flat_confirm_recheck(
+        self,
+        ticker: str,
+        side: str,
+        entry_c: int,
+        strategy: str,
+        orig_count: int,
+        bb_fair: int,
+        bb_mid: int,
+        bb_edge: float,
+    ) -> None:
+        """FIX 1 (2026-05-04): 5-second post-FLAT-CONFIRMED recheck.
+
+        Kalshi's positions cache occasionally flips 0→N seconds after a
+        FLAT-CONFIRMED. Without this recheck, the engine treats the
+        re-detected position as 'manual' and leaves it uncovered. This
+        polls one more time after a delay; if the position has
+        reappeared, RE-ADOPT it (re-set _open_position so protective +
+        TP placement resumes).
+
+        Wrapped in try/except — must never crash the engine.
+        """
+        try:
+            delay_s = float(_uc("FLAT_CONFIRM_RECHECK_DELAY_S", 5.0))
+        except Exception:
+            delay_s = 5.0
+        try:
+            await asyncio.sleep(max(0.5, delay_s))
+        except Exception:
+            return
+        try:
+            verified = 0
+            try:
+                verified = await self._get_verified_side_position_count(
+                    ticker, side,
+                )
+            except Exception as _ge:
+                logger.debug(
+                    "FLAT-CONFIRM RECHECK: get_verified raised: %s", _ge
+                )
+                return
+            if verified <= 0:
+                logger.warning(
+                    "FLAT-CONFIRM RECHECK: confirmed flat after %.1fs "
+                    "(ticker=%s side=%s) — no re-adopt needed",
+                    delay_s, ticker[-15:], side,
+                )
+                return
+            # Position re-appeared. If we're already tracking a fresh
+            # position (perhaps a new BB_PURE FIRE in the gap), don't
+            # clobber it — only RE-ADOPT when state is clean.
+            if (self._open_position is not None
+                    and self._open_position.get("ticker") == ticker
+                    and int(self._open_position.get("count", 0) or 0) > 0):
+                logger.warning(
+                    "FLAT-CONFIRM RECHECK: re-polled after %.1fs, found "
+                    "%dct on %s but engine already tracking %dct — "
+                    "skipping re-adopt (state already healthy)",
+                    delay_s, verified, ticker[-15:],
+                    int(self._open_position.get("count", 0) or 0),
+                )
+                return
+            logger.warning(
+                "FLAT-CONFIRM RECHECK: re-polled after %.1fs, found %dct "
+                "on %s side=%s → RE-ADOPTING (entry=%dc strat=%s)",
+                delay_s, verified, ticker[-15:], side, entry_c, strategy,
+            )
+            # Reconstruct the position dict so protective layer can take
+            # ownership. Mirrors the SYNC RECLAIM shape so downstream
+            # code paths see a familiar dict.
+            _entry = int(entry_c) if entry_c > 0 else 0
+            new_pos = {
+                "order_id": "flat_confirm_recheck_readopt",
+                "side": side,
+                "entry_cents": _entry,
+                "original_entry_cents": _entry,
+                "original_count": int(orig_count or verified),
+                "ticker": ticker,
+                "tier": strategy,
+                "strategy_name": strategy,
+                "count": int(verified),
+                "fill_time": time.time(),
+                "_dca_maxed": True,
+                "entry_conviction": 0.0,
+                "entry_wallets": 0,
+                "entry_wallet_count_at_last_scale": 0,
+                "high_water_bid": _entry,
+                "had_flow_at_entry": False,
+                "tiers_in": set(),
+                "entry_elite_wallets": set(),
+                "shallow_filled": int(verified),
+                "shallow_price": _entry,
+                "deep_filled": 0,
+                "deep_price": _entry,
+                "signal_wallet_names": [],
+                "tp_order_id": None,
+                "tp_order_ids": [],
+                "tp_price": 0,
+            }
+            if strategy == "BB_PURE" and bb_fair > 0:
+                new_pos["_bb_pure_fair_yes_cents_at_entry"] = int(bb_fair)
+                new_pos["_bb_pure_market_mid_at_entry"] = int(bb_mid)
+                new_pos["_bb_pure_edge_pp_at_entry"] = float(bb_edge)
+            # Attach MRC analyzer (FIX 3) so the re-adopted position is
+            # also covered by the contract-momentum layer.
+            try:
+                if (_MRC_AVAILABLE
+                        and ContractMomentumAnalyzer is not None
+                        and bool(_uc("MRC_ENABLED", True))
+                        and bool(_uc("MRC_RECLAIM_ATTACH_ENABLED", True))):
+                    new_pos["_momentum_analyzer"] = (
+                        ContractMomentumAnalyzer(side=side)
+                    )
+            except Exception as _mrc_init_err:
+                logger.debug(
+                    "FLAT-CONFIRM RECHECK MRC init failed: %s",
+                    _mrc_init_err,
+                )
+            self._open_position = new_pos
+        except Exception as _re:
+            logger.error("FLAT-CONFIRM RECHECK: unexpected error: %s", _re)
 
     async def _fetch_resting_side_sells(self, ticker: str, side: str) -> list[dict]:
         """Fetch authoritative resting sell orders for ticker/side."""
@@ -14917,6 +15897,42 @@ class PolymarketCopyEngine:
             logger.error("%s cancel-verify get_order(%s) raised: %s", context, order_id[:12], exc)
             return False
 
+    @staticmethod
+    def _exposure_cap_check(
+        *,
+        kalshi_count: int,
+        entry_cents: int,
+        bankroll_cents: int,
+        cap_frac: float = 0.25,
+        enabled: bool = True,
+    ) -> tuple[bool, int, int]:
+        """Return ``(blocked, implied_cost_c, cap_c)`` for the per-ticker
+        exposure cap (2026-05-04 post-catastrophe).
+
+        Pure-arithmetic helper, factored out for unit testability. The cap
+        is computed against ``(bankroll + already-escrowed exposure)`` so
+        the comparison is against the bankroll-equivalent total, not just
+        the cash currently in the account (which has already been depleted
+        by the escrowed contracts).
+
+        - ``blocked`` is True when the implied cost of the position
+          exceeds ``cap_frac * (bankroll + escrowed)``.
+        - ``implied_cost_c`` = ``kalshi_count * max(1, entry_cents)``.
+        - ``cap_c`` = the dollar threshold above which we refuse.
+
+        With ``enabled=False`` the helper always returns
+        ``(False, 0, 0)`` (legacy behavior).
+        """
+        if not enabled:
+            return False, 0, 0
+        if kalshi_count <= 0 or bankroll_cents < 0:
+            return False, 0, 0
+        implied_cost_c = int(kalshi_count) * max(1, int(entry_cents))
+        projected_total_c = int(bankroll_cents) + implied_cost_c
+        cap_c = int(projected_total_c * float(cap_frac))
+        blocked = projected_total_c > 0 and implied_cost_c > cap_c
+        return blocked, implied_cost_c, cap_c
+
     async def _place_capped_side_sell(
         self,
         *,
@@ -14947,23 +15963,46 @@ class PolymarketCopyEngine:
            _maintain_protective_order got in commit 168dfd2. Per the
            agreed scope, the residual-flatten path needs the same
            protection.
+
+        2026-05-04 MIN-TRUTH FIX (post-catastrophe):
+        Position-zero gate now ALWAYS queries Kalshi truth, even when a
+        caller passes ``known_position_count``. The dispatch session's MRC
+        FORCE-EXIT path passed an inflated engine-belief count (13) when
+        Kalshi truth was 0 — the old code trusted the hint and fired sells
+        that Kalshi auto-converted to "buy NO @ (100-price)c" via its sell-
+        to-open semantics, opening 143 phantom NO contracts and draining
+        the account. ``known_position_count`` is now only used to FURTHER
+        cap the Kalshi truth, never to override the zero-gate.
         """
-        position_count = (
-            int(known_position_count)
-            if known_position_count is not None
-            else await self._get_verified_side_position_count(ticker, side)
-        )
-        # ── Guard 1: position-zero gate ──────────────────────────────────
-        # Never place a sell when the Kalshi-truth position is zero.
-        # When known_position_count is provided by a caller, trust it
-        # (e.g. residual-flatten passes the held_count it just observed).
-        # Otherwise we just queried Kalshi and zero is the truth.
-        if position_count <= 0:
-            logger.warning(
-                "%s SELL-CAP: blocked %s %s — position_count=0 (no sells when flat)",
-                reason, ticker, side.upper(),
+        # MIN-TRUTH: Kalshi truth is the authoritative zero-gate. We must
+        # never sell more than Kalshi confirms we hold, regardless of what
+        # the caller believes the count to be.
+        try:
+            kalshi_truth = await self._get_verified_side_position_count(ticker, side)
+        except Exception as _truth_err:
+            logger.error(
+                "%s SELL-CAP: Kalshi truth fetch failed for %s side=%s: %s — "
+                "refusing sell (fail-closed)",
+                reason, ticker, side, _truth_err,
             )
             return None, 0
+        kalshi_truth = int(kalshi_truth or 0)
+        if kalshi_truth <= 0:
+            # Old code with known_position_count passed-through was the bug.
+            # Even when a caller swears the position exists, if Kalshi
+            # disagrees, do NOT open the sell-to-open inverse position.
+            _hint = "" if known_position_count is None else f" (caller hint={int(known_position_count)})"
+            logger.warning(
+                "%s SELL-CAP: blocked %s %s — kalshi_truth=0 (no sells when flat)%s",
+                reason, ticker, side.upper(), _hint,
+            )
+            return None, 0
+        # Hint may FURTHER cap the truth (residual-flatten passes the count
+        # it just observed) but never above it.
+        if known_position_count is not None:
+            position_count = min(int(known_position_count), kalshi_truth)
+        else:
+            position_count = kalshi_truth
 
         resting_orders = await self._fetch_resting_side_sells(ticker, side)
         # ── Guard 2: OVERSELL-GUARD on >1 resting sells ──────────────────
@@ -15234,10 +16273,43 @@ class PolymarketCopyEngine:
                 ticker, side, truth_ct, fill_age_s,
                 zero_n, flat_required_count, zero_span, flat_confirm_window,
             )
+            # Snapshot fields needed by the post-clear recheck BEFORE
+            # _clear_position wipes _open_position.
+            _recheck_entry_c = int(pos.get("original_entry_cents")
+                                   or pos.get("entry_cents", 0) or 0)
+            _recheck_strat = str(pos.get("strategy_name") or
+                                 pos.get("tier") or "BB_PURE")
+            _recheck_orig_count = int(pos.get("original_count", 0) or 0)
+            _recheck_bb_fair = int(
+                pos.get("_bb_pure_fair_yes_cents_at_entry", 0) or 0)
+            _recheck_bb_mid = int(
+                pos.get("_bb_pure_market_mid_at_entry", 0) or 0)
+            _recheck_bb_edge = float(
+                pos.get("_bb_pure_edge_pp_at_entry", 0.0) or 0.0)
             try:
                 await self._clear_position(reason="kalshi_truth_flat")
             except Exception as _ce:
                 logger.error("FLAT-CONFIRM clear_position raised: %s", _ce)
+            # FIX 1 (2026-05-04): schedule a one-shot 5s recheck. Kalshi's
+            # positions cache can flip 0→N within seconds (the bug this
+            # patch addresses). If the position re-appears, RE-ADOPT it
+            # rather than leaving it uncovered.
+            try:
+                if bool(_uc("FLAT_CONFIRM_RECHECK_ENABLED", True)):
+                    asyncio.create_task(
+                        self._flat_confirm_recheck(
+                            ticker=ticker,
+                            side=side,
+                            entry_c=_recheck_entry_c,
+                            strategy=_recheck_strat,
+                            orig_count=_recheck_orig_count,
+                            bb_fair=_recheck_bb_fair,
+                            bb_mid=_recheck_bb_mid,
+                            bb_edge=_recheck_bb_edge,
+                        )
+                    )
+            except Exception as _re:
+                logger.warning("FLAT-CONFIRM recheck schedule failed: %s", _re)
             return True  # owned, no further action this cycle
 
         if truth_ct <= 0:
@@ -15345,6 +16417,75 @@ class PolymarketCopyEngine:
         else:
             tp_offset = int(_uc("PROTECTIVE_TP_OFFSET_C", 5))
             tp_target = max(1, min(99, entry + tp_offset))
+
+        # 2026-05-04 MRC TP MODULATION — scale the premium (tp_target -
+        # entry) by the analyzer's recommended_tp_multiplier when warm.
+        # Floor on the scaled premium prevents tightening below entry+2c
+        # (otherwise maker fees + 1c spread eat the profit). Failures
+        # silently fall back to the unmodified tp_target.
+        try:
+            _mrc_an = pos.get("_momentum_analyzer")
+            if (_mrc_an is not None
+                    and bool(_uc("MRC_ENABLED", True))
+                    and bool(_uc("MRC_TP_MODULATION", True))
+                    and getattr(_mrc_an, "is_warm", False)):
+                _premium = tp_target - entry
+                if _premium > 0:
+                    _mult = float(_mrc_an.recommended_tp_multiplier)
+                    # FIX 3 (2026-05-04) MRC TP DAMPENING — rate-limit
+                    # cancel/replace cycles + multiplier hysteresis to
+                    # prevent the 0.70→1.0→0.70 flicker that churned the
+                    # resting TP on every observation.
+                    _now_ts = time.time()
+                    _last_tp_ts = float(
+                        pos.get("_last_tp_placement_time", 0) or 0)
+                    _last_mult = pos.get("_last_mrc_multiplier")
+                    _min_interval = float(
+                        _uc("MRC_TP_MIN_INTERVAL_S", 10))
+                    _hysteresis = float(_uc("MRC_TP_HYSTERESIS", 0.15))
+                    _delta_t = _now_ts - _last_tp_ts if _last_tp_ts > 0 else 1e9
+                    _delta_m = (
+                        abs(_mult - float(_last_mult))
+                        if _last_mult is not None else 1e9
+                    )
+                    _damped = False
+                    if _last_tp_ts > 0 and _delta_t < _min_interval:
+                        logger.info(
+                            "MRC TP-DAMPED: skipping adjustment, "
+                            "last_change=%.1fs ago, delta=%.2f",
+                            _delta_t, _delta_m,
+                        )
+                        _damped = True
+                    elif (_last_mult is not None
+                            and _delta_m < _hysteresis):
+                        logger.info(
+                            "MRC TP-DAMPED: skipping adjustment, "
+                            "last_change=%.1fs ago, delta=%.2f",
+                            _delta_t, _delta_m,
+                        )
+                        _damped = True
+                    if not _damped:
+                        _premium_floor = int(_uc("MRC_TP_PREMIUM_FLOOR_C", 2))
+                        _scaled = max(_premium_floor, int(round(_premium * _mult)))
+                        _new_target = max(1, min(99, entry + _scaled))
+                        if _new_target != tp_target:
+                            logger.info(
+                                "MRC TP-ADJUST: %s side=%s entry=%dc premium=%dc "
+                                "× %.2f → %dc (mrc=%+.2f path=%s "
+                                "micro5s=%+.2f micro25s=%+.2f rev25s=%.2f align=%+.2f)",
+                                ticker[-15:], side, entry, _premium, _mult,
+                                _scaled, _mrc_an.covariance,
+                                _mrc_an.path_signature,
+                                getattr(_mrc_an, "micro_momentum_5s", 0.0),
+                                getattr(_mrc_an, "micro_momentum_25s", 0.0),
+                                getattr(_mrc_an, "micro_reversion_25s", 0.0),
+                                getattr(_mrc_an, "micro_alignment", 0.0),
+                            )
+                            tp_target = _new_target
+                            pos["_last_tp_placement_time"] = _now_ts
+                            pos["_last_mrc_multiplier"] = _mult
+        except Exception as _mrc_tp_err:
+            logger.debug("MRC TP modulation error: %s", _mrc_tp_err)
         if strat == "BB_PURE":
             try:
                 _mfe_decision = compute_mfe_trail_price(
@@ -15366,6 +16507,103 @@ class PolymarketCopyEngine:
                     )
             except Exception as _mfe_exc:
                 logger.debug("BB_PURE MFE trail calculation failed: %s", _mfe_exc)
+
+        # 2026-05-04 KALSHI-LAG TP MODULATION ──────────────────────────────
+        # Read the MarketPressure composite's `kalshi_lag` component. When
+        # Kalshi is lagging BTC in our favor, the edge is still open; widen
+        # the TP. When Kalshi has overshot, the edge is closing; tighten.
+        # Multiplies the *premium* (tp_target − entry), bounded at +1c min
+        # so we never invert the trade. Silent fallback if microstructure
+        # cold or pressure data missing.
+        try:
+            if bool(_uc("KALSHI_LAG_TP_ENABLED", True)):
+                _ms = getattr(self, "_microstructure", None)
+                _pscore = getattr(_ms, "last_score", None) if _ms else None
+                _lag = float(getattr(_pscore, "kalshi_lag", 0.0) or 0.0) if _pscore else 0.0
+                _lag_thr = float(_uc("KALSHI_LAG_TP_THRESHOLD", 0.3))
+                # Sign convention: positive kalshi_lag = Kalshi behind BTC (favor
+                # bid catch-up). Side-aware — for NO position, favorable means
+                # BTC moved against YES = lag should be negative (YES underpriced
+                # to fall). We treat the *magnitude* of lag combined with the
+                # alignment of the pressure direction with our side as "favorable
+                # vs unfavorable".
+                _direction = str(getattr(_pscore, "direction", "") or "")
+                _aligned = (_direction == side)
+                _opposed = (_direction != "" and _direction != side)
+                _lag_mag = abs(_lag)
+                _premium_kl = tp_target - entry
+                if _lag_mag > _lag_thr and _premium_kl > 0:
+                    if _aligned:
+                        _mult = float(_uc("KALSHI_LAG_TP_WIDEN_MULT", 1.15))
+                    elif _opposed:
+                        _mult = float(_uc("KALSHI_LAG_TP_TIGHTEN_MULT", 0.85))
+                    else:
+                        _mult = 1.0
+                    if _mult != 1.0:
+                        _new_premium = max(1, int(round(_premium_kl * _mult)))
+                        _new_tp = max(1, min(99, entry + _new_premium))
+                        if _new_tp != tp_target:
+                            logger.info(
+                                "KALSHI-LAG TP [%s]: side=%s lag=%+.2f dir=%s "
+                                "premium %dc × %.2f → %dc (tp %dc → %dc)",
+                                ticker[-15:], side, _lag, _direction or "-",
+                                _premium_kl, _mult, _new_premium,
+                                tp_target, _new_tp,
+                            )
+                            tp_target = _new_tp
+        except Exception as _kl_err:
+            logger.debug("Kalshi lag TP modulation failed: %s", _kl_err)
+
+        # 2026-05-04 S/R TP CAP ────────────────────────────────────────────
+        # Consult the contract's empirical S/R levels (already maintained
+        # every cycle by the contract_sr feed). When a defended resistance
+        # sits between current mid and our TP target, cap TP at level - 1c
+        # (post one cent below the wall). For NO positions, the relevant
+        # barrier is YES *support* — translate to NO-bid scale via 100-x-1.
+        try:
+            if bool(_uc("SR_TP_CAP_ENABLED", True)):
+                _sr_st = self._sr_state.get(ticker)
+                _sr_min_samp = int(_uc("SR_TP_CAP_MIN_SAMPLES", 30))
+                _sr_min_str = float(_uc("SR_TP_CAP_MIN_STRENGTH", 0.4))
+                if (_sr_st is not None
+                        and int(getattr(_sr_st, "samples_seen", 0) or 0) >= _sr_min_samp):
+                    _yes_mid = int(getattr(book, "mid_price_cents", 0) or 0)
+                    if _yes_mid > 0:
+                        _capped = None
+                        if side == "yes":
+                            _level = contract_sr.nearest_resistance(
+                                _sr_st, _yes_mid,
+                                min_strength=_sr_min_str,
+                            )
+                            if _level is not None:
+                                _level_px, _level_str = _level
+                                _candidate = _level_px - 1
+                                if _candidate < tp_target and _candidate > entry:
+                                    _capped = (_candidate, _level_px, _level_str)
+                        else:
+                            _level = contract_sr.nearest_support(
+                                _sr_st, _yes_mid,
+                                min_strength=_sr_min_str,
+                            )
+                            if _level is not None:
+                                _level_px, _level_str = _level
+                                # NO bid ceiling = 100 - YES support - 1
+                                _candidate = (100 - _level_px) - 1
+                                if _candidate < tp_target and _candidate > entry:
+                                    _capped = (_candidate, _level_px, _level_str)
+                        if _capped is not None:
+                            _new_tp, _lvl_px, _lvl_str = _capped
+                            logger.info(
+                                "SR TP-CAP [%s]: side=%s yes_mid=%dc "
+                                "%s=%dc(str=%.2f) original_tp=%dc capped_tp=%dc",
+                                ticker[-15:], side, _yes_mid,
+                                "resistance" if side == "yes" else "support",
+                                _lvl_px, _lvl_str, tp_target, _new_tp,
+                            )
+                            tp_target = max(1, min(99, _new_tp))
+        except Exception as _sr_err:
+            logger.debug("SR TP cap failed: %s", _sr_err)
+
         # 2026-05-02 SL TRIGGER FIX: previously `target_state = "tp" if bid > entry else "sl"`.
         # This flipped to SL state on ANY 1c dip below entry — the sl_offset
         # was only the FALLBACK PRICE, not the trigger. Live observed
@@ -15433,6 +16671,91 @@ class PolymarketCopyEngine:
                     target_px = max(1, min(99, entry - sl_offset))
         except Exception as _mte:
             logger.debug("Mid-trade BTC velocity SL check failed: %s", _mte)
+
+        # 2026-05-04 WALL CONSUMPTION SL/HOLD ──────────────────────────────
+        # Read ask-stack consumption rate for our side and the opposing
+        # side. If buyers are aggressively lifting offers AGAINST us
+        # (≥30 ct/s on the opposite side), bid is about to drop — exit
+        # now while still profitable. If buyers are aggressively lifting
+        # offers ON our side, the trade is still working — suppress this
+        # cycle's TP placement so we don't sell into favorable momentum.
+        # Fail-soft: missing depth history → no action.
+        _wall_hold_skip = False
+        try:
+            if bool(_uc("WALL_CONSUMPTION_EXIT_ENABLED", True)):
+                _wc_lookback = float(_uc("WALL_CONSUMPTION_LOOKBACK_S", 5.0))
+                _opp_side = "no" if side == "yes" else "yes"
+                _opp_wall = self._detect_wall_consumption(ticker, _opp_side, _wc_lookback)
+                _same_wall = self._detect_wall_consumption(ticker, side, _wc_lookback)
+                _opp_v = str(_opp_wall.get("verdict", "UNKNOWN"))
+                _same_v = str(_same_wall.get("verdict", "UNKNOWN"))
+                # Opposing aggression while profitable → force cross-spread exit
+                if (_opp_v == "AGGRESSIVE_BUY"
+                        and bid > entry
+                        and target_state != "sl"):
+                    logger.warning(
+                        "WALL-EXIT [%s]: opposing aggression detected "
+                        "(opp=%s rate=%+.1f ct/s samples=%d) — forcing exit "
+                        "side=%s bid=%dc entry=%dc",
+                        ticker[-15:], _opp_side,
+                        float(_opp_wall.get("rate_per_s", 0.0) or 0.0),
+                        int(_opp_wall.get("samples", 0) or 0),
+                        side.upper(), bid, entry,
+                    )
+                    target_state = "sl"
+                    target_px = max(1, min(99, bid - 1))
+                # Same-side aggression while profitable & TP-targeted → hold past TP
+                elif (_same_v == "AGGRESSIVE_BUY"
+                        and target_state == "tp"
+                        and bid > entry):
+                    logger.info(
+                        "WALL-HOLD [%s]: favorable aggression "
+                        "(same=%s rate=%+.1f ct/s samples=%d) — holding past TP, "
+                        "skipping placement this cycle",
+                        ticker[-15:], side,
+                        float(_same_wall.get("rate_per_s", 0.0) or 0.0),
+                        int(_same_wall.get("samples", 0) or 0),
+                    )
+                    _wall_hold_skip = True
+        except Exception as _wce:
+            logger.debug("Wall consumption check failed: %s", _wce)
+        if _wall_hold_skip:
+            return False
+
+        # 2026-05-04 MRC PATH-SIG DEFENSIVE ESCALATION ─────────────────────
+        # Defensive backstop: `_mrc_check_force_exit` runs *before* this
+        # function and cross-spread sells when should_force_exit is set
+        # AND profitable. If that path failed (cancel race, place_order
+        # exception), or if path_signature is M_TOP / W_BOTTOM but
+        # should_force_exit is somehow False, escalate target_state to
+        # SL here so the resting protective order moves to a defensive
+        # price. Never escalates a losing trade.
+        try:
+            if (bool(_uc("MRC_ENABLED", True))
+                    and bool(_uc("MRC_PATH_SIG_PROTECTIVE_ESC", True))
+                    and target_state != "sl"):
+                _mrc_an_pe = pos.get("_momentum_analyzer")
+                if (_mrc_an_pe is not None
+                        and getattr(_mrc_an_pe, "is_warm", False)):
+                    _path = str(getattr(_mrc_an_pe, "path_signature", "") or "")
+                    _force = bool(getattr(_mrc_an_pe, "should_force_exit", False))
+                    _adverse_path = (
+                        (side == "yes" and _path == "M_TOP")
+                        or (side == "no" and _path == "W_BOTTOM")
+                    )
+                    if (_force or _adverse_path) and bid > entry:
+                        logger.warning(
+                            "MRC PATH-EXIT [%s]: side=%s path=%s "
+                            "force_exit=%s mrc=%+.2f bid=%dc entry=%dc "
+                            "— escalating to SL (defensive)",
+                            ticker[-15:], side, _path, _force,
+                            float(getattr(_mrc_an_pe, "covariance", 0.0) or 0.0),
+                            bid, entry,
+                        )
+                        target_state = "sl"
+                        target_px = max(1, min(99, bid - 1))
+        except Exception as _mrc_pe_err:
+            logger.debug("MRC path-sig escalation failed: %s", _mrc_pe_err)
 
         # 2026-05-02 Phase 8b — TAPE EXIT-PRESSURE (shadow mode).
         # User: "massive volume to the opposite direction is also an
@@ -15659,6 +16982,20 @@ class PolymarketCopyEngine:
         else:
             place_px = target_px
             place_post_only = True
+            # FIX 1 (2026-05-04) TP TAKER-CONVERT: if the contract bid is
+            # already at or above the TP target, post_only at tp_price will
+            # cross and Kalshi rejects silently. Cross the spread instead.
+            try:
+                if bool(_uc("TP_TAKER_CONVERT_ENABLED", True)):
+                    if target_state == "tp" and int(bid) >= int(target_px) > 0:
+                        place_px = max(1, int(bid))
+                        place_post_only = False
+                        logger.warning(
+                            "TP TAKER-CONVERT: bid=%dc >= tp=%dc, crossing spread",
+                            int(bid), int(target_px),
+                        )
+            except Exception as _ttc_err:
+                logger.debug("TP TAKER-CONVERT check failed: %s", _ttc_err)
         try:
             new_order, placed_count = await self._place_capped_side_sell(
                 ticker=ticker, side=side,
@@ -15691,6 +17028,91 @@ class PolymarketCopyEngine:
             entry, bid, strat or "?", place_post_only, cur_px, cur_count,
             _resting_count,
         )
+        return True
+
+    async def _mrc_check_force_exit(self, pos: dict) -> bool:
+        """If the MRC analyzer flags `should_force_exit` AND we're in
+        profit, cancel the resting TP and cross-spread sell at bid-1.
+
+        Profit-only guard: never let the analyzer force an exit while
+        underwater — the protective SL and pre-expiry flatten layers
+        already handle losing positions, and force-exiting at a loss on
+        a transient signature would just lock in the loss.
+
+        Returns True iff a force-exit was triggered.
+        """
+        if pos is None:
+            return False
+        an = pos.get("_momentum_analyzer")
+        if an is None or not getattr(an, "is_warm", False):
+            return False
+        if not bool(getattr(an, "should_force_exit", False)):
+            return False
+        ticker = pos.get("ticker", "")
+        side = (pos.get("side") or "").lower()
+        if not ticker or side not in ("yes", "no"):
+            return False
+        ws = getattr(self, "_kalshi_ws", None)
+        book = ws.get_book(ticker) if ws and hasattr(ws, "get_book") else None
+        if book is None or not book.is_ready:
+            return False
+        if side == "yes":
+            bid = int(getattr(book, "best_yes_bid", 0) or 0)
+        else:
+            bid = int(getattr(book, "best_no_bid", 0) or 0)
+        if bid <= 0:
+            return False
+        entry = int(
+            pos.get("original_entry_cents") or pos.get("entry_cents", 0) or 0
+        )
+        # Profit gate: only force-exit when we have at least 2c above
+        # entry (covers maker fees + 1c cross-spread cost).
+        min_profit = int(_uc("MRC_FORCE_EXIT_MIN_PROFIT_C", 2))
+        if entry <= 0 or bid < entry + min_profit:
+            return False
+        # Verify count from Kalshi truth.
+        try:
+            verified = await self._get_verified_side_position_count(ticker, side)
+        except Exception:
+            verified = 0
+        count = max(int(pos.get("count", 0) or 0), int(verified or 0))
+        if count <= 0:
+            return False
+        sell_px = max(1, bid - 1)
+        logger.warning(
+            "MRC FORCE-EXIT: %s side=%s %dct entry=%dc bid=%dc sell@%dc "
+            "path=%s mrc=%+.2f scr=%.2f "
+            "micro5s=%+.2f micro25s=%+.2f rev25s=%.2f align=%+.2f",
+            ticker[-15:], side, count, entry, bid, sell_px,
+            an.path_signature, an.covariance, an.convergence_rate,
+            getattr(an, "micro_momentum_5s", 0.0),
+            getattr(an, "micro_momentum_25s", 0.0),
+            getattr(an, "micro_reversion_25s", 0.0),
+            getattr(an, "micro_alignment", 0.0),
+        )
+        try:
+            await self._cancel_tp_order()
+        except Exception as _ce:
+            logger.warning("MRC FORCE-EXIT: cancel_tp_order raised: %s", _ce)
+        try:
+            order, placed = await self._place_capped_side_sell(
+                ticker=ticker, side=side,
+                price=sell_px, requested_count=count,
+                post_only=False,
+                reason="MRC FORCE-EXIT",
+                known_position_count=count,
+            )
+            if not order:
+                logger.error(
+                    "MRC FORCE-EXIT: _place_capped_side_sell returned None "
+                    "for %s side=%s count=%d", ticker, side, count,
+                )
+                return False
+        except Exception as _pe:
+            logger.error("MRC FORCE-EXIT place_order failed: %s", _pe)
+            return False
+        # Mark position so the protective layer doesn't re-place a TP.
+        pos["_mrc_force_exit_done"] = True
         return True
 
     async def _cancel_tp_order(self) -> bool:
@@ -18537,6 +19959,84 @@ class PolymarketCopyEngine:
         pos = self._open_position
 
         # ═══════════════════════════════════════════════════════════════════
+        # MRC FEED (2026-05-04) — feed the per-fill momentum analyzer with
+        # the latest mid before any exit decisions are made. Always wrapped
+        # in try/except: a broken analyzer must never block the engine.
+        # ═══════════════════════════════════════════════════════════════════
+        if pos is not None:
+            try:
+                analyzer = pos.get("_momentum_analyzer")
+                if analyzer is not None and bool(_uc("MRC_ENABLED", True)):
+                    _ws_mrc = getattr(self, "_kalshi_ws", None)
+                    _ticker_mrc = pos.get("ticker", "")
+                    _book_mrc = (
+                        _ws_mrc.get_book(_ticker_mrc)
+                        if _ws_mrc and hasattr(_ws_mrc, "get_book")
+                        and _ticker_mrc else None
+                    )
+                    if _book_mrc is not None and _book_mrc.is_ready:
+                        _mid_mrc = int(getattr(_book_mrc, "mid_price_cents", 0) or 0)
+                        if _mid_mrc > 0:
+                            _ws_start_mrc = float(
+                                getattr(self, "_window_start_time", 0) or 0
+                            )
+                            if _ws_start_mrc > 0:
+                                _secs_left_mrc = max(
+                                    0.0, 900.0 - (time.time() - _ws_start_mrc)
+                                )
+                            else:
+                                _secs_left_mrc = None
+                            analyzer.update(
+                                float(_mid_mrc),
+                                time.time(),
+                                seconds_left=_secs_left_mrc,
+                            )
+                            if analyzer.is_warm:
+                                logger.info(
+                                    "MRC %s side=%s mid=%dc cms=%+.2f cri=%.2f "
+                                    "mrc=%+.2f path=%s scr=%.2f tp_mult=%.2f "
+                                    "force_exit=%s",
+                                    _ticker_mrc[-15:],
+                                    pos.get("side", "?"),
+                                    _mid_mrc,
+                                    analyzer.momentum_score,
+                                    analyzer.reversion_index,
+                                    analyzer.covariance,
+                                    analyzer.path_signature,
+                                    analyzer.convergence_rate,
+                                    analyzer.recommended_tp_multiplier,
+                                    analyzer.should_force_exit,
+                                )
+                            else:
+                                # FIX 3 (2026-05-04): warmup progress log.
+                                # Throttled to once every 5 observations to
+                                # avoid log spam (analyzer ticks every 3s).
+                                try:
+                                    if bool(_uc("MRC_WARMUP_LOG_ENABLED", True)):
+                                        _obs_n = int(getattr(
+                                            analyzer, "observation_count", 0))
+                                        _min_obs = int(getattr(
+                                            analyzer, "MIN_OBS", 20))
+                                        if _obs_n > 0 and _obs_n % 5 == 0:
+                                            _ws_pct = 0.0
+                                            if _ws_start_mrc > 0:
+                                                _elapsed_pct = (
+                                                    (time.time() - _ws_start_mrc)
+                                                    / 900.0 * 100.0
+                                                )
+                                                _ws_pct = max(0.0, min(100.0, _elapsed_pct))
+                                            logger.info(
+                                                "MRC WARMUP: %d/%d observations, "
+                                                "%.1f%% of window elapsed (%s)",
+                                                _obs_n, _min_obs, _ws_pct,
+                                                _ticker_mrc[-15:],
+                                            )
+                                except Exception:
+                                    pass
+            except Exception as _mrc_feed_err:
+                logger.debug("MRC feed error: %s", _mrc_feed_err)
+
+        # ═══════════════════════════════════════════════════════════════════
         # PROTECTIVE-ORDER MODE (Phase 4, 2026-04-30)
         # ───────────────────────────────────────────────────────────────────
         # When PROTECTIVE_ORDER_MODE=True, maintain a single resting sell on
@@ -18553,6 +20053,21 @@ class PolymarketCopyEngine:
                     await self._pre_expiry_consolidate()
                 except Exception as _ce:
                     logger.warning("pre_expiry_consolidate error: %s", _ce)
+
+                # 2026-05-04 MRC FORCE-EXIT — checked before protective
+                # maintain so we cancel the resting TP and cross-spread
+                # sell on a strong adverse path signature. Profit-only:
+                # never force-exit while underwater (let SL handle that).
+                try:
+                    if (bool(_uc("MRC_ENABLED", True))
+                            and bool(_uc("MRC_FORCE_EXIT", True))):
+                        await self._mrc_check_force_exit(pos)
+                except Exception as _mrc_fe_err:
+                    logger.debug("MRC force-exit check error: %s", _mrc_fe_err)
+                # If force-exit cleared the position, bail out cleanly.
+                if self._open_position is None:
+                    return
+
                 _protective_owned = await self._maintain_protective_order()
                 if _protective_owned:
                     # Mark position so legacy bid-check stops + TP ladders
@@ -19672,13 +21187,119 @@ class PolymarketCopyEngine:
                                 _engine_recent_ct + 5,
                             )
                         if kalshi_count > _engine_max_owned:
+                            # FIX 1 (2026-05-04): in BB_PURE-only mode (no
+                            # manual / wallet-copy strategies enabled), an
+                            # "over-fill" cannot actually be user manual —
+                            # there are no other automated entry paths and
+                            # the user isn't trading manually. Treat as
+                            # cache-lag RE-ADOPT instead of leaving alone.
+                            _readopt_via_overfill = False
+                            try:
+                                _bb_only = (
+                                    bool(_uc("BB_PURE_MODE", True))
+                                    and not bool(_uc("WALLET_COPY_ENABLED", False))
+                                    and not bool(_uc("WALLET_COPY_BUY_ENABLED", False))
+                                    and not bool(_uc("SNIPER_ENABLED", False))
+                                    and not bool(_uc("SR_FADE_ENABLED", False))
+                                    and not bool(_uc("SCALP_DCA_ENABLED", False))
+                                    and not bool(_uc("TA_FORCED_ENTRY_ENABLED", False))
+                                )
+                                _flat_recheck_on = bool(_uc(
+                                    "FLAT_CONFIRM_RECHECK_ENABLED", True))
+                                if _bb_only and _flat_recheck_on and (
+                                        _placed_recently_dt or _entered_dt):
+                                    _readopt_via_overfill = True
+                            except Exception:
+                                _readopt_via_overfill = False
+                            if not _readopt_via_overfill:
+                                logger.warning(
+                                    "CopyEngine SYNC MANUAL-DETECTED (over-fill): %s has "
+                                    "%d ct but engine's max known fill on this ticker is "
+                                    "%d ct (cap=%d, recent_place=%s entered=%s) — excess is user manual; leaving alone",
+                                    ticker[-15:], kalshi_count, _engine_recent_ct,
+                                    _engine_max_owned, _placed_recently_dt, _entered_dt,
+                                )
+                                continue
+                            # BB_PURE-only over-fill → RE-ADOPT (we know
+                            # this can't be a user manual trade because no
+                            # manual trading paths are enabled). Reconstruct
+                            # _open_position so protective layer + TP
+                            # placement resume; un-close the ticker.
                             logger.warning(
-                                "CopyEngine SYNC MANUAL-DETECTED (over-fill): %s has "
-                                "%d ct but engine's max known fill on this ticker is "
-                                "%d ct (cap=%d, recent_place=%s entered=%s) — excess is user manual; leaving alone",
+                                "CopyEngine SYNC OVERFILL-READOPT: %s has %dct "
+                                "(engine_max=%d cap=%d recent_place=%s entered=%s) "
+                                "— BB_PURE-only mode → RE-ADOPTING (was leave-alone)",
                                 ticker[-15:], kalshi_count, _engine_recent_ct,
                                 _engine_max_owned, _placed_recently_dt, _entered_dt,
                             )
+                            try:
+                                self._closed_tickers.discard(ticker)
+                            except Exception:
+                                pass
+                            try:
+                                _readopt_side = (
+                                    "yes" if float(pos_data.get(
+                                        "position_fp", "0")) > 0 else "no"
+                                )
+                                _entry_est_ro = int(
+                                    exposure / kalshi_count * 100
+                                ) if kalshi_count > 0 else 0
+                                _bb_ctx_ro = self._recent_bb_pure_placements.get(
+                                    ticker)
+                                _new_pos_ro = {
+                                    "order_id": "overfill_readopt",
+                                    "side": _readopt_side,
+                                    "entry_cents": _entry_est_ro,
+                                    "original_entry_cents": _entry_est_ro,
+                                    "original_count": kalshi_count,
+                                    "ticker": ticker,
+                                    "tier": "BB_PURE",
+                                    "strategy_name": "BB_PURE",
+                                    "count": kalshi_count,
+                                    "fill_time": time.time(),
+                                    "_dca_maxed": True,
+                                    "entry_conviction": 0.0,
+                                    "entry_wallets": 0,
+                                    "entry_wallet_count_at_last_scale": 0,
+                                    "high_water_bid": _entry_est_ro,
+                                    "had_flow_at_entry": False,
+                                    "tiers_in": set(),
+                                    "entry_elite_wallets": set(),
+                                    "shallow_filled": kalshi_count,
+                                    "shallow_price": _entry_est_ro,
+                                    "deep_filled": 0,
+                                    "deep_price": _entry_est_ro,
+                                    "signal_wallet_names": [],
+                                    "tp_order_id": None,
+                                    "tp_order_ids": [],
+                                    "tp_price": 0,
+                                }
+                                if _bb_ctx_ro:
+                                    _new_pos_ro["_bb_pure_fair_yes_cents_at_entry"] = int(
+                                        _bb_ctx_ro.get("fair_yes_cents", 0))
+                                    _new_pos_ro["_bb_pure_market_mid_at_entry"] = int(
+                                        _bb_ctx_ro.get("market_mid_cents", 0))
+                                    _new_pos_ro["_bb_pure_edge_pp_at_entry"] = float(
+                                        _bb_ctx_ro.get("edge_pp", 0.0))
+                                try:
+                                    if (_MRC_AVAILABLE
+                                            and ContractMomentumAnalyzer is not None
+                                            and bool(_uc("MRC_ENABLED", True))
+                                            and bool(_uc("MRC_RECLAIM_ATTACH_ENABLED", True))):
+                                        _new_pos_ro["_momentum_analyzer"] = (
+                                            ContractMomentumAnalyzer(side=_readopt_side)
+                                        )
+                                except Exception as _mrc_e:
+                                    logger.debug(
+                                        "OVERFILL-READOPT MRC init failed: %s",
+                                        _mrc_e,
+                                    )
+                                self._open_position = _new_pos_ro
+                            except Exception as _ro_e:
+                                logger.error(
+                                    "OVERFILL-READOPT pos reconstruction failed: %s",
+                                    _ro_e,
+                                )
                             continue
                         # Real residual exists on a closed ticker. Try to
                         # flatten up to 2 times, then hard-log and give up.
@@ -19766,6 +21387,51 @@ class PolymarketCopyEngine:
                         except Exception:
                             pass
                         if our_recent:
+                            # 2026-05-04 EXPOSURE-CAP GUARD: refuse to adopt
+                            # an inflated count if the implied dollar exposure
+                            # exceeds MAX_TICKER_EXPOSURE_FRAC of the live
+                            # bankroll. Today's catastrophe had this exact
+                            # shape: engine_count=13, kalshi_count=156,
+                            # implied exposure $68 on a $70 bankroll. Adopting
+                            # it sealed the loss. With the cap active, the
+                            # engine refuses to manage the inflated position
+                            # and leaves engine state unchanged so the human
+                            # can investigate.
+                            try:
+                                _bal = await self._client.get_balance()
+                                _bankroll_c = int(_bal.balance) if _bal is not None else 0
+                                _blocked, _implied_c, _cap_c = self._exposure_cap_check(
+                                    kalshi_count=int(kalshi_count),
+                                    entry_cents=int(entry_est),
+                                    bankroll_cents=_bankroll_c,
+                                    cap_frac=float(_uc("MAX_TICKER_EXPOSURE_FRAC", 0.25)),
+                                    enabled=bool(_uc("EXPOSURE_CAP_ENABLED", True)),
+                                )
+                                if _blocked:
+                                    logger.error(
+                                        "EXPOSURE-CAP REFUSE-BACKFILL: ticker=%s "
+                                        "engine_count=%d kalshi_count=%d implied=$%.2f "
+                                        "cap=$%.2f bankroll=$%.2f — leaving engine "
+                                        "state unchanged for human review",
+                                        ticker[-15:], engine_count, kalshi_count,
+                                        _implied_c / 100, _cap_c / 100,
+                                        _bankroll_c / 100,
+                                    )
+                                    # Skip the entire Case A backfill. Engine
+                                    # continues tracking its original count;
+                                    # the inflated Kalshi position is left
+                                    # uncovered until a human investigates.
+                                    return
+                            except Exception as _ec_err:
+                                # Fail-OPEN here is acceptable: this is a
+                                # safety guard, not a correctness invariant.
+                                # If the bankroll check breaks, fall through
+                                # to legacy behavior. MIN-TRUTH still protects
+                                # downstream sells.
+                                logger.warning(
+                                    "EXPOSURE-CAP check failed: %s — falling "
+                                    "through to legacy backfill", _ec_err,
+                                )
                             # Case A: our order, count drift. Update the pos.
                             logger.warning(
                                 "CopyEngine SYNC RECONCILE: Kalshi has %d, engine had %d on %s — "
@@ -19797,6 +21463,29 @@ class PolymarketCopyEngine:
                             if not self._open_position.get("tier"):
                                 self._open_position["tier"] = "TA_FORCED"
                             self._open_position["fill_time"] = time.time()
+                            # FIX 3 (2026-05-04): backfill MRC analyzer on
+                            # SYNC RECONCILE Case A. Without this, an
+                            # _open_position created via reclaim/resync
+                            # never has the analyzer attached.
+                            try:
+                                if (_MRC_AVAILABLE
+                                        and ContractMomentumAnalyzer is not None
+                                        and bool(_uc("MRC_ENABLED", True))
+                                        and bool(_uc("MRC_RECLAIM_ATTACH_ENABLED", True))
+                                        and "_momentum_analyzer" not in self._open_position):
+                                    _rec_side = self._open_position.get("side", kalshi_side)
+                                    self._open_position["_momentum_analyzer"] = (
+                                        ContractMomentumAnalyzer(side=_rec_side)
+                                    )
+                                    logger.info(
+                                        "MRC RECONCILE-ATTACH: %s side=%s analyzer "
+                                        "initialized for reconciled position",
+                                        ticker[-15:], _rec_side,
+                                    )
+                            except Exception as _mrc_rec_err:
+                                logger.debug(
+                                    "MRC reconcile attach failed: %s", _mrc_rec_err,
+                                )
                             logger.info(
                                 "CopyEngine SYNC RECONCILE BACKFILL: ticker=%s count=%d "
                                 "entry=%dc orig_entry=%dc strat=%s — stop-loss now armed",
@@ -19993,6 +21682,32 @@ class PolymarketCopyEngine:
                                     "(fair_yes=%dc edge=%.1fpp)",
                                     int(_bb_ctx.get("fair_yes_cents", 0)),
                                     float(_bb_ctx.get("edge_pp", 0.0)),
+                                )
+                            # FIX 3 (2026-05-04): attach MRC analyzer on
+                            # RECLAIM. Today's BB_PURE fires all routed
+                            # through NOFILL → late-fill → RECLAIM, which
+                            # bypassed the _execute_bb_pure_signal MRC
+                            # init at line ~10408 → MRC produced 0 log
+                            # lines. Without this, the analyzer is never
+                            # attached and the contract-momentum layer
+                            # never engages on reclaimed BB_PURE positions.
+                            try:
+                                if (_MRC_AVAILABLE
+                                        and ContractMomentumAnalyzer is not None
+                                        and bool(_uc("MRC_ENABLED", True))
+                                        and bool(_uc("MRC_RECLAIM_ATTACH_ENABLED", True))
+                                        and "_momentum_analyzer" not in self._open_position):
+                                    self._open_position["_momentum_analyzer"] = (
+                                        ContractMomentumAnalyzer(side=kalshi_side)
+                                    )
+                                    logger.info(
+                                        "MRC RECLAIM-ATTACH: %s side=%s analyzer "
+                                        "initialized for reclaimed position",
+                                        ticker[-15:], kalshi_side,
+                                    )
+                            except Exception as _mrc_re_err:
+                                logger.debug(
+                                    "MRC reclaim attach failed: %s", _mrc_re_err,
                                 )
                             # Place TPs immediately on reclaimed position
                             if resting == 0:

@@ -252,3 +252,93 @@ def test_repeated_calls_when_flat_never_place():
         assert order is None
         assert count == 0
     assert client.placed_orders == [], "Phase 0.1 fix: zero placements when flat"
+
+
+# ── Test 5: 2026-05-04 catastrophe regression ────────────────────────────
+
+
+def test_min_truth_blocks_when_hint_positive_but_kalshi_flat():
+    """Reproduce the 2026-05-04 catastrophe shape: caller passes a positive
+    ``known_position_count`` hint (engine belief) while Kalshi truth is 0.
+
+    Old code at line 15170-15174 trusted the hint and never queried Kalshi
+    when the hint was provided — the position-zero gate became a no-op.
+    Each MRC FORCE-EXIT call then placed a sell-yes that Kalshi auto-
+    converted to "buy NO @ (100-price)c" via sell-to-open semantics,
+    opening 143 phantom NO contracts and draining $68 of the account.
+
+    New code (MIN-TRUTH FIX, 2026-05-04) ALWAYS queries Kalshi truth for
+    the zero-gate; the hint can only further cap the truth, never override
+    it. With Kalshi flat, the helper must return (None, 0) regardless of
+    the hint."""
+    # Kalshi positions empty → truth=0
+    client = _FakeClient(positions=[], resting=[])
+    eng = _make_engine(client)
+    order, count = asyncio.run(
+        eng._place_capped_side_sell(
+            ticker="KXBTC15M-26MAY041730-30",
+            side="yes",
+            price=56,
+            requested_count=13,
+            post_only=False,
+            reason="MRC FORCE-EXIT",
+            known_position_count=13,  # the inflated engine-belief hint
+        )
+    )
+    assert order is None, (
+        "MIN-TRUTH FIX: must refuse the sell when Kalshi truth=0, "
+        "regardless of the caller's hint. Without this, the dispatch "
+        "session's MRC loop opened phantom NO contracts."
+    )
+    assert count == 0
+    assert client.placed_orders == [], (
+        "Catastrophe regression: zero orders must hit the wire when truth=0"
+    )
+
+
+def test_min_truth_caps_hint_to_kalshi_when_hint_exceeds_truth():
+    """When the caller's hint is higher than Kalshi truth, cap to truth.
+
+    Mirror of the catastrophe shape but with truth > 0: caller hint=20,
+    Kalshi truth=5. The sell must be capped to 5, not 20.
+    """
+    positions = [{"ticker": "KXBTC15M-T", "position": 5, "side": "yes"}]
+    client = _FakeClient(positions=positions, resting=[])
+    eng = _make_engine(client)
+    order, count = asyncio.run(
+        eng._place_capped_side_sell(
+            ticker="KXBTC15M-T",
+            side="yes",
+            price=70,
+            requested_count=20,
+            post_only=True,
+            reason="UNITTEST",
+            known_position_count=20,  # caller wrongly believes 20
+        )
+    )
+    assert order is not None
+    assert count == 5, "must cap to Kalshi truth (5), not honor inflated hint (20)"
+    assert client.placed_orders[0]["count"] == 5
+
+
+def test_min_truth_uses_hint_when_hint_lower_than_truth():
+    """When the caller's hint is LOWER than Kalshi truth, prefer the hint
+    (residual-flatten use case: caller saw a smaller residual count an
+    instant ago and wants to act on that)."""
+    positions = [{"ticker": "KXBTC15M-T", "position": 30, "side": "yes"}]
+    client = _FakeClient(positions=positions, resting=[])
+    eng = _make_engine(client)
+    order, count = asyncio.run(
+        eng._place_capped_side_sell(
+            ticker="KXBTC15M-T",
+            side="yes",
+            price=70,
+            requested_count=10,
+            post_only=True,
+            reason="UNITTEST",
+            known_position_count=10,  # caller saw exactly 10
+        )
+    )
+    assert order is not None
+    assert count == 10
+    assert client.placed_orders[0]["count"] == 10
