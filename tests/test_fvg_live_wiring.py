@@ -31,9 +31,14 @@ class _FakeOrder:
 
 
 class _FakeBook:
+    """Mirrors KalshiWS book — yes_ask / no_ask derived from
+    complementary opposite-side bids (Kalshi-style)."""
     def __init__(self, yes_bid=30, no_bid=70):
         self.best_yes_bid = yes_bid
         self.best_no_bid = no_bid
+        # Yes ask = 100 - best_no_bid, no ask = 100 - best_yes_bid
+        self.best_yes_ask = (100 - no_bid) if no_bid else 0
+        self.best_no_ask = (100 - yes_bid) if yes_bid else 0
 
 
 class _FakeWS:
@@ -111,7 +116,11 @@ def _make_engine():
 def test_live_entry_filled_places_tp_and_transitions_holding():
     """A buy that fills immediately → resting TP placed → state=LIVE_HOLDING."""
     eng = _make_engine()
-    # Order fills 17 contracts immediately at our bid+1=31c
+    # Use a book with a wider ask so paper_entry_price=44 doesn't cross.
+    # yes_bid=30, no_bid=50 → yes_ask = 100-50 = 50. With entry=44 < ask=50,
+    # we rest as a maker bid (post_only=True).
+    eng._kalshi_ws = _FakeWS(_FakeBook(yes_bid=30, no_bid=50))
+    # Order fills 17 contracts (later TP-fills via Kalshi)
     eng._client.place_order.side_effect = [
         _FakeOrder(order_id="OID-ENTRY", filled_count=17),
         _FakeOrder(order_id="OID-TP", filled_count=0),
@@ -124,6 +133,7 @@ def test_live_entry_filled_places_tp_and_transitions_holding():
         baseline=30, fair=70, fvg_vs_baseline=40,
         prob=fake_prob, btc=110000.0, btc_5m_proxy=30.0, aligned=True,
         btc_dist_pct=0.12, session_age=400, seconds_remaining=500,
+        paper_entry_price=44, mid=63,
     ))
 
     pf = eng._paper_fvg
@@ -131,21 +141,22 @@ def test_live_entry_filled_places_tp_and_transitions_holding():
     assert pf["live_filled_count"] == 17
     assert pf["live_entry_order_id"] == "OID-ENTRY"
     assert pf["live_tp_order_id"] == "OID-TP"
-    assert pf["live_tp_px"] == 31 + 20  # T1 TP = entry + 20
-    assert pf["live_sl_trig"] == 31 - 8  # uniform SL = entry - 8
+    # Entry uses paper-formula min(mid, baseline). With paper_entry_price=44
+    # and ask>=45 in the fake book, entry_px stays at 44 (no taker-cross).
+    assert pf["live_entry_px"] == 44
+    assert pf["live_tp_px"] == 44 + 20  # T1 TP = entry + 20
+    assert pf["live_sl_trig"] == 44 - 8  # uniform SL = entry - 8
     # Ticker lock added
     assert "KXBTC15M-T1" in eng._entered_tickers_this_window
     # Two place_order calls: entry + TP
     assert eng._client.place_order.call_count == 2
     entry_call = eng._client.place_order.call_args_list[0]
     tp_call = eng._client.place_order.call_args_list[1]
-    assert entry_call.kwargs["price"] == 31  # bid(30) + 1
-    assert entry_call.kwargs["post_only"] is True
-    # Sizing: T1 35% × $50 = $17.50 = 1750c. 1750c / 31c = 56 contracts
-    # (well within the 40% exposure cap = 1736c which is just under, so
-    # actually 1736/31 = 56 still — cap and frac coincide closely here).
-    assert entry_call.kwargs["count"] == 56
-    assert tp_call.kwargs["price"] == 51
+    assert entry_call.kwargs["price"] == 44  # min(mid=63, baseline=30) → 30 was passed; we passed 44 directly
+    assert entry_call.kwargs["post_only"] is True  # didn't cross ask
+    # Sizing: T1 35% × $50 = $17.50 = 1750c. 1750c / 44c = 39 contracts.
+    assert entry_call.kwargs["count"] == 39
+    assert tp_call.kwargs["price"] == 64  # 44 + 20 T1 offset
     assert tp_call.kwargs["action"] == "sell"
     assert tp_call.kwargs["post_only"] is True
     # TP count uses actual fill count, not requested count
@@ -165,6 +176,7 @@ def test_live_entry_nofill_transitions_pending():
         prob=MagicMock(probability=0.5, volatility=20.0),
         btc=110000.0, btc_5m_proxy=15.0, aligned=True,
         btc_dist_pct=0.05, session_age=400, seconds_remaining=500,
+        paper_entry_price=30, mid=50,
     ))
 
     pf = eng._paper_fvg
@@ -188,6 +200,7 @@ def test_live_entry_place_order_failure_releases_lock():
         prob=MagicMock(probability=0.5, volatility=20.0),
         btc=110000.0, btc_5m_proxy=30.0, aligned=True,
         btc_dist_pct=0.12, session_age=400, seconds_remaining=500,
+        paper_entry_price=44, mid=63,
     ))
 
     pf = eng._paper_fvg
@@ -207,6 +220,7 @@ def test_live_entry_blocks_on_existing_ticker_lock():
         prob=MagicMock(probability=0.5, volatility=20.0),
         btc=110000.0, btc_5m_proxy=30.0, aligned=True,
         btc_dist_pct=0.12, session_age=400, seconds_remaining=500,
+        paper_entry_price=44, mid=63,
     ))
 
     eng._client.place_order.assert_not_called()
@@ -231,10 +245,45 @@ def test_live_entry_daily_loss_halt():
         prob=MagicMock(probability=0.5, volatility=20.0),
         btc=110000.0, btc_5m_proxy=30.0, aligned=True,
         btc_dist_pct=0.12, session_age=400, seconds_remaining=500,
+        paper_entry_price=44, mid=63,
     ))
 
     eng._client.place_order.assert_not_called()
     assert eng._paper_fvg["halted"] is True
+
+
+def test_live_entry_taker_cross_when_paper_target_above_ask():
+    """When paper_entry_price >= ask, cap at ask + drop post_only.
+
+    The market is offering BELOW our valuation — taker-cross is correct
+    behavior: we pay LESS than our valuation. The OOS-validated entry
+    price was min(mid, baseline); when that crosses the ask, the ask is
+    cheaper, so we just take it.
+    """
+    eng = _make_engine()
+    # Book: yes_bid=40, no_bid=58 → yes_ask = 100-58 = 42.
+    eng._kalshi_ws = _FakeWS(_FakeBook(yes_bid=40, no_bid=58))
+    eng._client.place_order.side_effect = [
+        _FakeOrder(order_id="OID-ENTRY", filled_count=10),
+        _FakeOrder(order_id="OID-TP", filled_count=0),
+    ]
+
+    asyncio.run(eng._paper_fvg_live_entry(
+        ticker="KXBTC15M-CROSS", side="yes", tier=1,
+        baseline=50, fair=70, fvg_vs_baseline=20,
+        prob=MagicMock(probability=0.5, volatility=20.0),
+        btc=110000.0, btc_5m_proxy=30.0, aligned=True,
+        btc_dist_pct=0.12, session_age=400, seconds_remaining=500,
+        # paper_entry_price=50 > ask=42 → taker-cross at 42
+        paper_entry_price=50, mid=55,
+    ))
+
+    pf = eng._paper_fvg
+    assert pf["state"] == "LIVE_HOLDING"
+    assert pf["live_entry_px"] == 42  # capped at ask
+    entry_call = eng._client.place_order.call_args_list[0]
+    assert entry_call.kwargs["price"] == 42
+    assert entry_call.kwargs["post_only"] is False  # taker, not maker
 
 
 # ─── LIVE_HOLDING exit path ─────────────────────────────────────────────

@@ -3410,6 +3410,8 @@ class PolymarketCopyEngine:
                         btc_dist_pct=float(btc_dist_pct),
                         session_age=int(session_age),
                         seconds_remaining=seconds_remaining,
+                        paper_entry_price=int(entry_price),
+                        mid=int(mid),
                     )
                     return
 
@@ -3588,10 +3590,18 @@ class PolymarketCopyEngine:
         fair: int, fvg_vs_baseline: int, prob, btc: float,
         btc_5m_proxy: float, aligned: bool, btc_dist_pct: float,
         session_age: int, seconds_remaining: float,
+        paper_entry_price: int, mid: int,
     ) -> None:
-        """Place a real Kalshi entry for the FVG signal. Mirrors the
-        BB_PURE place pattern: post_only at bid+1, ticker-lock pre-await,
-        lock-release on failure, NOFILL → LIVE_PENDING with cancel timer.
+        """Place a real Kalshi entry for the FVG signal.
+
+        Entry price uses the paper-sim formula ``min(mid, baseline)`` for
+        YES (or ``min(100-mid, 100-baseline)`` for NO) — this matches the
+        OOS-validated entry price exactly. The order rests as a maker bid
+        at our valuation; fills only when the market mean-reverts. If our
+        valuation would already cross the ask (rare), we cap at ask and
+        cross as taker (still cheaper than our valuation in that case).
+
+        Lock-release on failure. NOFILL → LIVE_PENDING with cancel timer.
         """
         from _fvg_tiering import (
             compute_size_contracts, tier_tp_price, tier_sl_price,
@@ -3639,7 +3649,16 @@ class PolymarketCopyEngine:
             pf["halted"] = True
             return
 
-        # ── Get bid for maker entry ────────────────────────────────────
+        # ── Per-ticker post-failure cooldown ───────────────────────────
+        # On any place_order failure, we set a brief cooldown so the eval
+        # loop doesn't spam the same rejection at every cycle.
+        if not hasattr(self, "_fvg_post_fail_cooldown"):
+            self._fvg_post_fail_cooldown = {}
+        _cd_until = self._fvg_post_fail_cooldown.get(ticker, 0.0)
+        if time.time() < _cd_until:
+            return  # silent skip during cooldown
+
+        # ── Get book for ask-cap logic ─────────────────────────────────
         ws = getattr(self, "_kalshi_ws", None)
         book = None
         if ws is not None and hasattr(ws, "get_book"):
@@ -3652,15 +3671,35 @@ class PolymarketCopyEngine:
             return
         if side == "yes":
             entry_bid = int(getattr(book, "best_yes_bid", 0) or 0)
+            entry_ask = int(getattr(book, "best_yes_ask", 0) or 0)
         else:
             entry_bid = int(getattr(book, "best_no_bid", 0) or 0)
-        if entry_bid <= 0 or entry_bid >= 99:
+            entry_ask = int(getattr(book, "best_no_ask", 0) or 0)
+
+        # ── Entry price: paper-sim formula min(mid, baseline) ─────────
+        # paper_entry_price was computed by the caller and is exactly the
+        # value the OOS backtest scored. Default behavior: rest as maker
+        # at our valuation. If valuation would cross the ask (rare —
+        # market is offering BELOW our fair value), cap at ask + drop
+        # post_only so we cross as taker (still a "buy below valuation").
+        entry_px = int(paper_entry_price)
+        if entry_px <= 0 or entry_px >= 99:
             logger.info(
-                "PAPER FVG LIVE: invalid bid=%d for side=%s — abort",
-                entry_bid, side,
+                "PAPER FVG LIVE: invalid paper_entry_price=%d — abort",
+                entry_px,
             )
             return
-        entry_px = entry_bid + 1
+        place_post_only = True
+        if entry_ask > 0 and entry_px >= entry_ask:
+            # Our valuation says it's worth >= ask — taker-cross at ask.
+            entry_px = entry_ask
+            place_post_only = False
+            logger.info(
+                "PAPER FVG LIVE TAKER-CROSS: paper_target=%dc >= ask=%dc — "
+                "crossing as taker at %dc",
+                int(paper_entry_price), entry_ask, entry_px,
+            )
+
         # Cheap-side cap (MAX_ENTRY_CENTS — defended again here).
         max_entry = int(_uc("FVG_LIVE_MAX_ENTRY_CENTS", 75))
         if entry_px > max_entry:
@@ -3707,19 +3746,21 @@ class PolymarketCopyEngine:
             pass
 
         logger.warning(
-            "PAPER FVG LIVE FIRE [T%d]: %s %s %dx @ %dc ($%.2f) | "
+            "PAPER FVG LIVE FIRE [T%d]: %s %s %dx @ %dc ($%.2f) %s | "
             "tp=%dc sl=%dc | bal=$%.2f age=%ds aligned=%s "
-            "|dist|=%.3f%% fvg=%+dc",
+            "|dist|=%.3f%% fvg=%+dc baseline=%dc mid=%dc",
             tier, side.upper(), ticker[-15:], contracts, entry_px,
-            cost_cents / 100, tp_px, sl_trig,
+            cost_cents / 100,
+            "MAKER" if place_post_only else "TAKER",
+            tp_px, sl_trig,
             balance_cents / 100, session_age, aligned,
-            btc_dist_pct, fvg_vs_baseline,
+            btc_dist_pct, fvg_vs_baseline, baseline, mid,
         )
 
         try:
             order = await self._client.place_order(
                 ticker=ticker, side=side, price=entry_px,
-                count=contracts, post_only=True,
+                count=contracts, post_only=place_post_only,
             )
         except Exception as e:
             # Lock-release pattern (per 2026-05-03 BB_PURE precedent):
@@ -3732,6 +3773,14 @@ class PolymarketCopyEngine:
             self._remove_session_lock(ticker)
             try:
                 self._recent_placement_tickers.pop(ticker, None)
+            except Exception:
+                pass
+            # 2026-05-05 POST-FAILURE COOLDOWN: brief backoff on this
+            # ticker so the eval loop doesn't fire the same condition
+            # at every cycle (~3-4× per second) until the book moves.
+            try:
+                cooldown_s = float(_uc("FVG_LIVE_POST_FAIL_COOLDOWN_S", 5.0))
+                self._fvg_post_fail_cooldown[ticker] = time.time() + cooldown_s
             except Exception:
                 pass
             return
