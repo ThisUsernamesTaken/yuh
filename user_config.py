@@ -203,20 +203,29 @@ TA_FORCED_ENABLED = True
 # now has manual-detection gates (size > 150ct OR untouched ticker OR
 # kalshi_count > 1.5x engine's known fill → leave alone). 13/13 manual-TP
 # tests pass; 11/11 reconciler tests pass. Re-enabling TA_FORCED entries.
-TA_FORCED_ENTRY_ENABLED = False  # 2026-05-01 09:20 PT — DISABLED.
-                                  # TA_FORCED was the source of today's
-                                  # major losses: morning -$249 oversell
-                                  # (446ct @ 62c re-peg overrun) and
-                                  # afternoon -$83 (415ct @ 49c stopped
-                                  # via manual sell). The legacy 5-tier
-                                  # staircase TPs and unguarded SCALP DCA
-                                  # paths produced multi-path chaos.
-                                  # Engine is now BB_PURE-only: single
-                                  # signal path, FVG-close TPs, conviction
-                                  # tier sizing, 2-fire-per-window cap.
-                                  # Stop-loss for any in-flight TA_FORCED
-                                  # positions remains live (TA_FORCED_STOP
-                                  # _ENABLED unchanged).
+TA_FORCED_ENTRY_ENABLED = True   # 2026-05-05 PT: RE-ENABLED.
+                                  # Empirical realized P&L 04-21 to 05-01:
+                                  # 81 trades, 67.9% win rate, +$611 net
+                                  # (kalshi_trades.strategy_name='TA_FORCED').
+                                  # Account peak $1,332 on 04-28 ridden by
+                                  # this strategy. The 05-01 catastrophe
+                                  # came from DCA stack + TIERED_TP, not
+                                  # the entry signal itself. Loss-adders
+                                  # are confirmed off:
+                                  #   SCALP_DCA_ENABLED        = False
+                                  #   TP_LAYERED_ENABLED       = False
+                                  #   MICRO_PULLBACK_ENABLED   = False
+                                  #   SNIPER_ENABLED           = False
+                                  #   WALLET_COPY_ENABLED      = False
+                                  # Sizing uses fixed-fraction (8% day,
+                                  # 2% night) capped at 15ct day / 5ct
+                                  # night. Runs in portfolio with
+                                  # DIRECTION_STRATEGY (different alpha,
+                                  # one-trade-per-window lock applies).
+                                  # 2026-05-01 PRIOR DISABLE: TA_FORCED was
+                                  # the source of major losses morning
+                                  # -$249 + afternoon -$83 — both via DCA
+                                  # stack overrun, NOT the entry signal.
 
 # ── DOMINANT-DIRECTION gate tuning (Claude 2026-04-28) ──────────────────────
 # Gate 1 of 4 in the DOMINANT filter (polymarket_copy_engine.py:~7421).
@@ -2083,7 +2092,14 @@ DIRECTION_DIST_THRESHOLD_PCT     = 0.0010  # 0.10% from strike (sweet spot
                                            # per OOS: 90.5% win rate)
 DIRECTION_MOMENTUM_THRESHOLD_DOLLARS = 10  # $10 over 5 min minimum
 DIRECTION_MAX_OFFSET_S           = 600     # entry only before minute 10
-DIRECTION_CONTRACTS              = 5       # flat sizing; do NOT use Kelly
+DIRECTION_CONTRACTS              = 20      # 2026-05-05 PT: bumped 5->20.
+                                           # Backtest scales linearly: 20ct
+                                           # × ~50c entry = $10 cost, 13%
+                                           # of $75 BR. At backtested
+                                           # +$2/trade EV, 20ct projects
+                                           # +$8/trade × ~2/day = $16/day.
+                                           # Per-trade max loss bounded
+                                           # by entry × 20 ($1-15 typical).
 DIRECTION_MIN_BANKROLL_X_COST    = 1.5     # require 1.5×cost in BAL
 DIRECTION_DAILY_LOSS_HALT_FRAC   = 0.20    # halt at -20% from day-start
 DIRECTION_POST_FAIL_COOLDOWN_S   = 5.0     # backoff after place_order fail
