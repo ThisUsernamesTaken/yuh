@@ -118,27 +118,80 @@ def evaluate(
 # ── Sizing helpers ─────────────────────────────────────────────────────
 
 
+def conviction_multiplier(
+    *,
+    dist_pct_abs: float,
+    btc_5m_move_abs: float,
+    base_dist_threshold: float = DEFAULT_DIST_THRESHOLD_PCT,
+    base_momentum_threshold: float = DEFAULT_MOMENTUM_THRESHOLD,
+) -> float:
+    """Return sizing multiplier in [0.7, 2.0] based on signal conviction.
+
+    Inputs are ABSOLUTE values (caller should pass abs(dist_pct) and
+    abs(btc_5m_move)). evaluate() filters everything below threshold so
+    callers can assume both are >= the respective threshold; we still
+    defensively floor at 0.7x for inputs that drift below.
+
+    Composition (additive on top of 1.0 base):
+      + 0.5 × min(1.0, (dist_pct - 0.0010) / 0.0010)
+        # +0 at threshold (0.10%), +0.5 at 0.20% or higher
+      + 0.5 × min(1.0, (btc_5m_move - 10) / 30)
+        # +0 at threshold ($10), +0.5 at $40 or higher
+
+    Caps:
+      Floor 0.7x — never undersize a qualified signal below 70% of base
+      Cap   2.0x — never oversize beyond 2× (the 0.20% / $40 line is
+                   already 94% win in OOS; further extrapolation is
+                   unsupported by the n=35 sample at that level)
+
+    Backtest evidence (scripts/backtest_direction.py, n=197 settled):
+      dist=0.01% & mom>$10:  67% win
+      dist=0.05% & mom>$10:  77% win
+      dist=0.10% & mom>$10:  90% win   ← threshold
+      dist=0.20% & mom>$10:  94% win   ← multiplier saturates here
+
+    Examples:
+      threshold (0.10%, $10):   1.0x  (5 → 5ct)
+      sweet spot (0.15%, $25):  1.5x  (5 → 7ct)
+      strong (0.18%, $35):      ~1.83x (5 → 9ct)
+      screaming (0.20%, $40+):  2.0x  (5 → 10ct)
+    """
+    if dist_pct_abs < base_dist_threshold or btc_5m_move_abs < base_momentum_threshold:
+        return 0.7  # defensive — caller should have filtered
+    dist_excess = dist_pct_abs - base_dist_threshold
+    mom_excess = btc_5m_move_abs - base_momentum_threshold
+    dist_bonus = 0.5 * min(1.0, dist_excess / 0.0010)
+    mom_bonus = 0.5 * min(1.0, mom_excess / 30.0)
+    mult = 1.0 + dist_bonus + mom_bonus
+    return max(0.7, min(2.0, mult))
+
+
 def compute_contracts(
     balance_cents: int,
     entry_price_c: int,
     *,
     flat_contracts: int = DEFAULT_CONTRACTS,
     min_bankroll_x_cost: float = DEFAULT_MIN_BANKROLL_X_COST,
+    multiplier: float = 1.0,
 ) -> int:
     """Return contract count, or 0 if bankroll insufficient.
 
-    Flat sizing — no Kelly, no tier fraction. The strategy's edge comes
-    from win rate not asymmetry; aggressive sizing blows up the account
-    on the inevitable losing streak.
+    Sizing path:
+      1. Apply ``multiplier`` (typically from ``conviction_multiplier``)
+         to ``flat_contracts``: scaled = floor(flat × multiplier)
+      2. Clamp to >= 1
+      3. Compute cost = scaled × entry_c
+      4. Refuse if bankroll < min_x_cost × cost (avoid insufficient_balance)
 
-    Refuses if: bal <= 0, entry_c <= 0, or bal < min_x_cost × cost.
+    Backwards-compatible: multiplier=1.0 (default) gives flat sizing.
     """
     if balance_cents <= 0 or entry_price_c <= 0 or flat_contracts <= 0:
         return 0
-    cost_cents = entry_price_c * flat_contracts
+    scaled = max(1, int(flat_contracts * multiplier))
+    cost_cents = entry_price_c * scaled
     if balance_cents < int(cost_cents * min_bankroll_x_cost):
         return 0
-    return flat_contracts
+    return scaled
 
 
 def daily_loss_halted(

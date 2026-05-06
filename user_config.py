@@ -203,7 +203,18 @@ TA_FORCED_ENABLED = True
 # now has manual-detection gates (size > 150ct OR untouched ticker OR
 # kalshi_count > 1.5x engine's known fill → leave alone). 13/13 manual-TP
 # tests pass; 11/11 reconciler tests pass. Re-enabling TA_FORCED entries.
-TA_FORCED_ENTRY_ENABLED = True   # 2026-05-05 PT: RE-ENABLED.
+TA_FORCED_ENTRY_ENABLED = False  # 2026-05-05 PT 21:55: RE-DISABLED.
+                                  # Was re-enabled earlier today as portfolio
+                                  # mode (with DIRECTION) but that was scope
+                                  # creep — operator asked for conviction-
+                                  # based sizing, NOT a strategy re-enable.
+                                  # Reverting to DIRECTION-only with the
+                                  # actual conviction multiplier built. Keep
+                                  # TA_FORCED off until a separate decision
+                                  # is made about portfolio composition.
+                                  # Prior comment block follows for context.
+                                  # ──────────────────────────────────────
+                                  # 2026-05-05 PT: RE-ENABLED.
                                   # Empirical realized P&L 04-21 to 05-01:
                                   # 81 trades, 67.9% win rate, +$611 net
                                   # (kalshi_trades.strategy_name='TA_FORCED').
@@ -2101,14 +2112,21 @@ DIRECTION_DIST_THRESHOLD_PCT     = 0.0010  # 0.10% from strike (sweet spot
                                            # per OOS: 90.5% win rate)
 DIRECTION_MOMENTUM_THRESHOLD_DOLLARS = 10  # $10 over 5 min minimum
 DIRECTION_MAX_OFFSET_S           = 600     # entry only before minute 10
-DIRECTION_CONTRACTS              = 20      # 2026-05-05 PT: bumped 5->20.
-                                           # Backtest scales linearly: 20ct
-                                           # × ~50c entry = $10 cost, 13%
-                                           # of $75 BR. At backtested
-                                           # +$2/trade EV, 20ct projects
-                                           # +$8/trade × ~2/day = $16/day.
-                                           # Per-trade max loss bounded
-                                           # by entry × 20 ($1-15 typical).
+DIRECTION_CONTRACTS              = 5       # 2026-05-05 PT: REVERTED from 20.
+                                           # The 20ct bump made one bad
+                                           # trade (DIRECTION YES 20x @
+                                           # 36c on -26MAY060030-30
+                                           # settled NO at 21:29 PT) cost
+                                           # -$7.53, 4× what 5ct would
+                                           # have cost. Replaced static
+                                           # bump with conviction-based
+                                           # multiplier in
+                                           # direction_strategy.conviction_multiplier
+                                           # (0.7-2.0x scaled by dist from
+                                           # strike + btc_5m momentum).
+                                           # Base stays at 5; multiplier
+                                           # scales up to 10ct on screaming
+                                           # signals, down to 5ct floor.
 DIRECTION_MIN_BANKROLL_X_COST    = 1.5     # require 1.5×cost in BAL
 DIRECTION_DAILY_LOSS_HALT_FRAC   = 0.20    # halt at -20% from day-start
 DIRECTION_POST_FAIL_COOLDOWN_S   = 5.0     # backoff after place_order fail

@@ -4411,19 +4411,33 @@ class PolymarketCopyEngine:
         if ask_c <= 0 or ask_c >= 100:
             return
 
-        # Gate 7: sizing
+        # Gate 7: sizing — base flat × conviction multiplier
+        from direction_strategy import conviction_multiplier as _conv_mult
         flat_contracts = int(_uc("DIRECTION_CONTRACTS", 5))
+        # Multiplier scales sizing 0.7-2.0× based on signal strength
+        # (distance past strike + 5min momentum). Backtest-validated:
+        # 0.10%/$10 = 1.0× (90% win), 0.20%/$40 = 2.0× (94% win).
+        if bool(_uc("DIRECTION_CONVICTION_SIZING_ENABLED", True)):
+            multiplier = _conv_mult(
+                dist_pct_abs=abs(sig.dist_pct),
+                btc_5m_move_abs=abs(sig.btc_5m_move),
+                base_dist_threshold=dist_thr,
+                base_momentum_threshold=mom_thr,
+            )
+        else:
+            multiplier = 1.0
         contracts = direction_compute_contracts(
             balance_cents=balance_cents,
             entry_price_c=ask_c,
             flat_contracts=flat_contracts,
             min_bankroll_x_cost=float(_uc("DIRECTION_MIN_BANKROLL_X_COST", 1.5)),
+            multiplier=multiplier,
         )
         if contracts == 0:
             logger.info(
-                "DIRECTION SIZING-REFUSE: bal=$%.2f ask=%dc flat=%dct — "
-                "insufficient bankroll for 1.5×cost rule",
-                balance_cents / 100, ask_c, flat_contracts,
+                "DIRECTION SIZING-REFUSE: bal=$%.2f ask=%dc flat=%dct mult=%.2f "
+                "— insufficient bankroll for 1.5×cost rule",
+                balance_cents / 100, ask_c, flat_contracts, multiplier,
             )
             return
 
@@ -4437,10 +4451,10 @@ class PolymarketCopyEngine:
             pass
 
         logger.warning(
-            "DIRECTION FIRE: %s %s %dx @ %dc ($%.2f) | %s | "
+            "DIRECTION FIRE: %s %s %dx @ %dc ($%.2f) mult=%.2f | %s | "
             "btc=$%.2f strike=$%.2f age=%ds bal=$%.2f",
             sig.side.upper(), ticker[-15:], contracts, ask_c,
-            cost_c / 100, sig.reason,
+            cost_c / 100, multiplier, sig.reason,
             btc_price, strike, int(session_age), balance_cents / 100,
         )
 
@@ -4482,11 +4496,54 @@ class PolymarketCopyEngine:
             self._direction_post_fail_cooldown[ticker] = now + cooldown_s
             return
 
-        # Filled. Persist a row for analytics; position settles at expiry.
+        # Filled. Set _open_position with tier="DIRECTION" so the legacy
+        # SYNC RECLAIM / PROTECTIVE machinery doesn't adopt it as an
+        # orphan and try to apply BB_PURE/TA_FORCED-style exit logic.
+        # The 2026-05-05 21:22 incident: DIRECTION YES 20x @ 36c filled,
+        # SYNC RECLAIM saw _open_position=None + Kalshi position present
+        # → adopted with strat=TA_FORCED_SIGNAL → PROTECTIVE TP loop placed
+        # 6 taker sells at 71c. Position then settled NO at expiry =
+        # -$7.53 loss. Setting _open_position with the DIRECTION tier
+        # gives PROTECTIVE a chance to opt out of management.
+        self._open_position = {
+            "order_id": oid,
+            "side": sig.side,
+            "entry_cents": ask_c,
+            "original_entry_cents": ask_c,
+            "original_count": filled,
+            "ticker": ticker,
+            "tier": "DIRECTION",
+            "strategy_name": "DIRECTION",
+            "count": filled,
+            "fill_time": time.time(),
+            "_dca_maxed": True,           # never DCA
+            "_hold_to_settle": True,      # marker: PROTECTIVE skips this
+            "entry_conviction": float(multiplier),
+            "entry_wallets": 0,
+            "entry_wallet_count_at_last_scale": 0,
+            "high_water_bid": ask_c,
+            "had_flow_at_entry": False,
+            "tiers_in": set(),
+            "entry_elite_wallets": set(),
+            "shallow_filled": filled,
+            "shallow_price": ask_c,
+            "deep_filled": 0,
+            "deep_price": ask_c,
+            "signal_wallet_names": [],
+            "tp_order_id": None,
+            "tp_order_ids": [],
+            "tp_price": 0,
+            # Direction-specific cached state
+            "_direction_dist_pct": float(sig.dist_pct),
+            "_direction_btc_5m_move": float(sig.btc_5m_move),
+            "_direction_multiplier": float(multiplier),
+        }
+
         logger.warning(
-            "DIRECTION FILL: %s %dx @ %dc oid=%s | settles at expiry — "
-            "no exit logic to run",
-            sig.side.upper(), filled, ask_c, oid[:12],
+            "DIRECTION FILL: %s %dx @ %dc oid=%s mult=%.2fx | "
+            "_open_position set with tier=DIRECTION (hold_to_settle) — "
+            "settles at expiry, PROTECTIVE will skip",
+            sig.side.upper(), filled, ask_c, oid[:12], multiplier,
         )
         try:
             import sqlite3 as _sq
@@ -16406,6 +16463,21 @@ class PolymarketCopyEngine:
         side = (pos.get("side") or "").lower()
         if not ticker or side not in ("yes", "no"):
             return False
+
+        # ── DIRECTION TIER OPT-OUT (2026-05-05) ──────────────────────
+        # DIRECTION strategy is hold-to-settlement by design. Kalshi
+        # auto-credits $1 per winning contract at expiry; no exit logic
+        # is needed. The 21:22 incident: PROTECTIVE adopted a DIRECTION
+        # fill as TA_FORCED, kept placing taker sells with TP_TAKER_
+        # CONVERT, position then settled NO at expiry = -$7.53 loss.
+        # The fix: tag DIRECTION fills with tier="DIRECTION" + the
+        # _hold_to_settle marker, and skip protective management here.
+        if pos.get("tier") == "DIRECTION" or pos.get("_hold_to_settle"):
+            # We "own" the position from a stand-out perspective — caller
+            # should not run legacy stop logic either. Returning True
+            # signals "protective is in charge", which here means
+            # "deliberately doing nothing until expiry."
+            return True
 
         # ── BB_MOMENTUM POST-ENTRY EXIT SIGNALS (2026-05-03) ──────────
         # Backtest validated +$19.86 vs +$9.99 hold-to-settle baseline.

@@ -13,6 +13,7 @@ from direction_strategy import (
     DEFAULT_MOMENTUM_THRESHOLD,
     DirectionSignal,
     compute_contracts,
+    conviction_multiplier,
     daily_loss_halted,
     evaluate,
 )
@@ -176,6 +177,76 @@ def test_contracts_custom_flat_size():
     """Override flat contracts to 10."""
     # 10 × 30c = 300c. 1.5× = 450c. Bankroll 500c → pass.
     assert compute_contracts(500, 30, flat_contracts=10) == 10
+
+
+# ─── conviction_multiplier() ─────────────────────────────────────────────
+
+
+def test_multiplier_at_threshold_is_1x():
+    """Just-at-threshold signal → 1.0x (no bonus, no penalty)."""
+    m = conviction_multiplier(dist_pct_abs=0.0010, btc_5m_move_abs=10.0)
+    assert m == 1.0
+
+
+def test_multiplier_below_threshold_is_floor():
+    """Signal below threshold (shouldn't happen if evaluate() ran) → 0.7x floor."""
+    m = conviction_multiplier(dist_pct_abs=0.0005, btc_5m_move_abs=10.0)
+    assert m == 0.7
+    m = conviction_multiplier(dist_pct_abs=0.0010, btc_5m_move_abs=5.0)
+    assert m == 0.7
+
+
+def test_multiplier_sweet_spot_is_1_5x():
+    """Halfway-between threshold and saturation: dist=0.15%, mom=$25 → 1.5x."""
+    m = conviction_multiplier(dist_pct_abs=0.0015, btc_5m_move_abs=25.0)
+    # +0.25 from dist (halfway 0.0010 → 0.0020)
+    # +0.25 from mom  (halfway $10 → $40)
+    assert m == pytest.approx(1.5, abs=0.01)
+
+
+def test_multiplier_saturates_at_2x():
+    """At/above 0.20% dist + $40 momentum → 2.0x cap."""
+    m = conviction_multiplier(dist_pct_abs=0.0020, btc_5m_move_abs=40.0)
+    assert m == 2.0
+    # Even further past doesn't go higher
+    m = conviction_multiplier(dist_pct_abs=0.0050, btc_5m_move_abs=200.0)
+    assert m == 2.0
+
+
+def test_multiplier_dist_only_max():
+    """Max dist alone (mom at threshold) → 1.5x (only dist contributes)."""
+    m = conviction_multiplier(dist_pct_abs=0.0020, btc_5m_move_abs=10.0)
+    assert m == pytest.approx(1.5, abs=0.01)
+
+
+def test_multiplier_momentum_only_max():
+    """Max mom alone (dist at threshold) → 1.5x."""
+    m = conviction_multiplier(dist_pct_abs=0.0010, btc_5m_move_abs=40.0)
+    assert m == pytest.approx(1.5, abs=0.01)
+
+
+# ─── compute_contracts() with multiplier ────────────────────────────────
+
+
+def test_contracts_multiplier_scales_up():
+    """multiplier=1.5 on flat=5 → 7ct (5 × 1.5 = 7.5 → floor 7)."""
+    assert compute_contracts(5000, 50, flat_contracts=5, multiplier=1.5) == 7
+
+
+def test_contracts_multiplier_max_cap():
+    """multiplier=2.0 on flat=5 → 10ct."""
+    assert compute_contracts(5000, 50, flat_contracts=5, multiplier=2.0) == 10
+
+
+def test_contracts_multiplier_below_one_floors_at_one():
+    """Even with multiplier < 1, never go below 1ct (otherwise return 0)."""
+    # flat=5 × 0.1 = 0.5 → max(1, 0) = 1
+    assert compute_contracts(5000, 50, flat_contracts=5, multiplier=0.1) == 1
+
+
+def test_contracts_multiplier_default_is_flat():
+    """Default multiplier=1.0 → preserves backwards compatibility."""
+    assert compute_contracts(5000, 50, flat_contracts=5) == 5
 
 
 # ─── daily_loss_halted() ─────────────────────────────────────────────────
