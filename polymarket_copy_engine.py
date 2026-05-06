@@ -2220,6 +2220,17 @@ class PolymarketCopyEngine:
             except Exception:
                 pass
 
+        # ── Direction-following strategy (2026-05-05) ─────────────────
+        # Buy whichever side BTC is moving when |dist|>=0.10% AND
+        # 5-min momentum agrees. Hold to settlement. OOS-validated:
+        # 84-132 trades, 69-90% win rate, +$2-4/trade. See
+        # direction_strategy.py + scripts/backtest_direction.py.
+        if bool(_uc("DIRECTION_STRATEGY_ENABLED", False)):
+            try:
+                await self._direction_tick()
+            except Exception:
+                logger.exception("CopyEngine DIRECTION tick error")
+
         # ── ATM Reversion tier (Codex handoff 2026-04-25 + ATM_ONLY plan) ──
         # Runs every cycle. Paper path always runs (with shadow logging).
         # Live path only fires when LIVE_STRATEGY_MODE=="ATM_ONLY" AND
@@ -4252,6 +4263,256 @@ class PolymarketCopyEngine:
 
         pf["state"] = "IDLE"
         pf["cycles_this_session"] += 1
+
+    # ═══════════════════════════════════════════════════════════════════
+    # DIRECTION-FOLLOWING STRATEGY (2026-05-05)
+    # ═══════════════════════════════════════════════════════════════════
+    # Pure module: direction_strategy.py
+    # OOS validation: scripts/backtest_direction.py (197 settled markets):
+    #   - 132 trades sign-aligned + entry pre-min-10 + no price cap:
+    #     68.9% win, +$2.07/trade, +$273.58 corpus, $50 BR -> $323.58
+    #   - 84 trades dist>=0.10%: 90.5% win, +$3.94/trade, +$330 corpus
+    #
+    # Thesis: when BTC is meaningfully past strike with momentum agreeing,
+    # it tends to stay there for the remaining ~14 min. Buy at ask via IOC
+    # taker, hold to settlement. No exit logic to write — Kalshi auto-
+    # settles binary contracts at $0/$1 on close.
+    #
+    # Architecture wins over FVG-tier:
+    # - No LIVE_HOLDING state machine (no FLAT-CONFIRMED bug surface)
+    # - No _open_position integration needed (settlement is automatic)
+    # - No taker-cross/maker-cross logic (just IOC at ask)
+    # - Per-window ticker lock + daily-loss halt = sufficient safety
+    # ═══════════════════════════════════════════════════════════════════
+
+    async def _direction_tick(self) -> None:
+        """One iteration of the direction-following strategy.
+
+        Gates (in order, fail-fast):
+          1. Already entered this ticker this window? skip
+          2. Past entry-time cap (default minute 10)? skip
+          3. Daily loss halt fired? skip
+          4. BTC + strike + 5m_move all available? else skip
+          5. evaluate() returns a signal? else skip
+          6. Book has valid ask on chosen side? else skip
+          7. Sufficient bankroll for flat sizing? else skip
+          8. Place IOC taker buy. On any exception, release session lock
+             (lock-release pattern, mirrors BB_PURE precedent).
+          9. On filled>0: add to ticker lock, log. No post-entry tracking
+             — position settles naturally at expiry.
+        """
+        from direction_strategy import (
+            evaluate as direction_evaluate,
+            compute_contracts as direction_compute_contracts,
+            daily_loss_halted as direction_daily_loss_halted,
+        )
+
+        ticker = getattr(self, "_current_kalshi_ticker", "") or ""
+        if not ticker:
+            return
+
+        # Gate 1: per-window ticker lock
+        if ticker in self._entered_tickers_this_window:
+            return
+
+        # Gate 2: entry-time cap
+        now = time.time()
+        session_open = float(getattr(self, "_poly_window_open_time", 0) or 0)
+        if session_open <= 0:
+            return
+        session_age = now - session_open
+        max_offset_s = int(_uc("DIRECTION_MAX_OFFSET_S", 600))
+        if session_age >= max_offset_s:
+            return
+
+        # Per-ticker post-failure cooldown (mirrors FVG/BB_PURE pattern)
+        if not hasattr(self, "_direction_post_fail_cooldown"):
+            self._direction_post_fail_cooldown = {}
+        _cd_until = self._direction_post_fail_cooldown.get(ticker, 0.0)
+        if now < _cd_until:
+            return
+
+        # Gate 3: real balance + daily loss halt
+        try:
+            _bal = await self._client.get_balance()
+            balance_cents = int(_bal.balance)
+        except Exception:
+            return
+        if balance_cents <= 0:
+            return
+
+        if not hasattr(self, "_direction_state"):
+            self._direction_state = {
+                "day_start_balance_c": 0,
+                "day_start_date": "",
+            }
+        ds = self._direction_state
+        import datetime as _dt
+        today_str = _dt.datetime.now().strftime("%Y-%m-%d")
+        if ds.get("day_start_date") != today_str:
+            ds["day_start_balance_c"] = balance_cents
+            ds["day_start_date"] = today_str
+            logger.info(
+                "DIRECTION: new session day %s — start_bal=$%.2f",
+                today_str, balance_cents / 100,
+            )
+        halt_frac = float(_uc("DIRECTION_DAILY_LOSS_HALT_FRAC", 0.20))
+        if direction_daily_loss_halted(
+            balance_cents, ds["day_start_balance_c"], halt_frac=halt_frac,
+        ):
+            logger.error(
+                "DIRECTION DAILY-LOSS-HALT: bal=$%.2f day_start=$%.2f "
+                "(halt at -%.0f%%) — skipping until tomorrow",
+                balance_cents / 100,
+                ds["day_start_balance_c"] / 100,
+                halt_frac * 100,
+            )
+            return
+
+        # Gate 4: inputs (BTC price, strike, 5m move)
+        btc_price = float(getattr(self, "_btc_last_price", 0) or 0)
+        if btc_price <= 0:
+            return
+        _pf = getattr(self, "_price_feed", None)
+        prob = _pf.prob_engine if _pf and hasattr(_pf, "prob_engine") else None
+        strike = float(getattr(prob, "strike", 0) or 0) if prob else 0.0
+        if strike <= 0:
+            return
+        pressure = getattr(self, "_last_pressure", None)
+        btc_5m_move = float(getattr(pressure, "btc_move_300s", 0.0) or 0.0)
+
+        # Gate 5: evaluate the strategy decision
+        dist_thr = float(_uc("DIRECTION_DIST_THRESHOLD_PCT", 0.0010))
+        mom_thr = float(_uc("DIRECTION_MOMENTUM_THRESHOLD_DOLLARS", 10.0))
+        sig = direction_evaluate(
+            btc_price=btc_price,
+            strike=strike,
+            btc_5m_move=btc_5m_move,
+            dist_threshold_pct=dist_thr,
+            momentum_threshold=mom_thr,
+        )
+        if sig is None:
+            return
+
+        # Gate 6: book has valid quotes on chosen side
+        ws = getattr(self, "_kalshi_ws", None)
+        book = None
+        if ws is not None and hasattr(ws, "get_book"):
+            try:
+                book = ws.get_book(ticker)
+            except Exception:
+                book = None
+        if book is None:
+            return
+        if sig.side == "yes":
+            ask_c = int(getattr(book, "best_yes_ask", 0) or 0)
+        else:
+            ask_c = int(getattr(book, "best_no_ask", 0) or 0)
+        if ask_c <= 0 or ask_c >= 100:
+            return
+
+        # Gate 7: sizing
+        flat_contracts = int(_uc("DIRECTION_CONTRACTS", 5))
+        contracts = direction_compute_contracts(
+            balance_cents=balance_cents,
+            entry_price_c=ask_c,
+            flat_contracts=flat_contracts,
+            min_bankroll_x_cost=float(_uc("DIRECTION_MIN_BANKROLL_X_COST", 1.5)),
+        )
+        if contracts == 0:
+            logger.info(
+                "DIRECTION SIZING-REFUSE: bal=$%.2f ask=%dc flat=%dct — "
+                "insufficient bankroll for 1.5×cost rule",
+                balance_cents / 100, ask_c, flat_contracts,
+            )
+            return
+
+        cost_c = contracts * ask_c
+
+        # Pre-await: add ticker lock for race protection.
+        self._add_session_lock(ticker)
+        try:
+            self._recent_placement_tickers[ticker] = now
+        except Exception:
+            pass
+
+        logger.warning(
+            "DIRECTION FIRE: %s %s %dx @ %dc ($%.2f) | %s | "
+            "btc=$%.2f strike=$%.2f age=%ds bal=$%.2f",
+            sig.side.upper(), ticker[-15:], contracts, ask_c,
+            cost_c / 100, sig.reason,
+            btc_price, strike, int(session_age), balance_cents / 100,
+        )
+
+        # Gate 8: place IOC taker buy
+        try:
+            order = await self._client.place_order(
+                ticker=ticker, side=sig.side, price=ask_c,
+                count=contracts, post_only=False,
+                time_in_force="immediate_or_cancel",
+            )
+        except Exception as e:
+            logger.error(
+                "DIRECTION place_order failed: %s — releasing session lock for %s",
+                e, ticker[-15:],
+            )
+            self._remove_session_lock(ticker)
+            try:
+                self._recent_placement_tickers.pop(ticker, None)
+            except Exception:
+                pass
+            cooldown_s = float(_uc("DIRECTION_POST_FAIL_COOLDOWN_S", 5.0))
+            self._direction_post_fail_cooldown[ticker] = now + cooldown_s
+            return
+
+        filled = int(getattr(order, "filled_count", 0) or 0)
+        oid = getattr(order, "order_id", "") or ""
+
+        if filled <= 0:
+            # IOC means no resting remainder — order auto-cancels if it
+            # didn't take immediately. Release lock so a slightly later
+            # tick can retry once book conditions match.
+            logger.info(
+                "DIRECTION IOC NOFILL: order=%s @ %dc — book moved or "
+                "depth insufficient; releasing lock",
+                oid[:12], ask_c,
+            )
+            self._remove_session_lock(ticker)
+            cooldown_s = float(_uc("DIRECTION_POST_FAIL_COOLDOWN_S", 5.0))
+            self._direction_post_fail_cooldown[ticker] = now + cooldown_s
+            return
+
+        # Filled. Persist a row for analytics; position settles at expiry.
+        logger.warning(
+            "DIRECTION FILL: %s %dx @ %dc oid=%s | settles at expiry — "
+            "no exit logic to run",
+            sig.side.upper(), filled, ask_c, oid[:12],
+        )
+        try:
+            import sqlite3 as _sq
+            conn = _sq.connect("data/trades.db")
+            c = conn.cursor()
+            c.execute("""CREATE TABLE IF NOT EXISTS direction_trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticker TEXT, side TEXT,
+                entry_price INTEGER, contracts INTEGER,
+                btc_price REAL, strike REAL, dist_pct REAL,
+                btc_5m_move REAL, session_age_s INTEGER,
+                bal_cents_at_entry INTEGER, order_id TEXT,
+                created_at TEXT DEFAULT (datetime('now'))
+            )""")
+            c.execute(
+                "INSERT INTO direction_trades VALUES "
+                "(NULL,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))",
+                (ticker, sig.side, ask_c, filled,
+                 sig.btc_price, sig.strike, sig.dist_pct,
+                 sig.btc_5m_move, int(session_age),
+                 balance_cents, oid),
+            )
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.debug("DIRECTION DB save failed: %s", e)
 
     # ── ATM Reversion paper-only tier ───────────────────────────────────────
     # Decision logic delegated to atm_reversion.evaluate / evaluate_exit so

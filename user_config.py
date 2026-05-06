@@ -2058,6 +2058,31 @@ PAPER_FVG_LIVE_MODE              = False  # 2026-05-05 06:27 PT EMERGENCY DISABL
                                           # (ticker-lock, MIN-TRUTH gate,
                                           # OVERSELL-GUARD, residual
                                           # reconciler, daily-loss halt).
+
+# ── DIRECTION-FOLLOWING STRATEGY (2026-05-05) ──────────────────────────
+# Buy whichever side BTC is moving when |dist|>=0.10% AND 5-min momentum
+# agrees. Hold to settlement. OOS-validated: 84-132 trades, 69-90% win
+# rate, +$2-4 mean P&L per trade, $50 BR -> $323 corpus.
+# See direction_strategy.py + scripts/backtest_direction.py.
+#
+# This is the PRIMARY live strategy as of 2026-05-05, replacing the
+# FVG-tier-aware path (PAPER_FVG_LIVE_MODE) which had structural bugs
+# (FLAT-CONFIRMED missing, SYNC RECLAIM orphan adoption) and inferior
+# economics (26% win rate vs 69-90% here).
+DIRECTION_STRATEGY_ENABLED       = False   # CRITICAL: must validate paper
+                                           # one window cycle before enabling
+                                           # live. When True, fires real
+                                           # Kalshi IOC taker orders on
+                                           # direction-aligned signals.
+DIRECTION_DIST_THRESHOLD_PCT     = 0.0010  # 0.10% from strike (sweet spot
+                                           # per OOS: 90.5% win rate)
+DIRECTION_MOMENTUM_THRESHOLD_DOLLARS = 10  # $10 over 5 min minimum
+DIRECTION_MAX_OFFSET_S           = 600     # entry only before minute 10
+DIRECTION_CONTRACTS              = 5       # flat sizing; do NOT use Kelly
+DIRECTION_MIN_BANKROLL_X_COST    = 1.5     # require 1.5×cost in BAL
+DIRECTION_DAILY_LOSS_HALT_FRAC   = 0.20    # halt at -20% from day-start
+DIRECTION_POST_FAIL_COOLDOWN_S   = 5.0     # backoff after place_order fail
+
 # Tier sizing fractions (Level 3 — Half-Kelly, OOS-validated)
 FVG_TIER_FRAC_T1                 = 0.35
 FVG_TIER_FRAC_T2                 = 0.25

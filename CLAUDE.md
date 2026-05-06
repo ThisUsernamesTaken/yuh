@@ -1,18 +1,32 @@
 # BTC Bias Engine — Current System Reference
 
-**Last updated**: 2026-05-05 04:41 PT (FVG-tier-aware live deploy)
+**Last updated**: 2026-05-05 (direction-following strategy live)
 **Entry point**: `run_copy_engine.py` (NSSM service `BTCBiasEngine` on Windows)
-**Live primary signal**: `PAPER_FVG` (tier-aware Brownian-Bridge FVG, Level 3 sizing)
-**Status**: SERVICE_RUNNING. BAL $35.52 (pre-flip). FLAT, 0 resting orders.
+**Live primary signal**: `DIRECTION` (sign-aligned distance + momentum, hold to settlement)
+**Status**: SERVICE_RUNNING. BAL $75.04. FLAT, 0 resting orders.
 
-> **For the AI agent inheriting this session**: BB_PURE / BB_TREND / BB_MOMENTUM
-> were retired 2026-05-04 in favor of the **FVG-tier-aware** path. The FVG
-> strategy fires from `_paper_fvg_tick` in `polymarket_copy_engine.py` and
-> routes through `_paper_fvg_live_entry` (real Kalshi orders) when
-> `PAPER_FVG_LIVE_MODE=True`. Tier classification + sizing math lives in
-> `_fvg_tiering.py` (pure module, OOS-validated 2026-05-04: T1 fill 97.4%,
-> T2 fill 92.2%). Sizing is **Level 3 Half-Kelly aggressive**: T1=35%, T2=25%,
-> T3=18%, T4=10% bankroll fractions, with a 40% max ticker exposure cap.
+> **For the AI agent inheriting this session**: as of 2026-05-05 PT, the
+> live primary signal is **direction-following**: when BTC is ≥0.10% past
+> strike with 5-min momentum agreeing, buy that side at ask (IOC taker)
+> and hold to settlement. Pure module is `direction_strategy.py`.
+> Engine handler is `_direction_tick` in `polymarket_copy_engine.py`.
+>
+> **Why this replaced FVG-tier**: the FVG-tier-aware path
+> (`PAPER_FVG_LIVE_MODE`, `_fvg_tiering.py`) had structural bugs that
+> caused a -19% live loss on first actual fill (2026-05-05 06:27 PT) —
+> stale-cache premature-close + SYNC RECLAIM orphan adoption with wrong
+> exit logic. More importantly, an honest backtest on settlement data
+> (197 markets, `scripts/backtest_direction.py` vs the original FVG OOS)
+> showed the direction-following thesis has dramatically better economics:
+> 69-90% win rate / +$2-4 per trade / $50 → $323 corpus, vs FVG-tier's
+> 26% win rate / +$0.47 per trade / volatile compounding that blew up at
+> 20% Kelly. **The user's intuition was right**: settlement-driven
+> direction bets beat mispricing-driven mean-reversion in this market
+> structure.
+>
+> The FVG-tier code is preserved but `PAPER_FVG_LIVE_MODE = False`.
+> Do not re-enable without first fixing FLAT-CONFIRMED + `_open_position`
+> integration, and not without re-validating against settlement data.
 
 This document is the operator-facing source of truth. **If this doc and code disagree, the code wins.** Update this doc whenever signal logic or config defaults materially change.
 
@@ -24,59 +38,54 @@ This document is the operator-facing source of truth. **If this doc and code dis
 
 Trades Kalshi `KXBTC15M` 15-minute BTC binary options.
 
-**Single live strategy: tier-aware FVG (Fair Value Gap)** — buys the cheap
-side when the Brownian-Bridge fair value diverges meaningfully from the
-session baseline, sized aggressively when conviction is high.
+**Single live strategy: direction-following.** Buy whichever side BTC is
+moving when it's meaningfully past strike with momentum agreeing. Hold
+to settlement. The exit IS the settlement — Kalshi auto-credits $1.00
+per contract to balance if the direction was right, $0 otherwise.
 
 ```
-[1] BASELINE phase (first 90s of session)
-    - Collect mid prices, compute baseline = mean(mids)
+[1] Inputs (every tick)
+    - btc_price        from price_feed (_btc_last_price)
+    - strike           from prob_engine.strike (parsed from ticker)
+    - btc_5m_move      from tape_pressure.btc_move_300s
+    - book.best_yes_ask / best_no_ask  from kalshi_ws
 
-[2] FVG signal
-    - fair_value (from BB model) vs baseline
-    - if |fair − baseline| ≥ time-weighted threshold:
-        side = "yes" if fair > baseline else "no"
-        entry_price = bid + 1 (post_only maker)
+[2] Decision (direction_strategy.evaluate)
+    - dist_pct = (btc - strike) / strike
+    - YES: dist_pct >= +0.10% AND btc_5m_move >= +$10
+    - NO:  dist_pct <= -0.10% AND btc_5m_move <= -$10
+    - else: skip
 
-[3] TIER CLASSIFICATION (_fvg_tiering.classify_tier)
-    - Tier 1 (35% size, +20c TP): age ≥ 300s, aligned, |dist| ≥ 0.10%  [99% OOS fill]
-    - Tier 2 (25% size, +15c TP): age ≥ 300s, aligned                 [93% OOS fill]
-    - Tier 3 (18% size, +12c TP): age ≥ 300s, not aligned             [91% OOS fill]
-    - Tier 4 (10% size, +12c TP): 180 ≤ age < 300                     [76% OOS fill]
-    - Tier 0 (REFUSE):
-        * age < 180s (early-window noise)
-        * counter-trend AND 30 ≤ entry ≤ 49 (worst-segment combo)
-        * |btc_5m_move| < $20 AND counter-trend (no edge)
+[3] Pre-fire gates
+    - Per-window ticker lock: skip if already entered this 15-min window
+    - Entry-time cap: skip if session_age >= 600s (minute 10)
+    - Daily-loss halt: skip if bal < day_start × (1 - 0.20)
+    - Bankroll: require bal >= 1.5× cost (avoid insufficient_balance on retry)
+    - Post-failure cooldown: 5s per-ticker after any place_order rejection
 
-[4] SIZING (_fvg_tiering.compute_size_contracts)
-    - notional = balance × tier_frac, capped at balance × 40%
-    - contracts = floor(notional / entry_price)
-    - hard cap at 200 contracts
-    - if min_contracts cost > exposure cap → refuse
-
-[5] LIVE EXECUTION (_paper_fvg_live_entry)
-    - Per-window ticker lock added pre-await (race protection)
-    - place_order(action="buy", post_only=True) at bid+1
-    - On filled>0: place resting TP at tier_tp_price → LIVE_HOLDING
-    - On filled=0: → LIVE_PENDING (8s NOFILL cancel timer)
-    - On exception: release ticker lock, retry on next signal
-
-[6] LIVE_HOLDING management (_paper_fvg_live_holding_tick)
-    - Poll Kalshi truth via get_positions every tick
-    - position == 0 (TP filled) → reconcile residual + close
-    - cur_bid ≤ sl_trigger (entry − 8c) → cancel TP + capped_side_sell
-    - seconds_remaining < 60 → cancel TP + flatten
-    - Always _reconcile_residual_position after close (oversell guard)
-
-[7] DAILY-LOSS CIRCUIT BREAKER
-    - If real bal < day_start × (1 − FVG_DAILY_LOSS_HALT_FRAC) → halt
+[4] EXECUTION
+    - Pre-await: add ticker lock, stamp recent_placement_tickers
+    - place_order(action="buy", side=signal.side, price=ask,
+                  count=DIRECTION_CONTRACTS, post_only=False,
+                  time_in_force="immediate_or_cancel")
+    - IOC ensures: fill at ask if depth available, else auto-cancel.
+      No stale resting orders, no maker bag-holds.
+    - On exception: release ticker lock + cooldown timer (lock-release)
+    - On filled=0: IOC cancelled. Release lock + cooldown for retry.
+    - On filled>0: log + persist row in direction_trades. NO post-entry
+      tracking — position settles at expiry, Kalshi handles it.
 ```
 
-The microstructure / regime / SR / wallet-copy / TA-cascade layers exist in
-the codebase but are all feature-flagged off. The FVG path is self-contained
-and routes through the existing safety primitives:
-`_add_session_lock`, `_place_capped_side_sell` (MIN-TRUTH gate +
-OVERSELL-GUARD), `_reconcile_residual_position`.
+The microstructure / regime / SR / wallet-copy / TA-cascade / FVG-tier
+layers exist in the codebase but are all feature-flagged off. The
+direction path is self-contained: only uses existing engine primitives
+for ticker lock + balance check + book read + place_order.
+
+**Why no exit logic:** Kalshi binary contracts settle at $0.00 or $1.00
+at expiry. Our position is bought via IOC at the ask, then held. At
+settlement, balance is auto-credited by Kalshi. No FLAT-CONFIRMED, no
+SYNC RECLAIM, no residual reconciler needed because no exit orders are
+placed. The only safety primitive needed is the per-window ticker lock.
 
 ---
 
@@ -85,36 +94,31 @@ OVERSELL-GUARD), `_reconcile_residual_position`.
 ```python
 # Live trading
 PAPER_TRADING                        = False
-PAPER_FVG_ENABLED                    = True
-PAPER_FVG_LIVE_MODE                  = True   # routes FVG through real orders
 
-# Tier sizing fractions (Level 3 Half-Kelly, OOS-validated 2026-05-04)
-FVG_TIER_FRAC_T1                     = 0.35
-FVG_TIER_FRAC_T2                     = 0.25
-FVG_TIER_FRAC_T3                     = 0.18
-FVG_TIER_FRAC_T4                     = 0.10
-
-# Tier TP offsets (cents above entry)
-FVG_TIER_TP_T1                       = 20
-FVG_TIER_TP_T2                       = 15
-FVG_TIER_TP_T3                       = 12
-FVG_TIER_TP_T4                       = 12
-FVG_TIER_SL_OFFSET                   = 8        # uniform across tiers
-
-# Live execution caps + safety
-FVG_LIVE_MAX_TICKER_EXPOSURE_FRAC    = 0.40     # cap above T1's 35%
-FVG_LIVE_MAX_ENTRY_CENTS             = 75       # cheap-side bias
-FVG_LIVE_MAX_CONTRACTS_CAP           = 200      # hard ceiling
-FVG_LIVE_NOFILL_TIMEOUT_S            = 8.0      # cancel-stale entry timer
-FVG_DAILY_LOSS_HALT_FRAC             = 0.20     # halt at -20% from day-start
+# DIRECTION-FOLLOWING (PRIMARY LIVE SIGNAL — 2026-05-05)
+DIRECTION_STRATEGY_ENABLED           = True    # PRIMARY
+DIRECTION_DIST_THRESHOLD_PCT         = 0.0010  # 0.10% from strike
+DIRECTION_MOMENTUM_THRESHOLD_DOLLARS = 10      # $10 over 5min
+DIRECTION_MAX_OFFSET_S               = 600     # entry only before minute 10
+DIRECTION_CONTRACTS                  = 5       # flat sizing (NO Kelly)
+DIRECTION_MIN_BANKROLL_X_COST        = 1.5     # need 1.5×cost in BAL
+DIRECTION_DAILY_LOSS_HALT_FRAC       = 0.20    # halt at -20% from day-start
+DIRECTION_POST_FAIL_COOLDOWN_S       = 5.0     # backoff after place_order fail
 
 # Per-window ticker lock — INVIOLABLE
 MAX_TRADES_PER_SESSION_TICKER        = 1
 
 # Safety hardening
-SAFETY_OVERSELL_HARDENING            = True     # gates _reconcile_residual_position
+SAFETY_OVERSELL_HARDENING            = True     # belt-and-braces (no exits placed
+                                                # by direction strategy, but the
+                                                # primitive defends if any ever
+                                                # are added)
 
 # DISABLED / RETIRED (do NOT re-enable without explicit user direction)
+PAPER_FVG_LIVE_MODE                  = False   # 2026-05-05 06:27 PT EMERGENCY
+                                               # DISABLE: stale-cache premature-
+                                               # close + SYNC RECLAIM bug. See
+                                               # to-do/LIVE_SESSION_NOTES_2026_05_02.md
 BB_PURE_MODE                         = False   # killed 2026-05-04 19:55
 BB_MOMENTUM_ENABLED                  = False   # killed 2026-05-05 (user: FVG only)
 TA_FORCED_ENTRY_ENABLED              = False
@@ -135,26 +139,36 @@ MICRO_PULLBACK_ENABLED               = False
 ### Core runtime (always)
 
 - `run_copy_engine.py` — entry point, credential bootstrap
-- `polymarket_copy_engine.py` — main engine. The FVG live path lives in
-  `_paper_fvg_tick` + `_paper_fvg_live_entry` + `_paper_fvg_live_holding_tick`
-  + `_paper_fvg_live_close` + `_paper_fvg_live_session_rollover`
-- `user_config.py` — live config switchboard (FVG knobs at line ~2015)
-- `_fvg_tiering.py` — pure module: tier classification + sizing math.
-  All decision logic is unit-testable here.
+- `polymarket_copy_engine.py` — main engine. The DIRECTION live path is in
+  `_direction_tick`. The FVG-tier path (now off) is in `_paper_fvg_tick`
+  + `_paper_fvg_live_entry` etc.
+- `user_config.py` — live config switchboard (DIRECTION knobs at line ~2060,
+  FVG knobs at ~2015 but disabled)
+- `direction_strategy.py` — pure module: direction-following decision math.
+  All logic is unit-testable here.
+- `_fvg_tiering.py` — pure module: legacy FVG tier classification (still
+  imported by `_paper_fvg_tick` paper-sim path).
 - `kalshi_client.py` — RSA-PSS signed REST client
 - `kalshi_ws.py` — WebSocket client for orderbook/trades
 - `kalshi_tape.py` — per-ticker rolling tape of trades + mids
-- `price_feed.py` — Binance/Coinbase ingestion + Brownian-Bridge model (`prob_engine`)
+- `tape_pressure.py` — pressure scoring; provides `btc_move_300s` for the
+  direction strategy
+- `price_feed.py` — Binance/Coinbase ingestion + Brownian-Bridge model (`prob_engine`).
+  Provides `prob_engine.strike` for the direction strategy.
 - `signal_logger.py` — async SQLite writer (data/trades.db, data/signals.db)
 
 ### Validation + analytics
 
-- `tests/test_fvg_tiering.py` — 23 unit tests pinning every tier boundary
-- `tests/test_fvg_live_wiring.py` — 10 unit tests for the live state machine
-  (entry path, NOFILL timeout, late-fill, SL hit, time-exit, daily-loss halt,
-  ticker-lock, place_order failure)
-- `scripts/backtest_oos_level3.py` — chronological 70/30 OOS validation
-- `scripts/backtest_fvg_segmentation.py` — feature-conditional P&L analysis
+- `tests/test_direction_strategy.py` — 25 unit tests pinning every decision
+  boundary (YES/NO sides, dist + momentum thresholds, sign-mismatch refusals,
+  invalid inputs, sizing, daily-loss halt)
+- `scripts/backtest_direction.py` — corpus backtest on 197 settled markets,
+  proves the 69-90% win rate and +$2-4/trade economics
+- `scripts/backtest_cheap_trail.py` + `backtest_cheap_trail_deep.py` —
+  alternative-strategy backtests (cheap-side + trailing TP) showing this
+  approach is inferior to direction-following
+- `tests/test_fvg_tiering.py` (23 tests) + `tests/test_fvg_live_wiring.py`
+  (10 tests) — preserved for the now-disabled FVG path
 
 ### Background workers
 
@@ -223,26 +237,15 @@ asyncio.run(main())
 
 | Pattern | Meaning |
 |---|---|
-| `PAPER FVG BASELINE: Nc from M samples` | First-90s baseline established |
-| `PAPER FVG LIVE FIRE [TN]: SIDE TICKER Nx @ Mc` | Live entry placed |
-| `PAPER FVG LIVE FILL [TN]: Nx @ Mc \| TP placed @ Pc` | Entry filled, TP resting |
-| `PAPER FVG LIVE NOFILL: order=...` | Entry resting at limit, awaiting fill |
-| `PAPER FVG LIVE NOFILL CANCEL: order=...` | Stale entry cancelled after 8s |
-| `PAPER FVG LIVE LATE-FILL: ...` | Entry filled after place_order returned |
-| `PAPER FVG LIVE CLOSE [TN]: ...pnl=$+/-X.XX` | Trade closed (TP / SL / time) |
-| `PAPER FVG LIVE EMERGENCY-EXIT (sl_hit)` | SL trigger fired, flattening |
-| `PAPER FVG LIVE EMERGENCY-EXIT (time_exit_any)` | < 60s left, flattening |
-| `PAPER FVG LIVE DAILY-LOSS-HALT: ...` | Day P&L hit -20%, halted |
-| `PAPER FVG LIVE SESSION-ROLLOVER` | Window rolled mid-position, cleaning up |
-| `PAPER FVG LIVE TIER-UNDERSIZED` | Bankroll can't afford 1ct under cap |
-| `PAPER FVG LIVE CHEAP-SIDE-BLOCK: entry=Nc > 75c` | Entry too expensive, skip |
-| `PAPER FVG LIVE BAL-FLOOR: ...` | Pre-fire balance gate (avoid insufficient_balance) |
-| `PAPER FVG LIVE SKIP: TICKER already entered` | Per-window ticker lock holding |
-| `PAPER FVG LIVE place_order failed: ...` | Order rejection, lock released |
-| `CopyEngine RESIDUAL-CLEAN: ...` | Position confirmed flat post-close |
-| `CopyEngine RESIDUAL: Nct YES still open` | Limit sells didn't fill, market-selling |
-| `CopyEngine OVERSELL-DETECTED: ...` | 2026-04-22 oversell-to-short signature (alarm) |
-| `CopyEngine STUCK-RESIDUAL: ...` | Reconciler couldn't clear after 3 attempts |
+| `DIRECTION FIRE: YES TICKER Nx @ Mc` | Direction entry placed (IOC) |
+| `DIRECTION FILL: YES Nx @ Mc oid=...` | Entry filled (settles at expiry) |
+| `DIRECTION IOC NOFILL: order=...` | IOC didn't take immediately, auto-cancelled |
+| `DIRECTION DAILY-LOSS-HALT: bal=$X day_start=$Y` | Day P&L hit -20%, halted |
+| `DIRECTION SIZING-REFUSE: bal=$X ask=Nc` | Bankroll < 1.5×cost, skip |
+| `DIRECTION place_order failed: ...` | Order rejection, lock released, 5s cooldown |
+| `DIRECTION: new session day YYYY-MM-DD` | First trade of the day |
+| `CopyEngine RESIDUAL-CLEAN: ...` | Defensive primitive (direction places no exit orders) |
+| `CopyEngine OVERSELL-DETECTED: ...` | 2026-04-22 catastrophe signature (should NEVER fire under DIRECTION) |
 | `SESSION-LOCK: restored N ticker(s)` | Per-window lock loaded from disk on startup |
 
 ---
@@ -295,22 +298,28 @@ asyncio.run(main())
 ## Reading order for new AI agents
 
 1. **This document (CLAUDE.md)** — operator-facing source of truth
-2. **`_fvg_tiering.py`** — pure tier-classification + sizing math
-3. **`tests/test_fvg_tiering.py`** — pins down each decision rule
-4. **`user_config.py`** — every live behavior knob in one file (FVG section
-   at line ~2015)
-5. **`polymarket_copy_engine.py:_paper_fvg_tick`** — entry-point
-6. **`polymarket_copy_engine.py:_paper_fvg_live_entry`** — entry-execution
-7. **`polymarket_copy_engine.py:_paper_fvg_live_holding_tick`** — exit/safety
-8. **`polymarket_copy_engine.py:_reconcile_residual_position`** — A5 oversell guard
-9. **`polymarket_copy_engine.py:_place_capped_side_sell`** — MIN-TRUTH +
-   OVERSELL-GUARD baked into every sell
-10. **Recent commits in chronological order** — context for *why* the code
-    looks the way it does
+2. **`direction_strategy.py`** — pure decision math (~150 lines, the entire
+   trading thesis)
+3. **`tests/test_direction_strategy.py`** — 25 unit tests pinning every
+   decision boundary
+4. **`scripts/backtest_direction.py`** — settlement-driven backtest
+   showing the 69-90% win rate / +$2-4/trade economics
+5. **`user_config.py`** — every live behavior knob (DIRECTION section
+   at ~2060)
+6. **`polymarket_copy_engine.py:_direction_tick`** — engine integration
+   (~150 lines: gates → evaluate → place_order → log)
+7. **`polymarket_copy_engine.py:_add_session_lock`** — per-window
+   ticker lock primitive
+8. **Recent commits in chronological order** — context for *why* the code
+   looks the way it does
 
 Skip on first read: any of the disabled-tier code (TA_FORCED, SR_FADE,
-SNIPER, SCALP DCA, wallet copy, BB_PURE/BB_MOMENTUM). They're feature-
-flagged off and don't affect current behavior.
+SNIPER, SCALP DCA, wallet copy, BB_PURE/BB_MOMENTUM, FVG-tier-aware
+LIVE_HOLDING). They're feature-flagged off and don't affect current
+behavior. The FVG-tier path produced an early-AM 2026-05-05 catastrophe
+loss (-19%) before being disabled — see
+`to-do/LIVE_SESSION_NOTES_2026_05_02.md` 06:27 PT entry for the
+postmortem.
 
 ---
 
