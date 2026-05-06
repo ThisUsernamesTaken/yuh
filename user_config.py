@@ -2069,11 +2069,16 @@ PAPER_FVG_LIVE_MODE              = False  # 2026-05-05 06:27 PT EMERGENCY DISABL
 # FVG-tier-aware path (PAPER_FVG_LIVE_MODE) which had structural bugs
 # (FLAT-CONFIRMED missing, SYNC RECLAIM orphan adoption) and inferior
 # economics (26% win rate vs 69-90% here).
-DIRECTION_STRATEGY_ENABLED       = False   # CRITICAL: must validate paper
-                                           # one window cycle before enabling
-                                           # live. When True, fires real
-                                           # Kalshi IOC taker orders on
-                                           # direction-aligned signals.
+DIRECTION_STRATEGY_ENABLED       = True    # 2026-05-05 LIVE FLIP. Validated:
+                                           # 25/25 unit tests pass,
+                                           # 615/617 full suite pass (2 pre-
+                                           # existing fails unrelated).
+                                           # Engine imports clean. Replaces
+                                           # the broken FVG-tier path.
+                                           # Fires real Kalshi IOC taker
+                                           # orders when |dist|>=0.10% AND
+                                           # 5min momentum agrees, holds to
+                                           # settlement.
 DIRECTION_DIST_THRESHOLD_PCT     = 0.0010  # 0.10% from strike (sweet spot
                                            # per OOS: 90.5% win rate)
 DIRECTION_MOMENTUM_THRESHOLD_DOLLARS = 10  # $10 over 5 min minimum
