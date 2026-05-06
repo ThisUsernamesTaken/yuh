@@ -5,6 +5,83 @@ from dataclasses import dataclass
 from typing import Literal
 
 
+# ── TP placement decision (2026-05-05) ─────────────────────────────────
+
+
+@dataclass
+class TpPlacementDecision:
+    place_px: int
+    post_only: bool
+    converted_to_taker: bool   # True if we crossed because bid >= target
+
+
+def decide_tp_placement(
+    *,
+    target_state: str,
+    target_px: int,
+    bid: int,
+    enable_taker_convert: bool = True,
+) -> TpPlacementDecision:
+    """Choose the right (price, post_only) for a protective TP placement.
+
+    Background (2026-05-05 portfolio-mode incident):
+      When the contract bid moves *past* our intended TP target before we
+      can land the maker order, post_only=True at target_px would cross
+      into the bid (a sell at 62c when bid is 69c is taking 7c of free
+      profit from a buyer — Kalshi correctly rejects post_only crosses).
+
+      Naive retry loops fire 8-12 "post only cross" rejections in a few
+      seconds, polluting the log and tripping our monitoring rule.
+
+    Decision rule:
+      - For non-TP states (SL etc.): unchanged, caller handles those.
+      - For TP state where bid >= target_px (winning fast): cross the
+        spread. place_px = bid, post_only = False. We pay taker fee but
+        get a guaranteed fill at a price >= our target.
+      - For TP state where bid < target_px: standard maker post_only at
+        target_px (our preferred path).
+
+    Pre-conditions for safe taker-convert:
+      - target_state == "tp" (no flipping behavior on SL paths)
+      - bid > 0 (valid quote)
+      - target_px > 0 (sane target)
+      - enable_taker_convert is True (kill-switch for safety)
+
+    Returns:
+      TpPlacementDecision(place_px, post_only, converted_to_taker)
+    """
+    # Only TP state is eligible for taker-convert; SL/HOLD pass through.
+    if target_state != "tp":
+        return TpPlacementDecision(
+            place_px=int(target_px), post_only=True,
+            converted_to_taker=False,
+        )
+    # Defensive: invalid inputs → fall back to maker default.
+    if int(target_px) <= 0 or int(bid) <= 0:
+        return TpPlacementDecision(
+            place_px=int(target_px), post_only=True,
+            converted_to_taker=False,
+        )
+    # Kill-switch off → maker default.
+    if not enable_taker_convert:
+        return TpPlacementDecision(
+            place_px=int(target_px), post_only=True,
+            converted_to_taker=False,
+        )
+    # Bid has crossed our TP — take the spread.
+    if int(bid) >= int(target_px):
+        return TpPlacementDecision(
+            place_px=int(bid), post_only=False,
+            converted_to_taker=True,
+        )
+    # Standard maker placement at target.
+    return TpPlacementDecision(
+        place_px=int(target_px), post_only=True,
+        converted_to_taker=False,
+    )
+
+
+
 # 2026-05-02 Phase 0.1.6 — asymmetric volatility gate types.
 # Trend orientation labels:
 #   "counter": our side opposite to BTC's prevailing direction = mean-reversion

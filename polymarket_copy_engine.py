@@ -17290,22 +17290,35 @@ class PolymarketCopyEngine:
             place_px = sl_exec_px
             place_post_only = sl_post_only
         else:
-            place_px = target_px
-            place_post_only = True
-            # FIX 1 (2026-05-04) TP TAKER-CONVERT: if the contract bid is
-            # already at or above the TP target, post_only at tp_price will
-            # cross and Kalshi rejects silently. Cross the spread instead.
+            # 2026-05-05 PORTFOLIO-MODE FIX: TP placement now goes
+            # through the pure protective_math.decide_tp_placement
+            # helper. When bid >= tp_target (winning fast tape),
+            # taker-cross at bid instead of post_only at target —
+            # eliminates the 8x "post only cross" rejection burst
+            # that tripped today's monitoring rule on Trade 3.
+            # Kill-switch: TP_TAKER_CONVERT_ENABLED in user_config.
             try:
-                if bool(_uc("TP_TAKER_CONVERT_ENABLED", True)):
-                    if target_state == "tp" and int(bid) >= int(target_px) > 0:
-                        place_px = max(1, int(bid))
-                        place_post_only = False
-                        logger.warning(
-                            "TP TAKER-CONVERT: bid=%dc >= tp=%dc, crossing spread",
-                            int(bid), int(target_px),
-                        )
+                from protective_math import decide_tp_placement
+                _enable_tk = bool(_uc("TP_TAKER_CONVERT_ENABLED", True))
+                _decision = decide_tp_placement(
+                    target_state=target_state,
+                    target_px=int(target_px),
+                    bid=int(bid),
+                    enable_taker_convert=_enable_tk,
+                )
+                place_px = _decision.place_px
+                place_post_only = _decision.post_only
+                if _decision.converted_to_taker:
+                    logger.warning(
+                        "TP TAKER-CONVERT: bid=%dc >= tp=%dc, crossing spread "
+                        "(eliminates post_only_cross retry burst)",
+                        int(bid), int(target_px),
+                    )
             except Exception as _ttc_err:
-                logger.debug("TP TAKER-CONVERT check failed: %s", _ttc_err)
+                # Defensive fallback to legacy maker behavior
+                logger.debug("decide_tp_placement failed: %s", _ttc_err)
+                place_px = target_px
+                place_post_only = True
         try:
             new_order, placed_count = await self._place_capped_side_sell(
                 ticker=ticker, side=side,

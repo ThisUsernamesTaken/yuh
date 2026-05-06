@@ -1989,14 +1989,23 @@ MRC_RECLAIM_ATTACH_ENABLED       = False  # 2026-05-04 PT 16:30: KILLED with MRC
 # default True from _uc("FLAG", True) calls in polymarket_copy_engine.py.
 # Explicitly setting them False here makes the kill switch authoritative
 # regardless of how _uc resolves missing names.
-TP_TAKER_CONVERT_ENABLED         = False  # 2026-05-04 PT 16:30: KILLED.
-                                          # In-flight live during dispatch
-                                          # session — addresses a real Kalshi
-                                          # post_only-cross silent reject, but
-                                          # flipping post_only mid-cycle had
-                                          # no test coverage before live ship.
-                                          # Re-enable individually after
-                                          # _safe_sell_count helper lands.
+TP_TAKER_CONVERT_ENABLED         = True   # 2026-05-05 RE-ENABLED.
+                                          # _safe_sell_count helper has
+                                          # shipped (MIN-TRUTH gate inside
+                                          # _place_capped_side_sell). Logic
+                                          # extracted to pure helper
+                                          # protective_math.decide_tp_placement
+                                          # with 11/11 unit tests covering
+                                          # boundaries (bid<tp / bid==tp /
+                                          # bid>tp / SL-state / kill-switch /
+                                          # zero/negative inputs). Trigger:
+                                          # today's portfolio Trade 3 fired
+                                          # 8 "post only cross" rejections
+                                          # in 12s before the bid eased
+                                          # enough to land a maker — taker-
+                                          # convert eliminates that burst
+                                          # entirely while still using post_
+                                          # only as the default path.
 PRE_EXPIRY_TAKER_ENABLED         = False  # 2026-05-04 PT 16:30: KILLED.
                                           # Re-enable individually after the
                                           # MIN-truth gate is in place.
