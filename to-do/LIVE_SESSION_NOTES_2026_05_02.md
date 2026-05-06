@@ -5430,3 +5430,110 @@ Also: "5+ insufficient_balance: IMMEDIATE STOP" — only 1 today, but that
 1 was a symptom of the bug.
 
 User notification: yes, this needs to be raised before any further auto-action.
+
+
+---
+
+## 20:07 PT tick — FIRST PORTFOLIO-MODE WIN
+
+State: SERVICE_RUNNING, BAL **$75.39** (+$0.35 from $75.04 baseline), FLAT, 0 resting.
+
+**TA_FORCED fired and filled cleanly at 20:04:**
+- KXBTC15M-26MAY052315-15, YES 7x @ 85c ($5.95)
+- Sized via FIXED-FRAC: 8% × $75 = $6 target, 7ct cap (under 15ct day cap)
+- TP at 90c filled ~110s later: $6.30 revenue
+- **Net: +$0.35 in 110 seconds**
+
+**Safety stack performed correctly:**
+- OVERSELL-GUARD cancelled 2 resting sells (TA_FORCED protective layer
+  initially placed multiple TP rungs; primitive caps at 1)
+- FLAT-CONFIRMED: 10 consecutive zero readings over 6.6s before clearing
+- RESIDUAL-CLEAN: 10 post-close polls, all clean
+- STOP DEFERRED on cache lag (pre-FLAT-CONFIRMED window)
+
+**DIRECTION strategy fired 4× but all IOC NOFILL'd:**
+- All at YES 20x @ 45c on the same ticker (dist=+0.146% mom=+$19)
+- IOC bounced because ask depth < 20ct or ask moved before order arrived
+- This is the same execution-quality issue from FVG live wiring this AM
+- Per-window ticker lock + cooldown working correctly (4 attempts then stops)
+- TA_FORCED won the per-window race for this ticker
+
+**Catastrophe markers since 19:36 baseline: 0 across all categories.**
+- OVERSELL-DETECTED: 0
+- STUCK-RESIDUAL: 0
+- MRC FORCE-EXIT: 0
+- BB_PURE/BB_TREND/BB_MOMENTUM FIRE: 0 (all disabled)
+- SCALP DCA / TIERED TP / MICRO PULLBACK / WALLET COPY: 0
+- insufficient_balance: 0
+- place_order failed: 0 (NOFILL is not a failure)
+
+**Conclusion:** Portfolio mode is functioning correctly. TA_FORCED entry
+signal works, FIXED-FRAC sizing is reasonable, exits clean via single
+TP. DIRECTION is alive but execution-bound by thin Kalshi ask depth at
+20ct sizing. Will continue monitoring; may need to lower DIRECTION_CONTRACTS
+back to 10 if NOFILL rate stays high.
+
+
+---
+
+## 20:40 PT — PROTOCOL STOP TRIGGERED (false positive — see analysis)
+
+**Trigger**: 8 `place_order failed` errors in last 30 min (rule: 5+ → STOP).
+**Decision**: stopped per protocol. **All 8 errors are benign**, see below.
+
+**State at stop**:
+- BAL: $76.09 (+$1.05 from baseline, 3 winning trades total today)
+- Position: FLAT, 0 resting
+- nssm: SERVICE_STOPPED
+
+**What the 8 errors actually are:**
+
+All 8 fired in a 12-second burst (20:32:13 - 20:32:25) on Trade 3 alone:
+- 20:32:07 TA_FORCED FILL: YES 7x @ 57c on KXBTC15M-26MAY052345-45
+- 20:32:13 - 20:32:25: PROTECTIVE layer tried to place TP at 62c (entry+5),
+  but bid was already at 69c (BTC tape ran fast in our favor). Each
+  post_only=True sell at 62c with bid=69c "crosses" into the bid,
+  which Kalshi correctly rejects.
+- 20:32:26: PROTECTIVE [TP] eventually placed @ 62c (bid briefly receded
+  enough to allow maker placement)
+- 20:32:37: FLAT-CONFIRMED — position closed for **+$0.35 profit**.
+
+The errors are NOT engine breakdown. They're the BB_PURE-era PROTECTIVE
+TP placement code retrying every ~1s when bid > intended TP price. The
+trade itself was a clean win.
+
+**Today's tape (3 wins, net +$1.05):**
+1. 20:04 -2315 YES 7x @ 85c → 90c TP (110s, +$0.35)
+2. 20:19 -2330 YES 7x @ 43c → 48c TP (35s, +$0.35)
+3. 20:32 -2345 YES 7x @ 57c → 62c TP (30s, +$0.35) [trigger trade]
+
+**Catastrophe markers (real ones):**
+- OVERSELL-DETECTED: 0
+- STUCK-RESIDUAL: 0
+- MRC FORCE-EXIT: 0
+- BB_PURE/BB_TREND/BB_MOMENTUM FIRE: 0
+- SCALP DCA / TIERED TP / MICRO PULLBACK / WALLET COPY: 0
+- insufficient_balance: 0
+- All disabled-strategy guards held.
+
+**Root cause of the false positive:**
+The PROTECTIVE TP placement code retries every ~1s with post_only=True
+when the bid is above the intended TP price. On a fast bullish tape
+(bid 57→69 in 6s), our 5c TP target gets crossed before we can land
+the maker order. This produces 8-12 false errors per such fast-tape
+trade.
+
+**Recommended fix before re-enabling:**
+1. Either skip the TP placement entirely when bid > TP_target (the
+   trade is already winning past our target — let it ride or take
+   bid directly), OR
+2. Use IOC sell at bid instead of post_only at TP target when bid
+   has already moved past target, OR
+3. Drop post_only on TP placement after N failed attempts (3-5)
+   and accept taker fee.
+
+**Operator decision needed:**
+- (A) Re-enable as-is — the trigger was false-positive, accept noise
+- (B) Tune the PROTECTIVE retry behavior first (above options)
+- (C) Bump protocol threshold from 5+ to 15+ (recognizes that fast-tape
+      bursts produce benign repeats)
