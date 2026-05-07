@@ -2130,11 +2130,18 @@ DIRECTION_CONTRACTS              = 5       # 2026-05-05 PT: REVERTED from 20.
 DIRECTION_MIN_BANKROLL_X_COST    = 1.5     # require 1.5×cost in BAL
 DIRECTION_DAILY_LOSS_HALT_FRAC   = 0.20    # halt at -20% from day-start
 DIRECTION_POST_FAIL_COOLDOWN_S   = 5.0     # backoff after place_order fail
-# 2026-05-06 evening: switched from IOC taker at ask to post_only maker
-# at ask-1. Resting orders need a timeout — if the market hasn't come to
-# us within this many seconds, cancel and try again on the next signal.
-DIRECTION_MAKER_TIMEOUT_S        = 60.0    # cancel resting maker after 60s
-DIRECTION_MAKER_OFFSET_C         = 1       # place at ask - this many cents
+# 2026-05-06 evening (round 2): IOC taker with slippage tolerance.
+# Maker mode (commit 9e4aef0) had structural fill problem on momentum
+# strategy: maker bid only fills when market reverses = adverse selection.
+# 0/1 fills in 25 min. Switched back to IOC, but at ask + slippage so
+# we walk through the next depth tier when the ask is thin. 1c on a $0.40
+# entry = 2.5% cost, well below the 5c TP target.
+DIRECTION_TAKER_SLIPPAGE_C       = 1       # IOC at ask + this many cents
+# Legacy maker-mode knobs retained for rollback (currently inactive —
+# fire path uses IOC at ask+slippage, not post_only at ask-offset).
+# The pending-order state machine is dead code while in IOC mode.
+DIRECTION_MAKER_TIMEOUT_S        = 60.0    # only used if maker mode resurrected
+DIRECTION_MAKER_OFFSET_C         = 1       # only used if maker mode resurrected
 
 # Tier sizing fractions (Level 3 — Half-Kelly, OOS-validated)
 FVG_TIER_FRAC_T1                 = 0.35

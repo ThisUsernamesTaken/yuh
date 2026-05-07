@@ -4473,16 +4473,17 @@ class PolymarketCopyEngine:
             )
             return
 
-        # 2026-05-06 evening: maker-mode entry. Place at ask - offset
-        # (default 1c) with post_only=True. Order rests on Kalshi
-        # until it fills (someone sells into our bid) or we cancel
-        # via _direction_handle_pending after the timeout.
-        # Compare to old IOC mode at the ask: 0/62 fill rate at 17:51
-        # because Kalshi 15m ask depth was consistently below our
-        # requested size at the snapshot time.
-        maker_offset = int(_uc("DIRECTION_MAKER_OFFSET_C", 1))
-        maker_px = max(1, ask_c - maker_offset)
-        cost_c = contracts * maker_px
+        # 2026-05-06 evening (round 2): IOC taker with slippage.
+        # Maker mode (commit 9e4aef0) had a structural fill problem on a
+        # momentum strategy: maker bid at ask-1 only fills when the
+        # market reverses toward us = adverse selection. After 25 min
+        # of maker mode, 1 fire / 0 fills / cancelled at 60s.
+        # Switching back to IOC but at ask+slippage (default 1c) so we
+        # walk through the next depth tier. 1c on a $0.40 entry = 2.5%
+        # cost, well below the 5c TP target the strategy targets.
+        slippage_c = int(_uc("DIRECTION_TAKER_SLIPPAGE_C", 1))
+        entry_px = min(99, max(1, ask_c + slippage_c))
+        cost_c = contracts * entry_px
 
         # Pre-await: add ticker lock for race protection.
         self._add_session_lock(ticker)
@@ -4492,20 +4493,21 @@ class PolymarketCopyEngine:
             pass
 
         logger.warning(
-            "DIRECTION FIRE: %s %s %dx @ %dc maker (ask=%dc) ($%.2f) mult=%.2f | %s | "
-            "btc=$%.2f strike=$%.2f age=%ds bal=$%.2f",
-            sig.side.upper(), ticker[-15:], contracts, maker_px, ask_c,
-            cost_c / 100, multiplier, sig.reason,
+            "DIRECTION FIRE: %s %s %dx @ %dc IOC (ask=%dc, slip=%dc) ($%.2f) "
+            "mult=%.2f | %s | btc=$%.2f strike=$%.2f age=%ds bal=$%.2f",
+            sig.side.upper(), ticker[-15:], contracts, entry_px, ask_c,
+            slippage_c, cost_c / 100, multiplier, sig.reason,
             btc_price, strike, int(session_age), balance_cents / 100,
         )
 
-        # Gate 8: place post_only=True maker buy at ask-offset.
-        # Resting GTC order (no time_in_force) — sits until fill or
-        # _direction_handle_pending cancels it after timeout.
+        # Gate 8: place IOC taker at ask+slippage. post_only=False so the
+        # order can cross the spread; immediate_or_cancel so any unfilled
+        # remainder is auto-cancelled by Kalshi (no stale resting orders).
         try:
             order = await self._client.place_order(
-                ticker=ticker, side=sig.side, price=maker_px,
-                count=contracts, post_only=True,
+                ticker=ticker, side=sig.side, price=entry_px,
+                count=contracts, post_only=False,
+                time_in_force="immediate_or_cancel",
             )
         except Exception as e:
             logger.error(
@@ -4525,44 +4527,29 @@ class PolymarketCopyEngine:
         oid = getattr(order, "order_id", "") or ""
 
         if filled <= 0:
-            # Maker rest — order is sitting on the book. Track in
-            # pending registry so _direction_handle_pending can poll
-            # for fill or cancel after timeout.
-            self._direction_pending_orders[ticker] = {
-                "oid": oid,
-                "place_ts": now,
-                "side": sig.side,
-                "count": int(contracts),
-                "px": int(maker_px),
-                "ask_at_place_c": int(ask_c),
-                "multiplier": float(multiplier),
-                "dist_pct": float(sig.dist_pct),
-                "btc_5m_move": float(sig.btc_5m_move),
-                "btc_price": float(btc_price),
-                "strike": float(strike),
-                "session_age_s": int(session_age),
-                "balance_at_entry_c": int(balance_cents),
-            }
+            # IOC means no resting remainder — order auto-cancels if it
+            # didn't take immediately. Release lock so a slightly later
+            # tick can retry once book conditions match.
             logger.info(
-                "DIRECTION MAKER PENDING: order=%s @ %dc (ask=%dc) — "
-                "resting; will check for fill or cancel after %.0fs",
-                oid[:12], maker_px, ask_c,
-                float(_uc("DIRECTION_MAKER_TIMEOUT_S", 60.0)),
+                "DIRECTION IOC NOFILL: order=%s @ %dc (ask=%dc, slip=%dc) — "
+                "depth still insufficient at this slippage; releasing lock",
+                oid[:12], entry_px, ask_c, slippage_c,
             )
+            self._remove_session_lock(ticker)
+            cooldown_s = float(_uc("DIRECTION_POST_FAIL_COOLDOWN_S", 5.0))
+            self._direction_post_fail_cooldown[ticker] = now + cooldown_s
             return
 
-        # Rare case: post_only=True maker that filled immediately on
-        # placement (bid caught up to maker_px between book-read and
-        # Kalshi-receiving-order). Treat the same as a normal fill —
-        # set _open_position with tier="DIRECTION" so the legacy
-        # SYNC RECLAIM / PROTECTIVE machinery doesn't adopt it.
-        # (Most post_only fills will come via _direction_handle_pending
-        # after the order rests for some time.)
+        # IOC filled (one or more contracts taken). entry_px is the
+        # limit we placed at; actual fill price could be lower (Kalshi
+        # IOC walks the book up to our limit, fills at best available).
+        # We persist entry_px as the upper bound; settlement P&L is
+        # ground truth.
         self._open_position = {
             "order_id": oid,
             "side": sig.side,
-            "entry_cents": maker_px,
-            "original_entry_cents": maker_px,
+            "entry_cents": entry_px,
+            "original_entry_cents": entry_px,
             "original_count": filled,
             "ticker": ticker,
             "tier": "DIRECTION",
@@ -4574,14 +4561,14 @@ class PolymarketCopyEngine:
             "entry_conviction": float(multiplier),
             "entry_wallets": 0,
             "entry_wallet_count_at_last_scale": 0,
-            "high_water_bid": maker_px,
+            "high_water_bid": entry_px,
             "had_flow_at_entry": False,
             "tiers_in": set(),
             "entry_elite_wallets": set(),
             "shallow_filled": filled,
-            "shallow_price": maker_px,
+            "shallow_price": entry_px,
             "deep_filled": 0,
-            "deep_price": maker_px,
+            "deep_price": entry_px,
             "signal_wallet_names": [],
             "tp_order_id": None,
             "tp_order_ids": [],
@@ -4606,11 +4593,11 @@ class PolymarketCopyEngine:
             pass
 
         logger.warning(
-            "DIRECTION FILL (immediate-maker): %s %dx @ %dc oid=%s mult=%.2fx | "
+            "DIRECTION FILL (IOC): %s %dx @ %dc oid=%s mult=%.2fx | "
             "_open_position set with tier=DIRECTION (hold_to_settle) — "
             "settles at expiry, PROTECTIVE/MANAGE_POSITION/MRC/SYNC_RECLAIM/"
             "ORPHAN_FLATTEN all skip",
-            sig.side.upper(), filled, maker_px, oid[:12], multiplier,
+            sig.side.upper(), filled, entry_px, oid[:12], multiplier,
         )
         try:
             import sqlite3 as _sq
@@ -4628,7 +4615,7 @@ class PolymarketCopyEngine:
             c.execute(
                 "INSERT INTO direction_trades VALUES "
                 "(NULL,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))",
-                (ticker, sig.side, maker_px, filled,
+                (ticker, sig.side, entry_px, filled,
                  sig.btc_price, sig.strike, sig.dist_pct,
                  sig.btc_5m_move, int(session_age),
                  balance_cents, oid),
