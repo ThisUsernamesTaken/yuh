@@ -1,6 +1,6 @@
 # New Instance Setup — for AI agents and humans
 
-**Last updated**: 2026-05-05 PT (FVG-tier-aware live deploy)
+**Last updated**: 2026-05-06 PT (DIRECTION refactor + improvements)
 **Reading prerequisite**: `CLAUDE.md` (root). Read it first to understand
 what the engine *does* before installing it.
 
@@ -9,21 +9,35 @@ Windows machine, validating it works, and flipping it to live trading. It
 exists because `README.md` got stale and confused fresh AI agents about
 which strategy is live.
 
-The engine has **one live entry strategy** as of 2026-05-05:
+The engine has **one live entry strategy** as of 2026-05-06:
 
-- **`PAPER_FVG`** — Tier-aware Brownian-Bridge Fair Value Gap mispricing,
-  Level 3 Half-Kelly sizing. The strategy fires from `_paper_fvg_tick` in
-  `polymarket_copy_engine.py` and routes through `_paper_fvg_live_entry`
-  (real Kalshi orders) when `PAPER_FVG_LIVE_MODE=True`.
+- **`DIRECTION`** — Sign-aligned distance + momentum, IOC at ask+slippage,
+  hold to settlement. Conviction-multiplier sizing (0.7-2.0×).
+  - Pure module: `direction_strategy.py` (decision + multiplier math)
+  - Engine handler: `_direction_tick` in `polymarket_copy_engine.py`
+  - **Position state: `self._direction_position` (NOT `_open_position`)**
+    — this is the architectural fix that prevents 20+ legacy exit
+    paths from hijacking DIRECTION fills.
 
-The decision math lives in `_fvg_tiering.py` (pure module). OOS-validated
-2026-05-04 across 2,485 signals / 9.1 days: T1 fill 97.4%, T2 fill 92.2%.
+Backtest evidence (`scripts/backtest_strategy_comparison.py`, n=197
+settled markets): DIRECTION 0.10%/$10 thresholds win on alpha density:
+90.5% win rate / +$3.93 mean per trade / +$331 corpus / 1.1% top-win-skew
+(extremely robust; not single-trade-skewed). Beat 8 alternative strategies
+(cheap-underdog, mean-reversion, BB-model-edge, momentum-only, etc.).
 
-`BB_PURE`, `BB_TREND`, `BB_MOMENTUM`, `TA_FORCED`, `SR_FADE`, `SCALP_DCA`,
-`SNIPER`, `WALLET_COPY`, `ATM_REVERSION`, `ARB_DETECTOR`, `MICRO_PULLBACK`,
-`TP_LAYERED` are all retired/feature-flagged-off. **Do not re-enable them
-without explicit user direction** — they obscure FVG signal and several have
-historical catastrophe records (see `MEMORY.md`).
+`PAPER_FVG_LIVE_MODE`, `BB_PURE`, `BB_TREND`, `BB_MOMENTUM`, `TA_FORCED`,
+`SR_FADE`, `SCALP_DCA`, `SNIPER`, `WALLET_COPY`, `ATM_REVERSION`,
+`ARB_DETECTOR`, `MICRO_PULLBACK`, `TP_LAYERED` are all retired/feature-
+flagged-off. **Do not re-enable them without explicit user direction** —
+they obscure DIRECTION signal and several have historical catastrophe
+records (see `MEMORY.md`). FVG-tier specifically had a stale-cache
+premature-close bug that caused a -19% loss on first live fill.
+
+**OPERATIONAL GOTCHA — `_uc()` caches config at module import.** Editing
+`user_config.py` while the engine is running has NO effect until restart.
+After any config change, run `nssm restart BTCBiasEngine` and verify the
+new value appears in the next FIRE log line. See `CLAUDE.md` for full
+details.
 
 ---
 

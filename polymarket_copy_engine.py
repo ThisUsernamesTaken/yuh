@@ -580,6 +580,15 @@ class PolymarketCopyEngine:
     _SESSION_LOCK_PATH = os.path.join("data", "session_state.json")
     _SESSION_LOCK_MAX_AGE_S = 900  # one Kalshi 15-min window
 
+    # 2026-05-06: separate persistence for DIRECTION-active tickers.
+    # Without this, an engine restart while a DIRECTION position is open
+    # loses the in-memory _direction_active_tickers set, and SYNC_RECLAIM
+    # adopts the orphan via the legacy TA_FORCED reclaim path. Same
+    # 15-min auto-expiry as the session lock — a ticker that's been
+    # idle that long has either settled or been abandoned.
+    _DIRECTION_ACTIVE_PATH = os.path.join("data", "direction_active.json")
+    _DIRECTION_ACTIVE_MAX_AGE_S = 900
+
     def _load_session_lock(self) -> set:
         """Load `_entered_tickers_this_window` from disk if recent.
 
@@ -633,6 +642,64 @@ class PolymarketCopyEngine:
         try:
             self._entered_tickers_this_window.add(ticker)
             self._persist_session_lock()
+        except Exception:
+            pass
+
+    def _load_direction_active(self) -> set:
+        """Load `_direction_active_tickers` from disk if recent.
+        Same auto-expiry semantics as `_load_session_lock`."""
+        try:
+            import json
+            if not os.path.exists(self._DIRECTION_ACTIVE_PATH):
+                return set()
+            with open(self._DIRECTION_ACTIVE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            saved_at = float(data.get("saved_at_ms", 0)) / 1000.0
+            if not saved_at or (time.time() - saved_at) > self._DIRECTION_ACTIVE_MAX_AGE_S:
+                return set()
+            tickers = data.get("tickers", []) or []
+            restored = set(t for t in tickers if isinstance(t, str) and t)
+            if restored:
+                logger.warning(
+                    "DIRECTION-ACTIVE: restored %d ticker(s) from disk: %s "
+                    "(age=%.0fs) — SYNC_RECLAIM/ORPHAN_FLATTEN opt-out "
+                    "preserved across restart",
+                    len(restored), ", ".join(sorted(restored))[:200],
+                    time.time() - saved_at,
+                )
+            return restored
+        except Exception as _e:
+            logger.warning("DIRECTION-ACTIVE load failed: %s", _e)
+            return set()
+
+    def _persist_direction_active(self) -> None:
+        """Write `_direction_active_tickers` to disk with timestamp.
+
+        Must be called whenever the set changes so a restart preserves
+        the SYNC_RECLAIM/ORPHAN_FLATTEN opt-out for open DIRECTION
+        positions. Today (2026-05-06 20:34-37 PT) we caught a regression:
+        engine restart at 20:36 lost the in-memory set, SYNC_RECONCILE
+        adopted the still-open 9ct YES position as TA_FORCED, PROTECTIVE
+        placed a sell that filled at 43c (luckily profitable +$0.60).
+        Without this persistence, a reversed scenario would lock in a loss.
+        """
+        try:
+            import json
+            os.makedirs(os.path.dirname(self._DIRECTION_ACTIVE_PATH), exist_ok=True)
+            payload = {
+                "saved_at_ms": int(time.time() * 1000),
+                "tickers": sorted(self._direction_active_tickers),
+            }
+            with open(self._DIRECTION_ACTIVE_PATH, "w", encoding="utf-8") as f:
+                json.dump(payload, f)
+        except Exception as _e:
+            logger.warning("DIRECTION-ACTIVE persist failed: %s", _e)
+
+    def _add_direction_active(self, ticker: str) -> None:
+        """Add ticker to direction-active set AND persist to disk."""
+        try:
+            self._direction_active_tickers.add(ticker)
+            self._persist_direction_active()
         except Exception:
             pass
 
@@ -750,10 +817,12 @@ class PolymarketCopyEngine:
         # ORPHAN-FLATTEN loops so they don't adopt/flatten DIRECTION
         # positions (which are managed via hold-to-settlement, not via
         # the legacy _open_position machinery's exit paths).
-        # Distinct from _entered_tickers_this_window because we need to
-        # tell SYNC RECLAIM "this is a DIRECTION ticker — leave it alone"
-        # without confusing the per-window single-trade lock.
-        self._direction_active_tickers: set = set()
+        # Persisted to disk (same 15-min expiry as session lock) so the
+        # opt-out survives engine restart while a DIRECTION position is
+        # open. Without persistence, restart caused SYNC_RECONCILE to
+        # adopt the orphan as TA_FORCED (caught 2026-05-06 20:36 PT;
+        # trade got lucky at +$0.60 but reversed scenario would lock loss).
+        self._direction_active_tickers: set = self._load_direction_active()
 
         # 2026-05-06 evening: DIRECTION-pending registry. With the switch
         # from IOC taker (immediate-or-cancel at the ask) to post_only
@@ -4583,18 +4652,15 @@ class PolymarketCopyEngine:
             "_direction_multiplier": float(multiplier),
         }
 
-        # Register ticker in DIRECTION-active set — consulted by
-        # SYNC_RECLAIM and ORPHAN_FLATTEN to skip DIRECTION positions.
-        # These two paths scan Kalshi truth independent of _open_position
-        # so they need a separate signal.
-        try:
-            self._direction_active_tickers.add(ticker)
-        except Exception:
-            pass
+        # Register ticker in DIRECTION-active set (persisted to disk so
+        # the opt-out survives engine restart) — consulted by SYNC_RECLAIM
+        # and ORPHAN_FLATTEN to skip DIRECTION positions.
+        self._add_direction_active(ticker)
 
         logger.warning(
             "DIRECTION FILL (IOC): %s %dx @ %dc oid=%s mult=%.2fx | "
-            "self._direction_position set (NOT _open_position) — "
+            "self._direction_position set (NOT _open_position), "
+            "ticker added to persisted _direction_active_tickers — "
             "all 20+ legacy exit paths gate on _open_position; they "
             "auto-skip. SYNC_RECLAIM/ORPHAN_FLATTEN consult "
             "_direction_active_tickers and skip. Holds to settlement.",
@@ -4751,13 +4817,11 @@ class PolymarketCopyEngine:
             "_direction_btc_5m_move": float(btc_5m_move),
             "_direction_multiplier": float(multiplier),
         }
-        try:
-            self._direction_active_tickers.add(ticker)
-        except Exception:
-            pass
+        self._add_direction_active(ticker)
         logger.warning(
             "DIRECTION FILL (maker): %s %dx @ %dc oid=%s mult=%.2fx | "
-            "self._direction_position set (NOT _open_position) — "
+            "self._direction_position set (NOT _open_position), "
+            "ticker added to persisted _direction_active_tickers — "
             "legacy exit paths cannot see this position.",
             side.upper(), filled, maker_px, oid[:12], multiplier,
         )

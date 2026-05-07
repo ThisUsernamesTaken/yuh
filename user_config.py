@@ -2112,21 +2112,22 @@ DIRECTION_DIST_THRESHOLD_PCT     = 0.0010  # 0.10% from strike (sweet spot
                                            # per OOS: 90.5% win rate)
 DIRECTION_MOMENTUM_THRESHOLD_DOLLARS = 10  # $10 over 5 min minimum
 DIRECTION_MAX_OFFSET_S           = 600     # entry only before minute 10
-DIRECTION_CONTRACTS              = 5       # 2026-05-05 PT: REVERTED from 20.
-                                           # The 20ct bump made one bad
-                                           # trade (DIRECTION YES 20x @
-                                           # 36c on -26MAY060030-30
-                                           # settled NO at 21:29 PT) cost
-                                           # -$7.53, 4× what 5ct would
-                                           # have cost. Replaced static
-                                           # bump with conviction-based
-                                           # multiplier in
-                                           # direction_strategy.conviction_multiplier
-                                           # (0.7-2.0x scaled by dist from
-                                           # strike + btc_5m momentum).
-                                           # Base stays at 5; multiplier
-                                           # scales up to 10ct on screaming
-                                           # signals, down to 5ct floor.
+DIRECTION_CONTRACTS              = 3       # 2026-05-06 PT: REDUCED from 5.
+                                           # Kalshi 15m ask depth at typical
+                                           # entry prices (14c-70c) is
+                                           # consistently below 5-10ct.
+                                           # 35+ fires at slip=1c at 70c
+                                           # produced 0 fills; 5+ fires at
+                                           # slip=1c at 14c produced 0
+                                           # fills. Reducing base size means
+                                           # the conviction multiplier
+                                           # (0.7-2.0x) scales 3ct → up to
+                                           # 6ct on screaming signals — well
+                                           # within typical 15m depth.
+                                           # Trade-off: 40% lower per-trade
+                                           # notional (3 vs 5 base), but
+                                           # fill rate >> 0% which dominates
+                                           # the EV math at any size.
 DIRECTION_MIN_BANKROLL_X_COST    = 1.5     # require 1.5×cost in BAL
 DIRECTION_DAILY_LOSS_HALT_FRAC   = 0.20    # halt at -20% from day-start
 DIRECTION_POST_FAIL_COOLDOWN_S   = 5.0     # backoff after place_order fail
@@ -2136,14 +2137,19 @@ DIRECTION_POST_FAIL_COOLDOWN_S   = 5.0     # backoff after place_order fail
 # 0/1 fills in 25 min. Switched back to IOC, but at ask + slippage so
 # we walk through the next depth tier when the ask is thin. 1c on a $0.40
 # entry = 2.5% cost, well below the 5c TP target.
-DIRECTION_TAKER_SLIPPAGE_C       = 2       # 2026-05-06 19:55: bumped 1->2.
-                                           # 35 fires at slip=1c produced
-                                           # 0 fills (ask depth at ask+1c
-                                           # consistently below 5-10ct
-                                           # requested size). Bumping to
-                                           # walk through the next tier.
-                                           # 2c on a 70c entry = 2.9% cost,
-                                           # still below the 5c TP target.
+DIRECTION_TAKER_SLIPPAGE_C       = 3       # 2026-05-06 PT: bumped 2->3
+                                           # alongside the contracts 5->3
+                                           # reduction. Combined: smaller
+                                           # orders + more aggressive cross
+                                           # = much higher fill probability
+                                           # on thin Kalshi 15m books.
+                                           # 3c on a 50c entry = 6% cost,
+                                           # still less than the 5-12c TP
+                                           # offset that drives the strategy
+                                           # economics. (NOTE: _uc() caches
+                                           # config at module-import time,
+                                           # so changing this REQUIRES an
+                                           # engine restart to take effect.)
 # Legacy maker-mode knobs retained for rollback (currently inactive —
 # fire path uses IOC at ask+slippage, not post_only at ask-offset).
 # The pending-order state machine is dead code while in IOC mode.

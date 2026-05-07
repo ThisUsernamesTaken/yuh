@@ -1,32 +1,51 @@
 # BTC Bias Engine — Current System Reference
 
-**Last updated**: 2026-05-05 (direction-following strategy live)
+**Last updated**: 2026-05-06 (DIRECTION refactor + improvements)
 **Entry point**: `run_copy_engine.py` (NSSM service `BTCBiasEngine` on Windows)
 **Live primary signal**: `DIRECTION` (sign-aligned distance + momentum, hold to settlement)
-**Status**: SERVICE_RUNNING. BAL $75.04. FLAT, 0 resting orders.
+**Status**: SERVICE_RUNNING. BAL $78.73. FLAT, 0 resting orders.
 
-> **For the AI agent inheriting this session**: as of 2026-05-05 PT, the
-> live primary signal is **direction-following**: when BTC is ≥0.10% past
-> strike with 5-min momentum agreeing, buy that side at ask (IOC taker)
-> and hold to settlement. Pure module is `direction_strategy.py`.
-> Engine handler is `_direction_tick` in `polymarket_copy_engine.py`.
+> **For the AI agent inheriting this session**: as of 2026-05-06 PT, the
+> live primary signal is **direction-following with conviction sizing**:
+> when BTC is ≥0.10% past strike with 5-min momentum agreeing, buy that
+> side at ask + slippage (IOC taker) and hold to settlement.
+> - Pure module: `direction_strategy.py` (decision + conviction multiplier)
+> - Engine handler: `_direction_tick` in `polymarket_copy_engine.py`
+> - **Position state: `self._direction_position` (NOT `self._open_position`)** —
+>   this is the architectural fix. Legacy exit paths (VWAP_EXIT,
+>   PROB_COLLAPSE, MRC_FORCE_EXIT, DOMINANT_UPGRADE, etc.) all gate on
+>   `_open_position is not None` so they auto-skip. Prevents the 4
+>   hijack incidents that plagued the first deploy attempts.
 >
-> **Why this replaced FVG-tier**: the FVG-tier-aware path
-> (`PAPER_FVG_LIVE_MODE`, `_fvg_tiering.py`) had structural bugs that
-> caused a -19% live loss on first actual fill (2026-05-05 06:27 PT) —
-> stale-cache premature-close + SYNC RECLAIM orphan adoption with wrong
-> exit logic. More importantly, an honest backtest on settlement data
-> (197 markets, `scripts/backtest_direction.py` vs the original FVG OOS)
-> showed the direction-following thesis has dramatically better economics:
-> 69-90% win rate / +$2-4 per trade / $50 → $323 corpus, vs FVG-tier's
-> 26% win rate / +$0.47 per trade / volatile compounding that blew up at
-> 20% Kelly. **The user's intuition was right**: settlement-driven
-> direction bets beat mispricing-driven mean-reversion in this market
-> structure.
+> **Backtest evidence** (scripts/backtest_strategy_comparison.py, n=197):
+> DIRECTION 0.10%/$10 confirmed highest-alpha strategy:
+> 90.5% win rate / +$3.93 mean per trade / +$331 corpus / 1.1% top-win-skew
+> (extremely robust). Other variants (cheap-underdog, mean-reversion,
+> BB-model-edge, momentum-only) ranked lower by alpha density and total $.
 >
-> The FVG-tier code is preserved but `PAPER_FVG_LIVE_MODE = False`.
-> Do not re-enable without first fixing FLAT-CONFIRMED + `_open_position`
-> integration, and not without re-validating against settlement data.
+> **Sizing:** `DIRECTION_CONTRACTS=3` base × `conviction_multiplier`
+> (0.7-2.0×) → 3-6ct per fire. Smaller than original `5` because
+> Kalshi 15m ask depth at typical entry prices (14c-70c) is consistently
+> below 5-10ct. Multiplier saturates at 2.0× on dist≥0.20% AND mom≥$40.
+>
+> **Execution:** IOC at `ask + DIRECTION_TAKER_SLIPPAGE_C` (default 3c).
+> Walks through 1-2 depth tiers when ask is thin. Hold-to-settlement:
+> Kalshi auto-credits $1 per winning contract at expiry; engine places
+> NO exit orders.
+>
+> **Today's lessons (2026-05-05 to 2026-05-06):**
+> 1. FVG-tier (`PAPER_FVG_LIVE_MODE`) had FLAT-CONFIRMED bug + stale-cache
+>    premature-close → -19% loss → permanently disabled, do not re-enable
+>    without re-validation
+> 2. DIRECTION via `_open_position` was hijacked 4 times by legacy exit
+>    paths (SYNC_RECLAIM, VWAP_EXIT, DOMINANT_UPGRADE, etc.) — fixed by
+>    refactoring to `self._direction_position` (commit `cc07690`)
+> 3. **`_uc()` caches config at module import** — config changes require
+>    engine restart. Don't trust "no restart needed" claims unless you've
+>    verified `_uc` re-reads the user_config module.
+> 4. Maker-mode (`post_only=True` at ask-1) is wrong for momentum
+>    strategies — only fills on reversal = adverse selection. IOC with
+>    slippage tolerance is the right execution model.
 
 This document is the operator-facing source of truth. **If this doc and code disagree, the code wins.** Update this doc whenever signal logic or config defaults materially change.
 
@@ -95,15 +114,22 @@ placed. The only safety primitive needed is the per-window ticker lock.
 # Live trading
 PAPER_TRADING                        = False
 
-# DIRECTION-FOLLOWING (PRIMARY LIVE SIGNAL — 2026-05-05)
+# DIRECTION-FOLLOWING (PRIMARY LIVE SIGNAL — 2026-05-06 final)
 DIRECTION_STRATEGY_ENABLED           = True    # PRIMARY
 DIRECTION_DIST_THRESHOLD_PCT         = 0.0010  # 0.10% from strike
 DIRECTION_MOMENTUM_THRESHOLD_DOLLARS = 10      # $10 over 5min
 DIRECTION_MAX_OFFSET_S               = 600     # entry only before minute 10
-DIRECTION_CONTRACTS                  = 5       # flat sizing (NO Kelly)
+DIRECTION_CONTRACTS                  = 3       # base size (was 5; reduced
+                                               # 2026-05-06 to match shallow
+                                               # Kalshi 15m ask depth)
+DIRECTION_CONVICTION_SIZING_ENABLED  = True    # apply 0.7-2.0× multiplier
 DIRECTION_MIN_BANKROLL_X_COST        = 1.5     # need 1.5×cost in BAL
 DIRECTION_DAILY_LOSS_HALT_FRAC       = 0.20    # halt at -20% from day-start
 DIRECTION_POST_FAIL_COOLDOWN_S       = 5.0     # backoff after place_order fail
+DIRECTION_TAKER_SLIPPAGE_C           = 3       # IOC at ask + 3c (walk depth)
+                                               # NOTE: changing this REQUIRES
+                                               # engine restart (_uc caches
+                                               # config at module import).
 
 # Per-window ticker lock — INVIOLABLE
 MAX_TRADES_PER_SESSION_TICKER        = 1
@@ -131,6 +157,59 @@ ATM_REVERSION_ENABLED                = False
 ARB_DETECTOR_ENABLED                 = False
 MICRO_PULLBACK_ENABLED               = False
 ```
+
+---
+
+## CRITICAL OPERATIONAL GOTCHAS (read before debugging)
+
+### 1. `_uc()` caches user_config at module import
+
+The `_uc(name, default)` function (`polymarket_copy_engine.py:105`) reads
+from a `_user_cfg` dict that is built **once** when the engine starts:
+
+```python
+_user_cfg = {k: v for k, v in vars(_uc).items() if not k.startswith("_")}
+```
+
+**Implication:** editing `user_config.py` while the engine is running has
+**NO effect** until the engine is restarted. Don't trust any "no restart
+needed" claim unless the consuming code path explicitly re-reads the
+file.
+
+To apply a config change:
+```powershell
+# 1. Edit user_config.py
+# 2. Save
+# 3. Restart:
+nssm restart BTCBiasEngine
+# 4. Verify the new value is in the next FIRE log line
+```
+
+### 2. DIRECTION uses `self._direction_position`, NOT `self._open_position`
+
+Every BB_PURE/TA_FORCED-era exit path in the engine (~20 of them inside
+`_manage_position`, plus `VWAP_EXIT`, `MRC_FORCE_EXIT`,
+`DOMINANT_UPGRADE`, etc.) gates on `self._open_position is not None`. If
+DIRECTION fills populated `_open_position`, those paths see it and apply
+the wrong exit logic — we hit this 4 times in 2 days (commits before
+`cc07690`).
+
+Fix: DIRECTION fills set `self._direction_position` (a separate
+attribute). `_open_position` stays `None` for DIRECTION trades. Legacy
+exit paths skip them by construction.
+
+The only paths that scan Kalshi truth independent of `_open_position`
+are `SYNC_RECLAIM` and `ORPHAN_FLATTEN`. Both consult
+`self._direction_active_tickers` and skip DIRECTION-tier tickers.
+
+**If a DIRECTION fill appears in `_open_position`, something is broken
+upstream.** Don't add a guard — fix the upstream code path.
+
+### 3. Maker-mode (`post_only=True` at ask-1) is a fail for momentum strategies
+
+Tested 2026-05-06 18:00-18:25 PT. Maker bids only fill when the market
+reverses toward our price = adverse selection. Don't try maker mode on
+DIRECTION; use IOC at `ask + slippage`.
 
 ---
 
