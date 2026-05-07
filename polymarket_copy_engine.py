@@ -768,6 +768,25 @@ class PolymarketCopyEngine:
         # at ask-1 trade less frequently but actually fill when they do.
         self._direction_pending_orders: dict = {}
 
+        # 2026-05-06 night: separate position state for DIRECTION strategy.
+        # Today's session caught 4 distinct legacy code paths each
+        # adopting/managing DIRECTION fills via _open_position:
+        #   - SYNC RECLAIM (yesterday) → -$7.53
+        #   - VWAP_EXIT (yesterday) → -$0.85 + $5.60 forfeited
+        #   - DOMINANT_UPGRADE (today) → 7ct → 14ct doubled bet, settled NO
+        # The pattern: anything that gates on `_open_position is not None`
+        # sees DIRECTION fills and applies BB_PURE/TA_FORCED-style exit
+        # logic.
+        # Architecture fix: DIRECTION fills now set self._direction_position
+        # instead of self._open_position. The 20+ legacy exit paths gate
+        # on _open_position; they auto-skip when it stays None. Only
+        # SYNC_RECLAIM and ORPHAN_FLATTEN scan Kalshi truth independent
+        # of _open_position — both already consult
+        # _direction_active_tickers and skip DIRECTION tickers.
+        # Net: DIRECTION attack surface reduced from ~20 paths to 0
+        # (SYNC_RECLAIM and ORPHAN_FLATTEN both opted out).
+        self._direction_position: dict | None = None
+
         # 2026-04-29 GHOST-bug fix #5: track per-ticker order PLACEMENT
         # timestamps. _entered_tickers_this_window only fills AFTER fill
         # confirmation reaches the engine, so when a maker order fills on
@@ -4545,48 +4564,29 @@ class PolymarketCopyEngine:
         # IOC walks the book up to our limit, fills at best available).
         # We persist entry_px as the upper bound; settlement P&L is
         # ground truth.
-        self._open_position = {
+        # 2026-05-06 night: store on self._direction_position (NOT
+        # self._open_position) — see __init__ comment for context.
+        self._direction_position = {
             "order_id": oid,
             "side": sig.side,
             "entry_cents": entry_px,
-            "original_entry_cents": entry_px,
             "original_count": filled,
             "ticker": ticker,
             "tier": "DIRECTION",
             "strategy_name": "DIRECTION",
             "count": filled,
             "fill_time": time.time(),
-            "_dca_maxed": True,           # never DCA
-            "_hold_to_settle": True,      # marker: PROTECTIVE skips this
+            "_hold_to_settle": True,
             "entry_conviction": float(multiplier),
-            "entry_wallets": 0,
-            "entry_wallet_count_at_last_scale": 0,
-            "high_water_bid": entry_px,
-            "had_flow_at_entry": False,
-            "tiers_in": set(),
-            "entry_elite_wallets": set(),
-            "shallow_filled": filled,
-            "shallow_price": entry_px,
-            "deep_filled": 0,
-            "deep_price": entry_px,
-            "signal_wallet_names": [],
-            "tp_order_id": None,
-            "tp_order_ids": [],
-            "tp_price": 0,
-            # Direction-specific cached state
             "_direction_dist_pct": float(sig.dist_pct),
             "_direction_btc_5m_move": float(sig.btc_5m_move),
             "_direction_multiplier": float(multiplier),
         }
 
-        # 2026-05-06: register ticker in DIRECTION-active set so the
-        # legacy adopt/flatten paths (SYNC RECLAIM, ORPHAN-FLATTEN)
-        # know to leave this position alone. _maintain_protective_order
-        # and _manage_position use the tier="DIRECTION" / _hold_to_settle
-        # markers in _open_position; the active-tickers set covers the
-        # paths that fire BEFORE _open_position is consulted (SYNC RECLAIM
-        # only runs when _open_position is None, ORPHAN-FLATTEN scans
-        # Kalshi truth independent of _open_position).
+        # Register ticker in DIRECTION-active set — consulted by
+        # SYNC_RECLAIM and ORPHAN_FLATTEN to skip DIRECTION positions.
+        # These two paths scan Kalshi truth independent of _open_position
+        # so they need a separate signal.
         try:
             self._direction_active_tickers.add(ticker)
         except Exception:
@@ -4594,9 +4594,10 @@ class PolymarketCopyEngine:
 
         logger.warning(
             "DIRECTION FILL (IOC): %s %dx @ %dc oid=%s mult=%.2fx | "
-            "_open_position set with tier=DIRECTION (hold_to_settle) — "
-            "settles at expiry, PROTECTIVE/MANAGE_POSITION/MRC/SYNC_RECLAIM/"
-            "ORPHAN_FLATTEN all skip",
+            "self._direction_position set (NOT _open_position) — "
+            "all 20+ legacy exit paths gate on _open_position; they "
+            "auto-skip. SYNC_RECLAIM/ORPHAN_FLATTEN consult "
+            "_direction_active_tickers and skip. Holds to settlement.",
             sig.side.upper(), filled, entry_px, oid[:12], multiplier,
         )
         try:
@@ -4730,36 +4731,22 @@ class PolymarketCopyEngine:
         btc_5m_move: float, btc_price: float, strike: float,
         session_age_s: int, balance_at_entry_c: int,
     ) -> None:
-        """Common fill-registration path: set _open_position, register
-        ticker as DIRECTION-active, persist row, log."""
-        self._open_position = {
+        """Common fill-registration path. Sets self._direction_position
+        (NOT self._open_position) so legacy exit paths can't see the
+        position. Also registers in _direction_active_tickers for
+        SYNC_RECLAIM/ORPHAN_FLATTEN opt-out."""
+        self._direction_position = {
             "order_id": oid,
             "side": side,
             "entry_cents": maker_px,
-            "original_entry_cents": maker_px,
             "original_count": filled,
             "ticker": ticker,
             "tier": "DIRECTION",
             "strategy_name": "DIRECTION",
             "count": filled,
             "fill_time": time.time(),
-            "_dca_maxed": True,
             "_hold_to_settle": True,
             "entry_conviction": float(multiplier),
-            "entry_wallets": 0,
-            "entry_wallet_count_at_last_scale": 0,
-            "high_water_bid": maker_px,
-            "had_flow_at_entry": False,
-            "tiers_in": set(),
-            "entry_elite_wallets": set(),
-            "shallow_filled": filled,
-            "shallow_price": maker_px,
-            "deep_filled": 0,
-            "deep_price": maker_px,
-            "signal_wallet_names": [],
-            "tp_order_id": None,
-            "tp_order_ids": [],
-            "tp_price": 0,
             "_direction_dist_pct": float(dist_pct),
             "_direction_btc_5m_move": float(btc_5m_move),
             "_direction_multiplier": float(multiplier),
@@ -4770,9 +4757,8 @@ class PolymarketCopyEngine:
             pass
         logger.warning(
             "DIRECTION FILL (maker): %s %dx @ %dc oid=%s mult=%.2fx | "
-            "_open_position set with tier=DIRECTION (hold_to_settle) — "
-            "settles at expiry, PROTECTIVE/MANAGE_POSITION/MRC/SYNC_RECLAIM/"
-            "ORPHAN_FLATTEN all skip",
+            "self._direction_position set (NOT _open_position) — "
+            "legacy exit paths cannot see this position.",
             side.upper(), filled, maker_px, oid[:12], multiplier,
         )
         try:
