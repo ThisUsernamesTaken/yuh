@@ -745,6 +745,16 @@ class PolymarketCopyEngine:
         # we restore tickers if the file is < 15 min old (one window).
         self._entered_tickers_this_window: set = self._load_session_lock()
 
+        # 2026-05-06: DIRECTION-active ticker registry. Populated when a
+        # DIRECTION strategy fill lands; consulted by SYNC RECLAIM and
+        # ORPHAN-FLATTEN loops so they don't adopt/flatten DIRECTION
+        # positions (which are managed via hold-to-settlement, not via
+        # the legacy _open_position machinery's exit paths).
+        # Distinct from _entered_tickers_this_window because we need to
+        # tell SYNC RECLAIM "this is a DIRECTION ticker — leave it alone"
+        # without confusing the per-window single-trade lock.
+        self._direction_active_tickers: set = set()
+
         # 2026-04-29 GHOST-bug fix #5: track per-ticker order PLACEMENT
         # timestamps. _entered_tickers_this_window only fills AFTER fill
         # confirmation reaches the engine, so when a maker order fills on
@@ -4539,10 +4549,24 @@ class PolymarketCopyEngine:
             "_direction_multiplier": float(multiplier),
         }
 
+        # 2026-05-06: register ticker in DIRECTION-active set so the
+        # legacy adopt/flatten paths (SYNC RECLAIM, ORPHAN-FLATTEN)
+        # know to leave this position alone. _maintain_protective_order
+        # and _manage_position use the tier="DIRECTION" / _hold_to_settle
+        # markers in _open_position; the active-tickers set covers the
+        # paths that fire BEFORE _open_position is consulted (SYNC RECLAIM
+        # only runs when _open_position is None, ORPHAN-FLATTEN scans
+        # Kalshi truth independent of _open_position).
+        try:
+            self._direction_active_tickers.add(ticker)
+        except Exception:
+            pass
+
         logger.warning(
             "DIRECTION FILL: %s %dx @ %dc oid=%s mult=%.2fx | "
             "_open_position set with tier=DIRECTION (hold_to_settle) — "
-            "settles at expiry, PROTECTIVE will skip",
+            "settles at expiry, PROTECTIVE/MANAGE_POSITION/MRC/SYNC_RECLAIM/"
+            "ORPHAN_FLATTEN all skip",
             sig.side.upper(), filled, ask_c, oid[:12], multiplier,
         )
         try:
@@ -17438,6 +17462,10 @@ class PolymarketCopyEngine:
         """
         if pos is None:
             return False
+        # 2026-05-06: DIRECTION positions hold to settlement; do not
+        # let the MRC analyzer force-exit them.
+        if pos.get("tier") == "DIRECTION" or pos.get("_hold_to_settle"):
+            return False
         an = pos.get("_momentum_analyzer")
         if an is None or not getattr(an, "is_warm", False):
             return False
@@ -19004,6 +19032,28 @@ class PolymarketCopyEngine:
                         continue
                     if ticker == active_ticker:
                         continue  # active engine position; protective_maintain owns it
+                    # 2026-05-06 DIRECTION OPT-OUT: never flatten DIRECTION
+                    # positions. They are designed to hold to settlement;
+                    # an orphan-flatten cross-spread sell forfeits the
+                    # settlement payout (incident 2026-05-05 21:51 was
+                    # VWAP_EXIT but ORPHAN-FLATTEN would do the same to
+                    # any DIRECTION position whose _open_position got
+                    # cleared by some other path).
+                    if ticker in getattr(self, "_direction_active_tickers", set()):
+                        # Rate-limit the skip log (poll runs every 3-5s).
+                        _last_skip_d = self._orphan_skip_log.get(ticker, 0.0) \
+                            if hasattr(self, "_orphan_skip_log") else 0.0
+                        if _now_t - _last_skip_d > 30.0:
+                            if not hasattr(self, "_orphan_skip_log"):
+                                self._orphan_skip_log = {}
+                            self._orphan_skip_log[ticker] = _now_t
+                            logger.info(
+                                "CopyEngine ORPHAN-SKIP-DIRECTION: %s %dct on %s "
+                                "— DIRECTION-tier ticker, holds to settlement",
+                                "+" if pos_int > 0 else "-",
+                                abs(pos_int), ticker[-15:],
+                            )
+                        continue
                     if ticker in recent_tickers:
                         # 2026-05-02 evening: recently-placed engine ticker.
                         # Skip orphan-flatten — let _maintain_protective_order
@@ -20352,6 +20402,30 @@ class PolymarketCopyEngine:
         Hold if smart wallets still support our direction.
         """
         pos = self._open_position
+
+        # ═══════════════════════════════════════════════════════════════
+        # 2026-05-06 DIRECTION HOLD-TO-SETTLE GUARD
+        # ───────────────────────────────────────────────────────────────
+        # DIRECTION strategy positions are designed to hold to settlement
+        # (Kalshi auto-credits $1 per winning contract at expiry). All
+        # exit logic in this function — VWAP_EXIT, PROB_COLLAPSE, PEAK_
+        # GIVEBACK, INTELLIGENT DCA, MFE-TRAIL, MRC FORCE-EXIT, BTC-
+        # DEVIATION-STOP, FLOW-FLIP, etc. — was designed for the BB_PURE/
+        # TA_FORCED tier where managed exits are the norm. Running any
+        # of these on a DIRECTION position will close it early and forfeit
+        # the settlement payout (incident 2026-05-05 21:51: VWAP_EXIT
+        # closed a 10ct NO @ 38c that would have settled NO at $1.00 = +
+        # $5.60, instead locked in -$0.85).
+        #
+        # This single guard at the top bypasses ~20 legacy exit paths
+        # in one shot. The protective_maintain layer has its own opt-out
+        # (line ~16480) for the same reason.
+        # ═══════════════════════════════════════════════════════════════
+        if pos is not None and (
+            pos.get("tier") == "DIRECTION"
+            or pos.get("_hold_to_settle")
+        ):
+            return
 
         # ═══════════════════════════════════════════════════════════════════
         # MRC FEED (2026-05-04) — feed the per-fill momentum analyzer with
@@ -21988,6 +22062,24 @@ class PolymarketCopyEngine:
                                     )
                             _sync_handled_this_iter = True
                         elif _placed_recently or ticker in getattr(self, "_entered_tickers_this_window", set()):
+                            # 2026-05-06 DIRECTION OPT-OUT: if this ticker
+                            # was a DIRECTION fill, leave it alone. SYNC
+                            # RECLAIM was originally written for BB_PURE/
+                            # TA_FORCED orphans where it reconstructs
+                            # _open_position so the stop-loss / TP staircase
+                            # paths can fire. DIRECTION holds to settlement;
+                            # adopting via SYNC RECLAIM and slapping TA_FORCED
+                            # exit logic on it is exactly what caused the
+                            # 2026-05-05 21:22 -$7.53 catastrophe.
+                            if ticker in getattr(self, "_direction_active_tickers", set()):
+                                logger.info(
+                                    "CopyEngine SYNC RECLAIM SKIP-DIRECTION: %s "
+                                    "is a DIRECTION-tier ticker — holds to settlement, "
+                                    "no reclaim/exit logic applies",
+                                    ticker[-15:],
+                                )
+                                _sync_handled_this_iter = True
+                                continue
                             # 2026-04-29 GHOST-bug fix: secondary safeguard
                             # (RECLAIM). _open_position is None or for a
                             # different ticker, but the engine entered THIS
