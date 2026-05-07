@@ -175,3 +175,37 @@ def test_orphan_flatten_check_skips_direction_tickers():
     for candidate in ("KXBTC15M-DIR", "KXBTC15M-OTHER"):
         skip = candidate in direction_tickers
         assert skip is (candidate == "KXBTC15M-DIR")
+
+
+# ─── Guard 6: _fire_dominant_size_upgrade (added 2026-05-06) ───────────
+
+
+def test_dominant_upgrade_returns_false_for_direction_tier():
+    """The 6th hijack vector: DOMINANT UPGRADE saw a DIRECTION position
+    (tier='DIRECTION' in _open_position), evaluated the FVG signal as
+    dominant, and added 7ct to the position + placed a 14x sell TP at
+    52c. Mid-trade scale-up is not allowed on hold-to-settle positions.
+    """
+    from polymarket_copy_engine import PolymarketCopyEngine
+    eng = PolymarketCopyEngine.__new__(PolymarketCopyEngine)
+    pos = _make_pos(tier="DIRECTION")
+    eng._open_position = pos
+    fired = asyncio.run(eng._fire_dominant_size_upgrade({}))
+    assert fired is False
+
+
+def test_dominant_upgrade_returns_false_for_hold_to_settle_marker():
+    from polymarket_copy_engine import PolymarketCopyEngine
+    eng = PolymarketCopyEngine.__new__(PolymarketCopyEngine)
+    pos = _make_pos(tier="UNKNOWN", hold=True)
+    eng._open_position = pos
+    fired = asyncio.run(eng._fire_dominant_size_upgrade({}))
+    assert fired is False
+
+
+def test_dominant_upgrade_returns_false_for_no_pos():
+    from polymarket_copy_engine import PolymarketCopyEngine
+    eng = PolymarketCopyEngine.__new__(PolymarketCopyEngine)
+    eng._open_position = None
+    fired = asyncio.run(eng._fire_dominant_size_upgrade({}))
+    assert fired is False

@@ -9909,6 +9909,16 @@ class PolymarketCopyEngine:
         pos = self._open_position
         if pos is None:
             return False
+        # 2026-05-06 GUARD #6: DIRECTION positions hold to settlement.
+        # No mid-trade size-up. The 2026-05-06 18:50 incident: DIRECTION
+        # filled YES 7x @ 40c, then 6 seconds later DOMINANT UPGRADE
+        # bought 7 more @ 38c and placed a 14x sell TP at 52c. The
+        # "all skip" message in the FILL log promised PROTECTIVE/
+        # MANAGE_POSITION/MRC/SYNC_RECLAIM/ORPHAN_FLATTEN would skip,
+        # but DOMINANT UPGRADE is a separate code path that wasn't in
+        # the original audit. Adding here.
+        if pos.get("tier") == "DIRECTION" or pos.get("_hold_to_settle"):
+            return False
         # Phase F mutex: SR_FADE trades run without scale-ups (the thesis is
         # "price reverts from a known level, take the pop, exit"). DOMINANT
         # upgrades don't apply to that playbook.
