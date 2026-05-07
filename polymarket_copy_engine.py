@@ -755,6 +755,19 @@ class PolymarketCopyEngine:
         # without confusing the per-window single-trade lock.
         self._direction_active_tickers: set = set()
 
+        # 2026-05-06 evening: DIRECTION-pending registry. With the switch
+        # from IOC taker (immediate-or-cancel at the ask) to post_only
+        # maker (resting bid at ask-1), placed orders sit on Kalshi until
+        # the market comes back to our price OR our timeout fires. The
+        # registry tracks {ticker: {oid, place_ts, side, count, px}} so
+        # the next eval cycle can poll status, transition to FILL on
+        # fill, or cancel + clear on timeout.
+        # Why the switch: 0/62 fill rate at 17:51 PT showed Kalshi 15m
+        # ask depth is consistently < 5-10ct of size at the snapshot
+        # time, so IOC always returns filled_count=0. Resting maker bids
+        # at ask-1 trade less frequently but actually fill when they do.
+        self._direction_pending_orders: dict = {}
+
         # 2026-04-29 GHOST-bug fix #5: track per-ticker order PLACEMENT
         # timestamps. _entered_tickers_this_window only fills AFTER fill
         # confirmation reaches the engine, so when a maker order fills on
@@ -4321,12 +4334,21 @@ class PolymarketCopyEngine:
         if not ticker:
             return
 
-        # Gate 1: per-window ticker lock
+        now = time.time()
+
+        # 2026-05-06 evening: maker-mode pending-order management.
+        # Before any new-fire logic, handle any resting orders we
+        # already placed. This must run BEFORE the ticker-lock gate
+        # so we can resolve pending orders and free up the lock.
+        await self._direction_handle_pending(ticker, now)
+
+        # Gate 1: per-window ticker lock (now also short-circuits if
+        # we have a pending maker order — the new fire would just
+        # bounce off the lock anyway, but we want to be explicit).
         if ticker in self._entered_tickers_this_window:
             return
 
         # Gate 2: entry-time cap
-        now = time.time()
         session_open = float(getattr(self, "_poly_window_open_time", 0) or 0)
         if session_open <= 0:
             return
@@ -4451,7 +4473,16 @@ class PolymarketCopyEngine:
             )
             return
 
-        cost_c = contracts * ask_c
+        # 2026-05-06 evening: maker-mode entry. Place at ask - offset
+        # (default 1c) with post_only=True. Order rests on Kalshi
+        # until it fills (someone sells into our bid) or we cancel
+        # via _direction_handle_pending after the timeout.
+        # Compare to old IOC mode at the ask: 0/62 fill rate at 17:51
+        # because Kalshi 15m ask depth was consistently below our
+        # requested size at the snapshot time.
+        maker_offset = int(_uc("DIRECTION_MAKER_OFFSET_C", 1))
+        maker_px = max(1, ask_c - maker_offset)
+        cost_c = contracts * maker_px
 
         # Pre-await: add ticker lock for race protection.
         self._add_session_lock(ticker)
@@ -4461,19 +4492,20 @@ class PolymarketCopyEngine:
             pass
 
         logger.warning(
-            "DIRECTION FIRE: %s %s %dx @ %dc ($%.2f) mult=%.2f | %s | "
+            "DIRECTION FIRE: %s %s %dx @ %dc maker (ask=%dc) ($%.2f) mult=%.2f | %s | "
             "btc=$%.2f strike=$%.2f age=%ds bal=$%.2f",
-            sig.side.upper(), ticker[-15:], contracts, ask_c,
+            sig.side.upper(), ticker[-15:], contracts, maker_px, ask_c,
             cost_c / 100, multiplier, sig.reason,
             btc_price, strike, int(session_age), balance_cents / 100,
         )
 
-        # Gate 8: place IOC taker buy
+        # Gate 8: place post_only=True maker buy at ask-offset.
+        # Resting GTC order (no time_in_force) — sits until fill or
+        # _direction_handle_pending cancels it after timeout.
         try:
             order = await self._client.place_order(
-                ticker=ticker, side=sig.side, price=ask_c,
-                count=contracts, post_only=False,
-                time_in_force="immediate_or_cancel",
+                ticker=ticker, side=sig.side, price=maker_px,
+                count=contracts, post_only=True,
             )
         except Exception as e:
             logger.error(
@@ -4493,33 +4525,44 @@ class PolymarketCopyEngine:
         oid = getattr(order, "order_id", "") or ""
 
         if filled <= 0:
-            # IOC means no resting remainder — order auto-cancels if it
-            # didn't take immediately. Release lock so a slightly later
-            # tick can retry once book conditions match.
+            # Maker rest — order is sitting on the book. Track in
+            # pending registry so _direction_handle_pending can poll
+            # for fill or cancel after timeout.
+            self._direction_pending_orders[ticker] = {
+                "oid": oid,
+                "place_ts": now,
+                "side": sig.side,
+                "count": int(contracts),
+                "px": int(maker_px),
+                "ask_at_place_c": int(ask_c),
+                "multiplier": float(multiplier),
+                "dist_pct": float(sig.dist_pct),
+                "btc_5m_move": float(sig.btc_5m_move),
+                "btc_price": float(btc_price),
+                "strike": float(strike),
+                "session_age_s": int(session_age),
+                "balance_at_entry_c": int(balance_cents),
+            }
             logger.info(
-                "DIRECTION IOC NOFILL: order=%s @ %dc — book moved or "
-                "depth insufficient; releasing lock",
-                oid[:12], ask_c,
+                "DIRECTION MAKER PENDING: order=%s @ %dc (ask=%dc) — "
+                "resting; will check for fill or cancel after %.0fs",
+                oid[:12], maker_px, ask_c,
+                float(_uc("DIRECTION_MAKER_TIMEOUT_S", 60.0)),
             )
-            self._remove_session_lock(ticker)
-            cooldown_s = float(_uc("DIRECTION_POST_FAIL_COOLDOWN_S", 5.0))
-            self._direction_post_fail_cooldown[ticker] = now + cooldown_s
             return
 
-        # Filled. Set _open_position with tier="DIRECTION" so the legacy
-        # SYNC RECLAIM / PROTECTIVE machinery doesn't adopt it as an
-        # orphan and try to apply BB_PURE/TA_FORCED-style exit logic.
-        # The 2026-05-05 21:22 incident: DIRECTION YES 20x @ 36c filled,
-        # SYNC RECLAIM saw _open_position=None + Kalshi position present
-        # → adopted with strat=TA_FORCED_SIGNAL → PROTECTIVE TP loop placed
-        # 6 taker sells at 71c. Position then settled NO at expiry =
-        # -$7.53 loss. Setting _open_position with the DIRECTION tier
-        # gives PROTECTIVE a chance to opt out of management.
+        # Rare case: post_only=True maker that filled immediately on
+        # placement (bid caught up to maker_px between book-read and
+        # Kalshi-receiving-order). Treat the same as a normal fill —
+        # set _open_position with tier="DIRECTION" so the legacy
+        # SYNC RECLAIM / PROTECTIVE machinery doesn't adopt it.
+        # (Most post_only fills will come via _direction_handle_pending
+        # after the order rests for some time.)
         self._open_position = {
             "order_id": oid,
             "side": sig.side,
-            "entry_cents": ask_c,
-            "original_entry_cents": ask_c,
+            "entry_cents": maker_px,
+            "original_entry_cents": maker_px,
             "original_count": filled,
             "ticker": ticker,
             "tier": "DIRECTION",
@@ -4531,14 +4574,14 @@ class PolymarketCopyEngine:
             "entry_conviction": float(multiplier),
             "entry_wallets": 0,
             "entry_wallet_count_at_last_scale": 0,
-            "high_water_bid": ask_c,
+            "high_water_bid": maker_px,
             "had_flow_at_entry": False,
             "tiers_in": set(),
             "entry_elite_wallets": set(),
             "shallow_filled": filled,
-            "shallow_price": ask_c,
+            "shallow_price": maker_px,
             "deep_filled": 0,
-            "deep_price": ask_c,
+            "deep_price": maker_px,
             "signal_wallet_names": [],
             "tp_order_id": None,
             "tp_order_ids": [],
@@ -4563,11 +4606,11 @@ class PolymarketCopyEngine:
             pass
 
         logger.warning(
-            "DIRECTION FILL: %s %dx @ %dc oid=%s mult=%.2fx | "
+            "DIRECTION FILL (immediate-maker): %s %dx @ %dc oid=%s mult=%.2fx | "
             "_open_position set with tier=DIRECTION (hold_to_settle) — "
             "settles at expiry, PROTECTIVE/MANAGE_POSITION/MRC/SYNC_RECLAIM/"
             "ORPHAN_FLATTEN all skip",
-            sig.side.upper(), filled, ask_c, oid[:12], multiplier,
+            sig.side.upper(), filled, maker_px, oid[:12], multiplier,
         )
         try:
             import sqlite3 as _sq
@@ -4585,10 +4628,185 @@ class PolymarketCopyEngine:
             c.execute(
                 "INSERT INTO direction_trades VALUES "
                 "(NULL,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))",
-                (ticker, sig.side, ask_c, filled,
+                (ticker, sig.side, maker_px, filled,
                  sig.btc_price, sig.strike, sig.dist_pct,
                  sig.btc_5m_move, int(session_age),
                  balance_cents, oid),
+            )
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.debug("DIRECTION DB save failed: %s", e)
+
+    async def _direction_handle_pending(self, current_ticker: str, now: float) -> None:
+        """Manage resting DIRECTION maker orders.
+
+        Each tick before any new-fire decision, walk the pending registry
+        and:
+          - If order filled: transition to position state (set
+            _open_position with tier="DIRECTION", register active ticker,
+            persist row, log "DIRECTION FILL (maker)")
+          - If order still resting AND age >= timeout: cancel via
+            self._client.cancel_order, remove from registry. Lock STAYS
+            (one trade per session — even if we couldn't fill, we tried).
+          - If different ticker (window rolled): cancel any pending
+            orders on the OLD ticker.
+
+        Idempotent: safe to call every tick. No state mutations on
+        no-op cases.
+        """
+        if not self._direction_pending_orders:
+            return
+        timeout_s = float(_uc("DIRECTION_MAKER_TIMEOUT_S", 60.0))
+        # Iterate over a copy so we can mutate the dict
+        for ticker, pending in list(self._direction_pending_orders.items()):
+            try:
+                oid = pending.get("oid", "") or ""
+                if not oid:
+                    self._direction_pending_orders.pop(ticker, None)
+                    continue
+                # Window rolled (different ticker): cancel + remove
+                window_rolled = (ticker != current_ticker)
+                age = now - float(pending.get("place_ts", now) or now)
+                timed_out = age >= timeout_s
+
+                # Poll order status
+                try:
+                    order = await self._client.get_order(oid)
+                except Exception as e:
+                    # Order disappeared (filled + settled, or already
+                    # cancelled) — treat as resolved and clear
+                    logger.info(
+                        "DIRECTION PENDING: get_order(%s) on %s failed (%s) "
+                        "— clearing from registry",
+                        oid[:12], ticker[-15:], e,
+                    )
+                    self._direction_pending_orders.pop(ticker, None)
+                    continue
+
+                filled_count = int(getattr(order, "filled_count", 0) or 0)
+                status = getattr(order, "status", "") or ""
+
+                if filled_count > 0:
+                    # FILLED. Set _open_position with tier=DIRECTION,
+                    # register active ticker, persist, log.
+                    await self._direction_register_fill(
+                        ticker=ticker,
+                        oid=oid,
+                        side=pending["side"],
+                        filled=filled_count,
+                        maker_px=int(pending["px"]),
+                        multiplier=float(pending["multiplier"]),
+                        dist_pct=float(pending["dist_pct"]),
+                        btc_5m_move=float(pending["btc_5m_move"]),
+                        btc_price=float(pending["btc_price"]),
+                        strike=float(pending["strike"]),
+                        session_age_s=int(pending["session_age_s"]),
+                        balance_at_entry_c=int(pending["balance_at_entry_c"]),
+                    )
+                    self._direction_pending_orders.pop(ticker, None)
+                    continue
+
+                if window_rolled or timed_out:
+                    # Cancel and clear. Lock stays — per-window single-trade rule.
+                    reason = "window-rolled" if window_rolled else "maker-timeout"
+                    try:
+                        await self._client.cancel_order(oid)
+                        logger.info(
+                            "DIRECTION MAKER CANCEL (%s): order=%s @ %dc on %s "
+                            "(age=%.0fs, no fill)",
+                            reason, oid[:12], pending["px"], ticker[-15:], age,
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "DIRECTION MAKER CANCEL (%s) failed: %s "
+                            "(may have already filled or expired)",
+                            reason, e,
+                        )
+                    self._direction_pending_orders.pop(ticker, None)
+                    # If window rolled, also release the lock on the OLD
+                    # ticker — NOT the current one
+                    if window_rolled:
+                        try:
+                            self._remove_session_lock(ticker)
+                        except Exception:
+                            pass
+            except Exception:
+                logger.exception(
+                    "DIRECTION pending handler error on ticker=%s",
+                    ticker[-15:] if ticker else "?",
+                )
+
+    async def _direction_register_fill(
+        self, *, ticker: str, oid: str, side: str, filled: int,
+        maker_px: int, multiplier: float, dist_pct: float,
+        btc_5m_move: float, btc_price: float, strike: float,
+        session_age_s: int, balance_at_entry_c: int,
+    ) -> None:
+        """Common fill-registration path: set _open_position, register
+        ticker as DIRECTION-active, persist row, log."""
+        self._open_position = {
+            "order_id": oid,
+            "side": side,
+            "entry_cents": maker_px,
+            "original_entry_cents": maker_px,
+            "original_count": filled,
+            "ticker": ticker,
+            "tier": "DIRECTION",
+            "strategy_name": "DIRECTION",
+            "count": filled,
+            "fill_time": time.time(),
+            "_dca_maxed": True,
+            "_hold_to_settle": True,
+            "entry_conviction": float(multiplier),
+            "entry_wallets": 0,
+            "entry_wallet_count_at_last_scale": 0,
+            "high_water_bid": maker_px,
+            "had_flow_at_entry": False,
+            "tiers_in": set(),
+            "entry_elite_wallets": set(),
+            "shallow_filled": filled,
+            "shallow_price": maker_px,
+            "deep_filled": 0,
+            "deep_price": maker_px,
+            "signal_wallet_names": [],
+            "tp_order_id": None,
+            "tp_order_ids": [],
+            "tp_price": 0,
+            "_direction_dist_pct": float(dist_pct),
+            "_direction_btc_5m_move": float(btc_5m_move),
+            "_direction_multiplier": float(multiplier),
+        }
+        try:
+            self._direction_active_tickers.add(ticker)
+        except Exception:
+            pass
+        logger.warning(
+            "DIRECTION FILL (maker): %s %dx @ %dc oid=%s mult=%.2fx | "
+            "_open_position set with tier=DIRECTION (hold_to_settle) — "
+            "settles at expiry, PROTECTIVE/MANAGE_POSITION/MRC/SYNC_RECLAIM/"
+            "ORPHAN_FLATTEN all skip",
+            side.upper(), filled, maker_px, oid[:12], multiplier,
+        )
+        try:
+            import sqlite3 as _sq
+            conn = _sq.connect("data/trades.db")
+            c = conn.cursor()
+            c.execute("""CREATE TABLE IF NOT EXISTS direction_trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticker TEXT, side TEXT,
+                entry_price INTEGER, contracts INTEGER,
+                btc_price REAL, strike REAL, dist_pct REAL,
+                btc_5m_move REAL, session_age_s INTEGER,
+                bal_cents_at_entry INTEGER, order_id TEXT,
+                created_at TEXT DEFAULT (datetime('now'))
+            )""")
+            c.execute(
+                "INSERT INTO direction_trades VALUES "
+                "(NULL,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))",
+                (ticker, side, maker_px, filled,
+                 btc_price, strike, dist_pct, btc_5m_move,
+                 session_age_s, balance_at_entry_c, oid),
             )
             conn.commit()
             conn.close()

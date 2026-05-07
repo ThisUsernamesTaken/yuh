@@ -2130,6 +2130,11 @@ DIRECTION_CONTRACTS              = 5       # 2026-05-05 PT: REVERTED from 20.
 DIRECTION_MIN_BANKROLL_X_COST    = 1.5     # require 1.5×cost in BAL
 DIRECTION_DAILY_LOSS_HALT_FRAC   = 0.20    # halt at -20% from day-start
 DIRECTION_POST_FAIL_COOLDOWN_S   = 5.0     # backoff after place_order fail
+# 2026-05-06 evening: switched from IOC taker at ask to post_only maker
+# at ask-1. Resting orders need a timeout — if the market hasn't come to
+# us within this many seconds, cancel and try again on the next signal.
+DIRECTION_MAKER_TIMEOUT_S        = 60.0    # cancel resting maker after 60s
+DIRECTION_MAKER_OFFSET_C         = 1       # place at ask - this many cents
 
 # Tier sizing fractions (Level 3 — Half-Kelly, OOS-validated)
 FVG_TIER_FRAC_T1                 = 0.35
