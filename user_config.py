@@ -2136,7 +2136,14 @@ DIRECTION_POST_FAIL_COOLDOWN_S   = 5.0     # backoff after place_order fail
 # 0/1 fills in 25 min. Switched back to IOC, but at ask + slippage so
 # we walk through the next depth tier when the ask is thin. 1c on a $0.40
 # entry = 2.5% cost, well below the 5c TP target.
-DIRECTION_TAKER_SLIPPAGE_C       = 1       # IOC at ask + this many cents
+DIRECTION_TAKER_SLIPPAGE_C       = 2       # 2026-05-06 19:55: bumped 1->2.
+                                           # 35 fires at slip=1c produced
+                                           # 0 fills (ask depth at ask+1c
+                                           # consistently below 5-10ct
+                                           # requested size). Bumping to
+                                           # walk through the next tier.
+                                           # 2c on a 70c entry = 2.9% cost,
+                                           # still below the 5c TP target.
 # Legacy maker-mode knobs retained for rollback (currently inactive —
 # fire path uses IOC at ask+slippage, not post_only at ask-offset).
 # The pending-order state machine is dead code while in IOC mode.
