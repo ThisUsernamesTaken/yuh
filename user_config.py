@@ -2208,11 +2208,46 @@ DIRECTION_TRAIL_PHASE2_C        = 8       # minutes 5-10 since fill
 DIRECTION_TRAIL_PHASE3_C        = 5       # minutes 10-13 since fill
 DIRECTION_TRAIL_PHASE4_C        = 3       # last 2 min of session
 DIRECTION_MAX_LOSS_C            = 20      # max unrealized loss per ct (cents)
-DIRECTION_NEAR_CERTAIN_C        = 90      # bid >= this -> hold for $1 settle
-DIRECTION_PRE_EXPIRY_S          = 90      # seconds to expiry trigger
+DIRECTION_NEAR_CERTAIN_C        = 75      # 2026-05-08 PT: 90 -> 75. SEMANTIC
+                                           # CHANGE: rule was "hold to $1
+                                           # settle when bid≥90c" (gambling
+                                           # 25c upside vs binary downside).
+                                           # Now: "TAKE PROFIT at bid≥75c"
+                                           # (lock 25c+ on a 50c entry vs
+                                           # rolling settlement dice).
+                                           # Math: 90% × +25c gain ($22.50)
+                                           # vs 10% × -75c loss ($75) = EV
+                                           # -$5.25 if held; locking 25c is
+                                           # always positive.
+DIRECTION_PRE_EXPIRY_S          = 90      # seconds to expiry trigger (legacy)
+DIRECTION_FORCE_FLATTEN_S       = 60      # 2026-05-08 PT: NEW. Force-sell
+                                           # ALL DIRECTION-class positions
+                                           # at this many seconds left,
+                                           # regardless of P&L. Eliminates
+                                           # last-minute settlement coin-
+                                           # flips on losers (was 90s but
+                                           # only if profitable).
 DIRECTION_WALL_EXIT_ENABLED     = True    # rule A toggle
 DIRECTION_WALL_RATE_CTPS        = 30      # opposing aggression ct/s threshold
 DIRECTION_WALL_WINDOW_S         = 3.0     # rolling tape window for wall check
+# Convergence-take: lock intermediate profit when bid moves favorably
+# without waiting for trail-stop drawdown. Mirrors the user's manual
+# 07:30-07:50 PT pattern (bought 55c, sold 70-86c within minutes).
+DIRECTION_CONVERGENCE_TAKE_ENABLED   = True   # 2026-05-08 PT: NEW
+DIRECTION_CONVERGENCE_TAKE_MIN_GAIN_C = 8     # bid >= entry + this → sell
+DIRECTION_CONVERGENCE_TAKE_MIN_AGE_S  = 180   # only after 3min hold (avoid
+                                                # premature exit on first-
+                                                # tick noise)
+# Anti-reversion: exit when underlying thesis is broken (BTC reverts past
+# strike). Detects BEFORE the bid fully reflects it.
+DIRECTION_REVERSION_EXIT_ENABLED  = True      # 2026-05-08 PT: NEW
+DIRECTION_REVERSION_EXIT_DIST_FRAC = 0.5      # if current_dist < entry_dist
+                                                # × this, thesis broken; exit
+# Price-band skip: avoid 30-49c entries (weakest-WR bucket per realistic-
+# fill backtest: 30-39c=42% WR, 40-49c=65% WR vs 50-59c=84%, ≤30c=75%).
+DIRECTION_SKIP_PRICE_BAND_ENABLED = True      # 2026-05-08 PT: NEW
+DIRECTION_SKIP_PRICE_MIN_C        = 30        # skip entries in [min, max]
+DIRECTION_SKIP_PRICE_MAX_C        = 49
 
 # ── CHEAP-CONTINUATION SIZING BOOST (2026-05-07 PT evening) ──────────────
 # Today's user manually traded 308ct YES @ 22c on a strong-distance signal

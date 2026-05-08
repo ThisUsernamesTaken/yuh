@@ -5051,6 +5051,26 @@ class PolymarketCopyEngine:
         if contracts <= 0 or ask_c <= 0 or ask_c >= 100:
             return
 
+        # PRICE-BAND SKIP (2026-05-08 PT: NEW). Mirror DIRECTION rule —
+        # skip 30-49c entries (weakest-WR per backtest). Universal across
+        # tiers since UNIFIED positions land in _direction_position too.
+        try:
+            if bool(_uc("DIRECTION_SKIP_PRICE_BAND_ENABLED", False)):
+                _skip_min = int(_uc("DIRECTION_SKIP_PRICE_MIN_C", 30))
+                _skip_max = int(_uc("DIRECTION_SKIP_PRICE_MAX_C", 49))
+                if _skip_min <= ask_c <= _skip_max:
+                    _last_ts = float(getattr(self, "_unified_band_skip_ts", 0.0) or 0.0)
+                    if (now - _last_ts) >= 60.0:
+                        logger.info(
+                            "UNIFIED BAND-SKIP: %s ask=%dc in skip band "
+                            "[%d, %d]",
+                            side.upper(), ask_c, _skip_min, _skip_max,
+                        )
+                        self._unified_band_skip_ts = now
+                    return
+        except Exception:
+            pass
+
         # Bankroll x cost gate (mirrors DIRECTION_MIN_BANKROLL_X_COST)
         min_bx = float(_uc("UNIFIED_MIN_BANKROLL_X_COST", 1.5))
         cost_at_ask = contracts * ask_c
@@ -5375,6 +5395,29 @@ class PolymarketCopyEngine:
             ask_c = int(getattr(book, "best_no_ask", 0) or 0)
         if ask_c <= 0 or ask_c >= 100:
             return
+
+        # ── PRICE-BAND SKIP (2026-05-08 PT: NEW) ─────────────────────────
+        # Skip 30-49c entries — weakest-WR bucket per realistic-fill backtest:
+        # 30-39c = 42% WR / +$0.45 mean (worst), 40-49c = 65% / +$1.79
+        # vs 50-59c = 84% / +$2.79, ≤30c = 75% / +$4.79. The 30-49c band is
+        # too close to coin-flip with insufficient asymmetric upside.
+        try:
+            if bool(_uc("DIRECTION_SKIP_PRICE_BAND_ENABLED", False)):
+                _skip_min = int(_uc("DIRECTION_SKIP_PRICE_MIN_C", 30))
+                _skip_max = int(_uc("DIRECTION_SKIP_PRICE_MAX_C", 49))
+                if _skip_min <= ask_c <= _skip_max:
+                    # Throttled log (60s)
+                    _last_ts = float(getattr(self, "_direction_band_skip_ts", 0.0) or 0.0)
+                    if (now - _last_ts) >= 60.0:
+                        logger.info(
+                            "DIRECTION BAND-SKIP: %s ask=%dc in skip band "
+                            "[%d, %d] (weak-WR bucket per backtest)",
+                            sig.side.upper(), ask_c, _skip_min, _skip_max,
+                        )
+                        self._direction_band_skip_ts = now
+                    return
+        except Exception:
+            pass
 
         # Phase 2A: NOFILL re-attempt requires the ask to have moved by
         # >= DIRECTION_NOFILL_REQUIRE_ASK_DELTA_C cents from the last
@@ -5837,19 +5880,80 @@ class PolymarketCopyEngine:
             sess_open = float(getattr(self, "_poly_window_open_time", 0) or 0)
             sess_remaining_s = (sess_open + 900 - now) if sess_open > 0 else 9999.0
 
-            # 2. Rule C — hold to expiry on near-certain win
-            if bid_c >= int(_uc("DIRECTION_NEAR_CERTAIN_C", 90)):
-                # Throttled log: every 30s at most
-                _last = float(pos.get("_certain_log_ts", 0.0) or 0.0)
-                if (now - _last) >= 30.0:
-                    logger.info(
-                        "DIRECTION HOLD-CERTAIN: %s %s bid=%dc >= %dc, "
-                        "holding to settlement (pays $1.00)",
-                        side.upper(), ticker[-15:], bid_c,
-                        int(_uc("DIRECTION_NEAR_CERTAIN_C", 90)),
-                    )
-                    pos["_certain_log_ts"] = now
-                return
+            # 2. Rule C — TAKE-PROFIT-CEILING (2026-05-08 PT: was HOLD-CERTAIN)
+            # When bid reaches NEAR_CERTAIN_C, LOCK the profit instead of
+            # gambling on settlement. Old behavior was "hold for $1 settle"
+            # which carried 5-25% binary downside risk for marginal +10-25c
+            # upside. New behavior: take the locked +25c-50c gain.
+            _certain_c = int(_uc("DIRECTION_NEAR_CERTAIN_C", 75))
+            if bid_c >= _certain_c:
+                ok = await self._direction_exit_sell(
+                    ticker=ticker, side=side, count=count,
+                    bid_c=bid_c, entry_c=entry_c,
+                    reason="TAKE-CEILING",
+                    extra=f"bid={bid_c}c >= {_certain_c}c (locking +{profit_c}c profit)",
+                )
+                if ok:
+                    return
+
+            # 2B. Rule G — FORCE-FLATTEN (2026-05-08 PT: NEW). Eliminates
+            # last-minute settlement coin-flips. At seconds_left ≤
+            # FORCE_FLATTEN_S, sell EVERYTHING regardless of P&L. The
+            # remaining time is pure binary risk — better to lock current
+            # bid value than face 50% chance of full loss.
+            _force_s = float(_uc("DIRECTION_FORCE_FLATTEN_S", 60))
+            if 0 < sess_remaining_s <= _force_s:
+                ok = await self._direction_exit_sell(
+                    ticker=ticker, side=side, count=count,
+                    bid_c=bid_c, entry_c=entry_c,
+                    reason="FORCE-FLATTEN",
+                    extra=f"{int(sess_remaining_s)}s remaining, P&L={profit_c:+d}c (no settlement gamble)",
+                )
+                if ok:
+                    return
+
+            # 2C. Rule H — ANTI-REVERSION (2026-05-08 PT: NEW). Exit when
+            # the underlying signal thesis is broken. We entered because
+            # |dist_pct| was past threshold; if BTC reverts to a fraction
+            # of that distance, the trade is no longer aligned with the
+            # signal. Cut losses BEFORE the bid fully reflects it.
+            try:
+                if bool(_uc("DIRECTION_REVERSION_EXIT_ENABLED", False)):
+                    _entry_dist = float(pos.get("_direction_dist_pct", 0.0) or 0.0)
+                    if abs(_entry_dist) > 1e-6:
+                        # Need current dist_pct: btc_price - strike / strike
+                        _btc = float(getattr(self, "_btc_last_price", 0) or 0)
+                        _prob = getattr(self, "_prob_engine", None)
+                        _strike = float(getattr(_prob, "strike", 0) or 0) if _prob else 0
+                        if _btc > 0 and _strike > 0:
+                            _curr_dist = (_btc - _strike) / _strike
+                            # Sign-aligned: must be same direction as entry
+                            # (if entered YES on +dist, current dist must
+                            # still be +; if it flipped, immediate exit).
+                            _frac = float(
+                                _uc("DIRECTION_REVERSION_EXIT_DIST_FRAC", 0.5)
+                            )
+                            _entry_sign = 1 if _entry_dist > 0 else -1
+                            _curr_sign = 1 if _curr_dist > 0 else -1
+                            _shrunk = (
+                                _entry_sign != _curr_sign
+                                or abs(_curr_dist) < abs(_entry_dist) * _frac
+                            )
+                            if _shrunk:
+                                ok = await self._direction_exit_sell(
+                                    ticker=ticker, side=side, count=count,
+                                    bid_c=bid_c, entry_c=entry_c,
+                                    reason="REVERSION-EXIT",
+                                    extra=(
+                                        f"entry_dist={_entry_dist*100:+.3f}% "
+                                        f"now={_curr_dist*100:+.3f}% "
+                                        f"(thesis broken)"
+                                    ),
+                                )
+                                if ok:
+                                    return
+            except Exception as _rev_err:
+                logger.debug("DIRECTION reversion-check failed: %s", _rev_err)
 
             if pos.get("exit_attempted"):
                 # An exit was already attempted this tick path — let
@@ -5930,6 +6034,30 @@ class PolymarketCopyEngine:
                     if ok:
                         return
 
+            # 4B. Rule F — CONVERGENCE-TAKE (2026-05-08 PT: NEW). Lock
+            # intermediate profit when bid moves favorably without waiting
+            # for trail-stop drawdown. Mirrors the user's manual pattern
+            # (07:30-07:50: bought 55c, sold 70-86c within minutes).
+            try:
+                if bool(_uc("DIRECTION_CONVERGENCE_TAKE_ENABLED", False)):
+                    _min_gain = int(_uc("DIRECTION_CONVERGENCE_TAKE_MIN_GAIN_C", 8))
+                    _min_age_s = float(_uc("DIRECTION_CONVERGENCE_TAKE_MIN_AGE_S", 180))
+                    _age_s = max(0.0, now - entry_t)
+                    if profit_c >= _min_gain and _age_s >= _min_age_s:
+                        ok = await self._direction_exit_sell(
+                            ticker=ticker, side=side, count=count,
+                            bid_c=bid_c, entry_c=entry_c,
+                            reason="CONVERGENCE-TAKE",
+                            extra=(
+                                f"profit={profit_c}c >= {_min_gain}c "
+                                f"age={int(_age_s)}s >= {int(_min_age_s)}s"
+                            ),
+                        )
+                        if ok:
+                            return
+            except Exception as _conv_err:
+                logger.debug("DIRECTION convergence-take failed: %s", _conv_err)
+
             # 5. Rule D — loss cut
             max_loss = int(_uc("DIRECTION_MAX_LOSS_C", 20))
             if (entry_c - bid_c) >= max_loss:
@@ -5942,7 +6070,10 @@ class PolymarketCopyEngine:
                 if ok:
                     return
 
-            # 6. Rule E — pre-expiry
+            # 6. Rule E — pre-expiry (legacy: profitable-only). Now mostly
+            # subsumed by Rule G (FORCE-FLATTEN at FORCE_FLATTEN_S) which
+            # fires earlier in the rule order. Kept for backward compat in
+            # case FORCE_FLATTEN_S < PRE_EXPIRY_S (transitional zone).
             pre_s = float(_uc("DIRECTION_PRE_EXPIRY_S", 90))
             if profitable and 0 < sess_remaining_s <= pre_s:
                 ok = await self._direction_exit_sell(
