@@ -125,7 +125,7 @@ def conviction_multiplier(
     base_dist_threshold: float = DEFAULT_DIST_THRESHOLD_PCT,
     base_momentum_threshold: float = DEFAULT_MOMENTUM_THRESHOLD,
 ) -> float:
-    """Return sizing multiplier in [0.7, 2.0] based on signal conviction.
+    """Return sizing multiplier in [0.7, 1.5] based on signal conviction.
 
     Inputs are ABSOLUTE values (caller should pass abs(dist_pct) and
     abs(btc_5m_move)). evaluate() filters everything below threshold so
@@ -140,9 +140,13 @@ def conviction_multiplier(
 
     Caps:
       Floor 0.7x — never undersize a qualified signal below 70% of base
-      Cap   2.0x — never oversize beyond 2× (the 0.20% / $40 line is
-                   already 94% win in OOS; further extrapolation is
-                   unsupported by the n=35 sample at that level)
+      Cap   1.5x — 2026-05-07 PT: REDUCED from 2.0x. Empirical evidence
+                   shows that effective 6ct orders (3 base × 2.0x) couldn't
+                   fill on Kalshi 15m even at +3c slip. With base reduced
+                   to 2ct and cap at 1.5x, effective max is 3ct which fits
+                   typical 15m offer-side depth. Top-end signal extrapolation
+                   beyond 1.5x was unsupported by the n=35 OOS sample anyway
+                   (94% win at 0.20%/$40+ is already saturated).
 
     Backtest evidence (scripts/backtest_direction.py, n=197 settled):
       dist=0.01% & mom>$10:  67% win
@@ -150,11 +154,11 @@ def conviction_multiplier(
       dist=0.10% & mom>$10:  90% win   ← threshold
       dist=0.20% & mom>$10:  94% win   ← multiplier saturates here
 
-    Examples:
-      threshold (0.10%, $10):   1.0x  (5 → 5ct)
-      sweet spot (0.15%, $25):  1.5x  (5 → 7ct)
-      strong (0.18%, $35):      ~1.83x (5 → 9ct)
-      screaming (0.20%, $40+):  2.0x  (5 → 10ct)
+    Examples (with base=2ct after 2026-05-07 reduction):
+      threshold (0.10%, $10):   1.0x  (2 → 2ct)
+      sweet spot (0.15%, $25):  1.25x (2 → 2ct)
+      strong (0.18%, $35):      ~1.40x (2 → 2ct)
+      screaming (0.20%, $40+):  1.5x  (2 → 3ct)
     """
     if dist_pct_abs < base_dist_threshold or btc_5m_move_abs < base_momentum_threshold:
         return 0.7  # defensive — caller should have filtered
@@ -163,7 +167,7 @@ def conviction_multiplier(
     dist_bonus = 0.5 * min(1.0, dist_excess / 0.0010)
     mom_bonus = 0.5 * min(1.0, mom_excess / 30.0)
     mult = 1.0 + dist_bonus + mom_bonus
-    return max(0.7, min(2.0, mult))
+    return max(0.7, min(1.5, mult))
 
 
 def compute_contracts(

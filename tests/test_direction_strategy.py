@@ -204,23 +204,26 @@ def test_multiplier_sweet_spot_is_1_5x():
     assert m == pytest.approx(1.5, abs=0.01)
 
 
-def test_multiplier_saturates_at_2x():
-    """At/above 0.20% dist + $40 momentum → 2.0x cap."""
+def test_multiplier_saturates_at_1_5x():
+    """At/above 0.20% dist + $40 momentum → 1.5x cap (reduced from 2.0x
+    on 2026-05-07 to fit Kalshi 15m offer-side depth)."""
     m = conviction_multiplier(dist_pct_abs=0.0020, btc_5m_move_abs=40.0)
-    assert m == 2.0
+    assert m == 1.5
     # Even further past doesn't go higher
     m = conviction_multiplier(dist_pct_abs=0.0050, btc_5m_move_abs=200.0)
-    assert m == 2.0
+    assert m == 1.5
 
 
 def test_multiplier_dist_only_max():
-    """Max dist alone (mom at threshold) → 1.5x (only dist contributes)."""
+    """Max dist alone (mom at threshold) → 1.5x (only dist contributes;
+    composite at 1.0 + 0.5 = 1.5x, which equals the cap)."""
     m = conviction_multiplier(dist_pct_abs=0.0020, btc_5m_move_abs=10.0)
     assert m == pytest.approx(1.5, abs=0.01)
 
 
 def test_multiplier_momentum_only_max():
-    """Max mom alone (dist at threshold) → 1.5x."""
+    """Max mom alone (dist at threshold) → 1.5x (composite at 1.0 + 0.5 =
+    1.5x, equal to cap)."""
     m = conviction_multiplier(dist_pct_abs=0.0010, btc_5m_move_abs=40.0)
     assert m == pytest.approx(1.5, abs=0.01)
 
@@ -234,8 +237,8 @@ def test_contracts_multiplier_scales_up():
 
 
 def test_contracts_multiplier_max_cap():
-    """multiplier=2.0 on flat=5 → 10ct."""
-    assert compute_contracts(5000, 50, flat_contracts=5, multiplier=2.0) == 10
+    """multiplier=1.5 (the new max cap) on flat=5 → 7ct (5 × 1.5 = 7.5 → 7)."""
+    assert compute_contracts(5000, 50, flat_contracts=5, multiplier=1.5) == 7
 
 
 def test_contracts_multiplier_below_one_floors_at_one():

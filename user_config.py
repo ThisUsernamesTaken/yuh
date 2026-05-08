@@ -258,7 +258,12 @@ DOMINANT_BTC_5M_THRESHOLD = 15.0
 # we can analyze user manual-trade patterns and reproduce the alpha
 # algorithmically. Independent of engine entries — runs even when
 # TA_FORCED_ENTRY_ENABLED and LATE_DOMINANT_ENABLED are False.
-MANUAL_FILLS_CAPTURE_ENABLED  = True
+MANUAL_FILLS_CAPTURE_ENABLED  = False   # 2026-05-07 OVERHAUL: DISABLED.
+                                          # Engine will NOT adopt positions it
+                                          # didn't place. Manual trades stay
+                                          # invisible to the engine. Prevents
+                                          # the "engine inherits a position
+                                          # it never sized" hijack pattern.
 MANUAL_FILLS_POLL_INTERVAL_S  = 8.0     # poll every 8s; ring buffer aligns
                                           # state to actual fill_time so rapid
                                           # scalps under poll-interval still
@@ -525,7 +530,13 @@ SESSION_STOP_PERSIST_BUCKETS_S   = [
 #
 # DEFAULT OFF. Session-1 ships only the math + method definition. Session 2
 # wires it into the cascade. Session 3 flips the flag for live testing.
-BB_PURE_MODE                     = False  # 2026-05-04 PT 19:55: KILLED.
+BB_PURE_MODE                     = True   # 2026-05-07 OVERHAUL: RE-ENABLED
+                                          # as Tier-1 mispricing scalper.
+                                          # Now subject to MAX_RISK_PER_WINDOW
+                                          # cap, MAX_ENTRIES_PER_WINDOW=1,
+                                          # BB_PURE_MIN_SESSION_ELAPSED_S=180,
+                                          # and BB_PURE_MAX_CONTRACTS=5.
+                                          # Historical note (2026-05-04 19:55):
                                           # Backtest verdict: -$0.024/trade.
                                           # The "$42 → $78 today" was a user
                                           # deposit, NOT engine earnings —
@@ -2112,22 +2123,25 @@ DIRECTION_DIST_THRESHOLD_PCT     = 0.0010  # 0.10% from strike (sweet spot
                                            # per OOS: 90.5% win rate)
 DIRECTION_MOMENTUM_THRESHOLD_DOLLARS = 10  # $10 over 5 min minimum
 DIRECTION_MAX_OFFSET_S           = 600     # entry only before minute 10
-DIRECTION_CONTRACTS              = 3       # 2026-05-06 PT: REDUCED from 5.
-                                           # Kalshi 15m ask depth at typical
-                                           # entry prices (14c-70c) is
-                                           # consistently below 5-10ct.
-                                           # 35+ fires at slip=1c at 70c
-                                           # produced 0 fills; 5+ fires at
-                                           # slip=1c at 14c produced 0
-                                           # fills. Reducing base size means
-                                           # the conviction multiplier
-                                           # (0.7-2.0x) scales 3ct → up to
-                                           # 6ct on screaming signals — well
-                                           # within typical 15m depth.
-                                           # Trade-off: 40% lower per-trade
-                                           # notional (3 vs 5 base), but
-                                           # fill rate >> 0% which dominates
-                                           # the EV math at any size.
+DIRECTION_CONTRACTS              = 1       # 2026-05-07 PT (afternoon): REDUCED from 2.
+                                           # Continued depth wall observation:
+                                           # 358 NOFILLs / 0 fills in 60 min
+                                           # at base=2 even with slip=5c.
+                                           # Even strong signals (mom=-$155 =
+                                           # 15.5x threshold) couldn't fill
+                                           # at 3ct effective max.
+                                           # Diagnosis: Kalshi 15m offer-side
+                                           # depth is structurally 1-2ct per
+                                           # tier regardless of signal.
+                                           # With base=1 and 1.5x cap, the
+                                           # effective max becomes 1ct which
+                                           # fits virtually any depth.
+                                           # Trade-off: 50% lower per-trade
+                                           # notional but ~100x higher fill
+                                           # rate (target >30% from prior
+                                           # 0.3%). Backtest's 90.5% WR can
+                                           # only manifest if we actually
+                                           # FILL the signals.
 DIRECTION_MIN_BANKROLL_X_COST    = 1.5     # require 1.5×cost in BAL
 DIRECTION_DAILY_LOSS_HALT_FRAC   = 0.20    # halt at -20% from day-start
 DIRECTION_POST_FAIL_COOLDOWN_S   = 5.0     # backoff after place_order fail
@@ -2137,24 +2151,199 @@ DIRECTION_POST_FAIL_COOLDOWN_S   = 5.0     # backoff after place_order fail
 # 0/1 fills in 25 min. Switched back to IOC, but at ask + slippage so
 # we walk through the next depth tier when the ask is thin. 1c on a $0.40
 # entry = 2.5% cost, well below the 5c TP target.
-DIRECTION_TAKER_SLIPPAGE_C       = 3       # 2026-05-06 PT: bumped 2->3
-                                           # alongside the contracts 5->3
-                                           # reduction. Combined: smaller
-                                           # orders + more aggressive cross
-                                           # = much higher fill probability
-                                           # on thin Kalshi 15m books.
-                                           # 3c on a 50c entry = 6% cost,
-                                           # still less than the 5-12c TP
-                                           # offset that drives the strategy
-                                           # economics. (NOTE: _uc() caches
-                                           # config at module-import time,
-                                           # so changing this REQUIRES an
+DIRECTION_TAKER_SLIPPAGE_C       = 5       # 2026-05-07 PT: bumped 3->5.
+                                           # 642+ NOFILLs over 2 days at
+                                           # slip=3c proved Kalshi 15m
+                                           # offer-side depth at +3c is
+                                           # consistently below 4-5ct
+                                           # orders, even at cheap 11c
+                                           # far-from-strike entries
+                                           # (asymmetric 8.1x risk-reward).
+                                           # 5c walks through 2 additional
+                                           # depth tiers. Cost: 5c on a 50c
+                                           # entry = 10% — still less than
+                                           # the +12c TP offset on a
+                                           # winning settlement
+                                           # ($1.00 - 0.50 = $0.50 upside).
+                                           # On a 30c entry: 5c = 16.7% but
+                                           # upside is $0.70 = 14x cost.
+                                           # (NOTE: _uc() caches config at
+                                           # module-import time, so
+                                           # changing this REQUIRES an
                                            # engine restart to take effect.)
 # Legacy maker-mode knobs retained for rollback (currently inactive —
 # fire path uses IOC at ask+slippage, not post_only at ask-offset).
 # The pending-order state machine is dead code while in IOC mode.
 DIRECTION_MAKER_TIMEOUT_S        = 60.0    # only used if maker mode resurrected
 DIRECTION_MAKER_OFFSET_C         = 1       # only used if maker mode resurrected
+
+# ── DIRECTION EXIT LAYER (Option B, 2026-05-07) ───────────────────────────
+# Lightweight active-management layer running on top of the hold-to-settle
+# DIRECTION strategy. Five exit conditions evaluated each tick once a
+# DIRECTION position is open:
+#   A) Wall consumption — if opposing-side aggressors push ≥30ct/s for 3s+
+#      AND we're profitable, sell at bid (avoid getting flipped)
+#   B) Time-scaled trailing stop — track HWM of contract bid during hold;
+#      sell if drawdown from HWM exceeds phase trail and we're profitable
+#   C) Profit lock at near-certainty — if bid ≥ 90c, hold to expiry
+#      (settlement pays $1.00 vs selling at 90c is +10c better)
+#   D) Loss cut — if unrealized loss exceeds DIRECTION_MAX_LOSS_C, sell
+#   E) Pre-expiry — with < 90s remaining AND profitable, sell at bid
+#
+# Disable by setting DIRECTION_EXIT_ENABLED = False (reverts to pure
+# hold-to-expiry).
+DIRECTION_EXIT_ENABLED          = True    # master switch for exit layer
+DIRECTION_TRAIL_PHASE1_C        = 15      # minutes 0-5 since fill (wide)
+DIRECTION_TRAIL_PHASE2_C        = 8       # minutes 5-10 since fill
+DIRECTION_TRAIL_PHASE3_C        = 5       # minutes 10-13 since fill
+DIRECTION_TRAIL_PHASE4_C        = 3       # last 2 min of session
+DIRECTION_MAX_LOSS_C            = 20      # max unrealized loss per ct (cents)
+DIRECTION_NEAR_CERTAIN_C        = 90      # bid >= this -> hold for $1 settle
+DIRECTION_PRE_EXPIRY_S          = 90      # seconds to expiry trigger
+DIRECTION_WALL_EXIT_ENABLED     = True    # rule A toggle
+DIRECTION_WALL_RATE_CTPS        = 30      # opposing aggression ct/s threshold
+DIRECTION_WALL_WINDOW_S         = 3.0     # rolling tape window for wall check
+
+# ── UNIFIED SCORER (Phase 4 wiring, 2026-05-07) ──────────────────────────
+# Single-EV decision module that replaces the rigid tier cascade with a
+# weighted blend of every signal the engine already computes. Backtest
+# preset: momentum-heavy weights + strict gates (71.5% WR, +$313 corpus).
+#
+# When UNIFIED_SCORER_ENABLED=True:
+#   - The unified scorer fires BEFORE the existing DIRECTION/BB_PURE cascade.
+#   - On a fill, position state lives on self._direction_position so the
+#     DIRECTION exit layer (trail / wall / loss-cut / pre-expiry) applies.
+#   - DIRECTION still runs as a fallback if the scorer declines.
+#   - BB_PURE evaluation is skipped (the unified scorer subsumes its math).
+#   - PENNY_MODE still runs if both unified and DIRECTION decline.
+#
+# All orders use IOC taker (post_only=False) — same execution model as
+# the DIRECTION fix on 2026-05-06. Maker mode = adverse selection on
+# momentum strategies.
+UNIFIED_SCORER_ENABLED       = True
+UNIFIED_MIN_EV_C             = 3      # 2026-05-07 PT (afternoon): loosened
+                                       # 5 → 3 (the backtest default).
+                                       # The "strict" preset (5c/0.30) had
+                                       # 71.5% WR but UNIFIED has fired 0
+                                       # times in 1+ hour live — too strict
+                                       # to extract any edge. Backtest-
+                                       # default (3c/0.25) had 67% WR but
+                                       # ~5x more fires; throughput >>>
+                                       # marginal WR.
+UNIFIED_MIN_CONFIDENCE       = 0.25   # 2026-05-07 PT (afternoon): loosened
+                                       # 0.30 → 0.25 (matches above).
+UNIFIED_MIN_SECONDS          = 90     # don't fire inside the 90s pre-expiry
+                                       # cliff — the DIRECTION pre-expiry
+                                       # exit layer owns anything tighter
+UNIFIED_MAX_CONTRACTS        = 5
+UNIFIED_KELLY_CAP_FRAC       = 0.10   # cap Kelly fraction at 10% of bankroll
+UNIFIED_MIN_BANKROLL_X_COST  = 1.5    # require 1.5×cost in BAL (mirrors
+                                       # DIRECTION_MIN_BANKROLL_X_COST)
+UNIFIED_TAKER_SLIPPAGE_C     = 5      # IOC at ask + 5c (mirrors DIRECTION
+                                       # post-fix value, walks 2 depth tiers)
+UNIFIED_POST_FAIL_COOLDOWN_S = 5.0    # backoff after place_order rejection
+UNIFIED_NOFILL_COOLDOWN_S    = 30.0   # cooldown after IOC NOFILL
+# Momentum-heavy + strict-gates weights (best backtest result).
+# Sum should equal 1.0; the scorer normalizes anyway when signals are
+# missing.
+UNIFIED_WEIGHTS = {
+    "bb_mispricing":    0.15,   # was 0.25 (default)
+    "btc_momentum":     0.35,   # was 0.20 — momentum-heavy
+    "kalshi_lag":       0.15,
+    "book_imbalance":   0.10,
+    "taker_flow":       0.10,
+    "ta_composite":     0.08,
+    "session_timing":   0.07,
+    "wall_consumption": 0.05,
+}
+# Use the existing universal cap (MAX_RISK_PER_WINDOW_DOLLARS) — no
+# scorer-specific dollar cap needed.
+
+# ── PHASE 2 (2026-05-07 OVERHAUL) — DIRECTION fill-quality fixes ──────────
+# Replaces 5s blanket NOFILL cooldown with: 30s + ask-changed-≥2c gate.
+# Adds pre-fire depth check + adaptive slippage.
+DIRECTION_NOFILL_COOLDOWN_S          = 30.0  # was 5s. After IOC NOFILL,
+                                              # 30s cooldown PLUS require the
+                                              # ask to have moved by ≥
+                                              # NOFILL_REQUIRE_ASK_DELTA_C
+                                              # before re-attempting.
+DIRECTION_NOFILL_REQUIRE_ASK_DELTA_C = 2     # ask must move ≥ this many
+                                              # cents for a re-attempt after
+                                              # NOFILL (in addition to the
+                                              # cooldown timer).
+DIRECTION_DEPTH_CHECK_ENABLED        = True  # pre-IOC, scan opposite-side
+                                              # bid book at our ask price;
+                                              # skip if visible depth <
+                                              # contracts needed.
+DIRECTION_ADAPTIVE_SLIP_ENABLED      = True  # compute slippage required to
+                                              # consume contracts of depth,
+                                              # capped at MAX_SLIP_C.
+DIRECTION_MAX_SLIP_C                 = 12    # 2026-05-07 PT (afternoon):
+                                              # raised 8 → 12. On thin Kalshi
+                                              # 15m books, +12c is still
+                                              # positive EV against $0.50
+                                              # binary upside (24% slippage
+                                              # cost vs 50c expected payoff
+                                              # on win). Adaptive walker
+                                              # picks the minimum slip
+                                              # required to consume depth,
+                                              # so we don't always pay 12c
+                                              # — only when depth is deep.
+DIRECTION_HALT_LOG_THROTTLE_S        = 60.0  # rate-limit DAILY-LOSS-HALT log
+                                              # (log once, then suppress for
+                                              # this many seconds).
+
+# ── PHASE 1 (2026-05-07 OVERHAUL) — UNIVERSAL SAFETY LAYER ───────────────
+# Hard cap on per-window risk across ALL strategies (DIRECTION / BB_PURE /
+# PENNY). Prevents the 156x incident pattern where stacked entries blow
+# through the intended position size. Checked PRE-fire — order is rejected
+# if entry_cost + already-committed-this-window > cap.
+MAX_RISK_PER_WINDOW_DOLLARS  = 15.0  # all strategies combined per window
+# Hard 1-entry-per-window cap (cross-ticker, cross-strategy). After ANY
+# fill in a window, block all further entries until window flip. Belt-and-
+# suspenders alongside the per-ticker session lock.
+MAX_ENTRIES_PER_WINDOW       = 1
+
+# ── PHASE 3 (2026-05-07 OVERHAUL) — BB_PURE re-enable with fixes ─────────
+# Re-enabling BB_PURE_MODE (above): the exit infrastructure (TP taker-
+# convert, pre-expiry taker, MRC, wall consumption, S/R cap, Kalshi lag)
+# was designed for this strategy.
+BB_PURE_MIN_SESSION_ELAPSED_S    = 180.0   # archetype-1 timing fix: BB_PURE
+                                            # may EVALUATE from minute 0 but
+                                            # only FIRES after 3 minutes of
+                                            # price action have developed.
+BB_PURE_MAX_CONTRACTS            = 5       # absolute ceiling on Kelly-sized
+                                            # BB_PURE entries. Independent of
+                                            # DIRECTION's 2ct sizing.
+
+# ── PHASE 4 (2026-05-07 OVERHAUL) — PENNY_MODE asymmetric hunter ─────────
+# Lightweight Tier-3 strategy. Activates ONLY when both BB_PURE and
+# DIRECTION decline the current window. Buys ≤ 8c contracts, holds to
+# expiry, no TP, no exit management. Max risk per fire is bounded.
+PENNY_MODE_ENABLED          = True
+PENNY_MAX_PRICE_C           = 12    # 2026-05-07 PT (afternoon): raised
+                                     # 8 → 12. Entries at 9-12c have nearly-
+                                     # identical asymmetric payoff to 7-8c
+                                     # (cost +$0.04, payout still $0.88-0.91).
+                                     # More fire opportunities for the same
+                                     # risk profile.
+PENNY_MIN_PRICE_C           = 3     # don't fire on pure-dust 1-2c contracts
+PENNY_MAX_CONTRACTS         = 10    # cap per fire
+PENNY_MIN_CONTRACTS         = 5     # if depth < this, skip
+PENNY_MAX_RISK_DOLLARS      = 1.0   # absolute risk ceiling per fire (cap
+                                     # is contracts × price ≤ this in $)
+PENNY_MIN_SESSION_ELAPSED_S = 60.0  # let book settle slightly before
+                                     # PENNY fires (avoid first-tick noise)
+PENNY_MAX_OFFSET_S          = 720   # don't fire in last 3 minutes (settle
+                                     # cliff makes the position uncovered)
+PENNY_DAILY_LOSS_HALT_FRAC  = 0.20  # 2026-05-07 PT (afternoon): NEW.
+                                     # Parity with DIRECTION_DAILY_LOSS_
+                                     # HALT_FRAC. Halts PENNY firing for
+                                     # the rest of the day if BAL drops
+                                     # to day_start × (1 - this). Bounded
+                                     # damage already capped at $1/trade
+                                     # but a string of losses w/o halt
+                                     # could drain meaningful capital.
 
 # Tier sizing fractions (Level 3 — Half-Kelly, OOS-validated)
 FVG_TIER_FRAC_T1                 = 0.35

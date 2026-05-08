@@ -1,152 +1,174 @@
 # BTC Bias Engine — Current System Reference
 
-**Last updated**: 2026-05-06 (DIRECTION refactor + improvements)
+**Last updated**: 2026-05-07 (multi-tier overhaul + fill-rate tuning)
 **Entry point**: `run_copy_engine.py` (NSSM service `BTCBiasEngine` on Windows)
-**Live primary signal**: `DIRECTION` (sign-aligned distance + momentum, hold to settlement)
-**Status**: SERVICE_RUNNING. BAL $78.73. FLAT, 0 resting orders.
+**Live tiers (cascade order)**: `UNIFIED` → `DIRECTION` → `BB_PURE` (gated off when UNIFIED on) → `PENNY_MODE`
+**Status**: Multi-tier architecture with universal safety layer. Active exit management on all DIRECTION-class fills.
 
-> **For the AI agent inheriting this session**: as of 2026-05-06 PT, the
-> live primary signal is **direction-following with conviction sizing**:
-> when BTC is ≥0.10% past strike with 5-min momentum agreeing, buy that
-> side at ask + slippage (IOC taker) and hold to settlement.
-> - Pure module: `direction_strategy.py` (decision + conviction multiplier)
-> - Engine handler: `_direction_tick` in `polymarket_copy_engine.py`
-> - **Position state: `self._direction_position` (NOT `self._open_position`)** —
->   this is the architectural fix. Legacy exit paths (VWAP_EXIT,
->   PROB_COLLAPSE, MRC_FORCE_EXIT, DOMINANT_UPGRADE, etc.) all gate on
->   `_open_position is not None` so they auto-skip. Prevents the 4
->   hijack incidents that plagued the first deploy attempts.
+> **For the AI agent inheriting this session**: as of 2026-05-07 PT, the
+> engine runs **four entry tiers** in cascade with a universal $15/window
+> risk cap and 1-entry-per-window count cap. All fills route through the
+> same exit layer (5 rules: hold-certain, wall-exit, trail-exit, loss-cut,
+> pre-expiry). DIRECTION's "holds to settlement" promise is **NO LONGER
+> ACCURATE** — the exit layer is active by default.
 >
-> **Backtest evidence** (scripts/backtest_strategy_comparison.py, n=197):
-> DIRECTION 0.10%/$10 confirmed highest-alpha strategy:
-> 90.5% win rate / +$3.93 mean per trade / +$331 corpus / 1.1% top-win-skew
-> (extremely robust). Other variants (cheap-underdog, mean-reversion,
-> BB-model-edge, momentum-only) ranked lower by alpha density and total $.
+> - Pure modules: `direction_strategy.py`, `unified_scorer.py`
+> - Engine handlers: `_unified_tick`, `_direction_tick`, `_evaluate_bb_pure_signal`,
+>   `_evaluate_penny_signal`, `_direction_manage_exit`
+> - **Position state**: `self._direction_position` for ALL tiers
+>   (DIRECTION + UNIFIED + PENNY all use it; BB_PURE uses
+>   `self._open_position`). The `tier` field distinguishes them.
+> - **Universal safety**: `_check_window_safety()` + `_record_window_fill()`
+>   wrapped around every place_order in every tier
 >
-> **Sizing:** `DIRECTION_CONTRACTS=3` base × `conviction_multiplier`
-> (0.7-2.0×) → 3-6ct per fire. Smaller than original `5` because
-> Kalshi 15m ask depth at typical entry prices (14c-70c) is consistently
-> below 5-10ct. Multiplier saturates at 2.0× on dist≥0.20% AND mom≥$40.
->
-> **Execution:** IOC at `ask + DIRECTION_TAKER_SLIPPAGE_C` (default 3c).
-> Walks through 1-2 depth tiers when ask is thin. Hold-to-settlement:
-> Kalshi auto-credits $1 per winning contract at expiry; engine places
-> NO exit orders.
->
-> **Today's lessons (2026-05-05 to 2026-05-06):**
-> 1. FVG-tier (`PAPER_FVG_LIVE_MODE`) had FLAT-CONFIRMED bug + stale-cache
->    premature-close → -19% loss → permanently disabled, do not re-enable
->    without re-validation
-> 2. DIRECTION via `_open_position` was hijacked 4 times by legacy exit
->    paths (SYNC_RECLAIM, VWAP_EXIT, DOMINANT_UPGRADE, etc.) — fixed by
->    refactoring to `self._direction_position` (commit `cc07690`)
-> 3. **`_uc()` caches config at module import** — config changes require
->    engine restart. Don't trust "no restart needed" claims unless you've
->    verified `_uc` re-reads the user_config module.
-> 4. Maker-mode (`post_only=True` at ask-1) is wrong for momentum
->    strategies — only fills on reversal = adverse selection. IOC with
->    slippage tolerance is the right execution model.
+> **Today's lessons (2026-05-07)**:
+> 1. Manual user trading at 12:02 PT (308ct YES @ 22c) crashed BAL to
+>    $6.22 — engine's DIRECTION_DAILY_LOSS_HALT engaged correctly at
+>    11:54:45. Position settled YES → +$236 → BAL recovered to $79.72.
+> 2. `MANUAL_FILLS_CAPTURE_ENABLED = False` — engine no longer adopts
+>    manual trades into state. Manual trades stay invisible to engine.
+> 3. Confirm-with-2nd-fetch BAL protocol: Kalshi shows transient low
+>    BAL during settlement (07:52 case: $11.29 → $84.79 in 90s). Always
+>    confirm a catastrophic BAL drop with a 2nd fetch ~10s later before
+>    stopping engine.
+> 4. Depth wall is structural at 1-2ct per Kalshi 15m offer-side tier.
+>    Solution: `DIRECTION_CONTRACTS=1` (effective max 1ct after multiplier
+>    cap of 1.5x). Trade-off: 50% smaller per-trade $ but ~100x higher
+>    fill rate.
 
-This document is the operator-facing source of truth. **If this doc and code disagree, the code wins.** Update this doc whenever signal logic or config defaults materially change.
+This document is the operator-facing source of truth. **If this doc and
+code disagree, the code wins.** Update this doc whenever signal logic or
+config defaults materially change.
 
-> **Setting up the engine on a new machine?** See [`docs/NEW_INSTANCE_SETUP.md`](docs/NEW_INSTANCE_SETUP.md) for the clean-install walkthrough (clone → venv → credentials → NSSM → smoke test → flip-to-live checklist).
+> **Setting up the engine on a new machine?** See [`docs/NEW_INSTANCE_SETUP.md`](docs/NEW_INSTANCE_SETUP.md)
 
 ---
 
 ## What the engine does
 
-Trades Kalshi `KXBTC15M` 15-minute BTC binary options.
-
-**Single live strategy: direction-following.** Buy whichever side BTC is
-moving when it's meaningfully past strike with momentum agreeing. Hold
-to settlement. The exit IS the settlement — Kalshi auto-credits $1.00
-per contract to balance if the direction was right, $0 otherwise.
+Trades Kalshi `KXBTC15M` 15-minute BTC binary options through 4 entry
+tiers, each with its own thesis. Universal $15/window risk cap +
+1-entry-per-window count cap means **only one tier fills per window**.
 
 ```
-[1] Inputs (every tick)
-    - btc_price        from price_feed (_btc_last_price)
-    - strike           from prob_engine.strike (parsed from ticker)
-    - btc_5m_move      from tape_pressure.btc_move_300s
-    - book.best_yes_ask / best_no_ask  from kalshi_ws
-
-[2] Decision (direction_strategy.evaluate)
-    - dist_pct = (btc - strike) / strike
-    - YES: dist_pct >= +0.10% AND btc_5m_move >= +$10
-    - NO:  dist_pct <= -0.10% AND btc_5m_move <= -$10
-    - else: skip
-
-[3] Pre-fire gates
-    - Per-window ticker lock: skip if already entered this 15-min window
-    - Entry-time cap: skip if session_age >= 600s (minute 10)
-    - Daily-loss halt: skip if bal < day_start × (1 - 0.20)
-    - Bankroll: require bal >= 1.5× cost (avoid insufficient_balance on retry)
-    - Post-failure cooldown: 5s per-ticker after any place_order rejection
-
-[4] EXECUTION
-    - Pre-await: add ticker lock, stamp recent_placement_tickers
-    - place_order(action="buy", side=signal.side, price=ask,
-                  count=DIRECTION_CONTRACTS, post_only=False,
-                  time_in_force="immediate_or_cancel")
-    - IOC ensures: fill at ask if depth available, else auto-cancel.
-      No stale resting orders, no maker bag-holds.
-    - On exception: release ticker lock + cooldown timer (lock-release)
-    - On filled=0: IOC cancelled. Release lock + cooldown for retry.
-    - On filled>0: log + persist row in direction_trades. NO post-entry
-      tracking — position settles at expiry, Kalshi handles it.
+[ tick cycle ]  
+   │
+   ├─ _unified_tick()           ← Tier 0: composite 8-component scorer
+   │                              (bb_mispricing+momentum+lag+book+
+   │                               taker_flow+ta+timing+wall)
+   │                              Strict gates: ev≥3c, conf≥0.25
+   │
+   ├─ _direction_tick()         ← Tier 1: dist≥0.10% + mom≥$10 momentum
+   │                              IOC at ask+slip (adaptive, max 12c)
+   │
+   ├─ _evaluate_bb_pure_signal  ← Tier 2: BB-fair-value mispricing scalper
+   │                              (gated off when UNIFIED enabled)
+   │
+   └─ _evaluate_penny_signal()  ← Tier 3: ≤12c asymmetric long-tail bets
+                                  (when 1+2+3 all decline)
 ```
 
-The microstructure / regime / SR / wallet-copy / TA-cascade / FVG-tier
-layers exist in the codebase but are all feature-flagged off. The
-direction path is self-contained: only uses existing engine primitives
-for ticker lock + balance check + book read + place_order.
+After fill, **`_direction_manage_exit()`** runs every tick on
+`self._direction_position`, evaluating in order:
 
-**Why no exit logic:** Kalshi binary contracts settle at $0.00 or $1.00
-at expiry. Our position is bought via IOC at the ask, then held. At
-settlement, balance is auto-credited by Kalshi. No FLAT-CONFIRMED, no
-SYNC RECLAIM, no residual reconciler needed because no exit orders are
-placed. The only safety primitive needed is the per-window ticker lock.
+1. **C HOLD-CERTAIN**: bid ≥ 90c → hold for $1 settlement
+2. **A WALL-EXIT**: opposing aggressor ≥30ct/s for 3s (if profitable)
+3. **B TRAIL-EXIT**: phase-gated trailing stop on hwm_bid:
+   - 0-5m  → 15c trail
+   - 5-10m → 8c trail
+   - 10-13m → 5c trail
+   - 13m+ or ≤120s left → 3c trail
+4. **D LOSS-CUT**: unrealized loss ≥ 20c/contract → sell
+5. **E PRE-EXPIRY**: profitable + ≤90s left → sell
+
+Sells go through `_place_capped_side_sell` (MIN-TRUTH + OVERSELL-GUARD).
+
+**Settlement remains the fallback**: if no exit rule fires, Kalshi
+auto-credits $1 per winning contract at expiry. But active exits trigger
+on the vast majority of profitable trades now.
 
 ---
 
-## Critical config (live values)
+## Critical config (live values, post 2026-05-07 afternoon tuning)
 
 ```python
 # Live trading
 PAPER_TRADING                        = False
+MANUAL_FILLS_CAPTURE_ENABLED         = False  # engine ignores manual trades
 
-# DIRECTION-FOLLOWING (PRIMARY LIVE SIGNAL — 2026-05-06 final)
-DIRECTION_STRATEGY_ENABLED           = True    # PRIMARY
+# UNIVERSAL SAFETY LAYER (Phase 1, 2026-05-07)
+MAX_RISK_PER_WINDOW_DOLLARS          = 15.0   # cap across ALL tiers
+MAX_ENTRIES_PER_WINDOW               = 1      # one fill cross-tier per window
+
+# UNIFIED SCORER (Tier 0, primary entry path)
+UNIFIED_SCORER_ENABLED               = True
+UNIFIED_MIN_EV_C                     = 3      # was 5; loosened for fire rate
+UNIFIED_MIN_CONFIDENCE               = 0.25   # was 0.30; loosened
+UNIFIED_MIN_SECONDS                  = 90
+UNIFIED_MAX_CONTRACTS                = 5
+UNIFIED_KELLY_CAP_FRAC               = 0.10
+UNIFIED_TAKER_SLIPPAGE_C             = 5
+UNIFIED_WEIGHTS = {
+    "bb_mispricing":    0.15,
+    "btc_momentum":     0.35,    # momentum-heavy preset
+    "kalshi_lag":       0.15,
+    "book_imbalance":   0.10,
+    "taker_flow":       0.10,
+    "ta_composite":     0.08,
+    "session_timing":   0.07,
+    "wall_consumption": 0.05,
+}
+
+# DIRECTION (Tier 1, momentum)
+DIRECTION_STRATEGY_ENABLED           = True
 DIRECTION_DIST_THRESHOLD_PCT         = 0.0010  # 0.10% from strike
-DIRECTION_MOMENTUM_THRESHOLD_DOLLARS = 10      # $10 over 5min
-DIRECTION_MAX_OFFSET_S               = 600     # entry only before minute 10
-DIRECTION_CONTRACTS                  = 3       # base size (was 5; reduced
-                                               # 2026-05-06 to match shallow
-                                               # Kalshi 15m ask depth)
-DIRECTION_CONVICTION_SIZING_ENABLED  = True    # apply 0.7-2.0× multiplier
-DIRECTION_MIN_BANKROLL_X_COST        = 1.5     # need 1.5×cost in BAL
-DIRECTION_DAILY_LOSS_HALT_FRAC       = 0.20    # halt at -20% from day-start
-DIRECTION_POST_FAIL_COOLDOWN_S       = 5.0     # backoff after place_order fail
-DIRECTION_TAKER_SLIPPAGE_C           = 3       # IOC at ask + 3c (walk depth)
-                                               # NOTE: changing this REQUIRES
-                                               # engine restart (_uc caches
-                                               # config at module import).
+DIRECTION_MOMENTUM_THRESHOLD_DOLLARS = 10
+DIRECTION_MAX_OFFSET_S               = 600
+DIRECTION_CONTRACTS                  = 1       # was 2; reduced to fit depth
+DIRECTION_CONVICTION_SIZING_ENABLED  = True    # 0.7-1.5x multiplier
+DIRECTION_TAKER_SLIPPAGE_C           = 5       # IOC at ask+5c
+DIRECTION_MAX_SLIP_C                 = 12      # was 8; adaptive ceiling
+DIRECTION_DEPTH_CHECK_ENABLED        = True    # pre-IOC depth scan
+DIRECTION_ADAPTIVE_SLIP_ENABLED      = True
+DIRECTION_NOFILL_COOLDOWN_S          = 30.0    # was 5s
+DIRECTION_NOFILL_REQUIRE_ASK_DELTA_C = 2
+DIRECTION_DAILY_LOSS_HALT_FRAC       = 0.20
+DIRECTION_HALT_LOG_THROTTLE_S        = 60.0
+
+# DIRECTION exit layer (replaces hold-to-settlement)
+DIRECTION_EXIT_ENABLED               = True
+DIRECTION_TRAIL_PHASE1_C             = 15      # 0-5m
+DIRECTION_TRAIL_PHASE2_C             = 8       # 5-10m
+DIRECTION_TRAIL_PHASE3_C             = 5       # 10-13m
+DIRECTION_TRAIL_PHASE4_C             = 3       # 13m+ / ≤120s left
+DIRECTION_MAX_LOSS_C                 = 20
+DIRECTION_NEAR_CERTAIN_C             = 90
+DIRECTION_PRE_EXPIRY_S               = 90
+DIRECTION_WALL_EXIT_ENABLED          = True
+DIRECTION_WALL_RATE_CTPS             = 30
+DIRECTION_WALL_WINDOW_S              = 3.0
+
+# BB_PURE (Tier 2, gated off when UNIFIED on)
+BB_PURE_MODE                         = True    # re-enabled 2026-05-07
+BB_PURE_MIN_SESSION_ELAPSED_S        = 180.0   # 3-min warmup
+BB_PURE_MAX_CONTRACTS                = 5
+
+# PENNY_MODE (Tier 3, asymmetric ≤12c)
+PENNY_MODE_ENABLED                   = True
+PENNY_MAX_PRICE_C                    = 12      # was 8
+PENNY_MIN_PRICE_C                    = 3
+PENNY_MAX_CONTRACTS                  = 10
+PENNY_MIN_CONTRACTS                  = 5
+PENNY_MAX_RISK_DOLLARS               = 1.0
+PENNY_DAILY_LOSS_HALT_FRAC           = 0.20    # 2026-05-07 PT NEW: parity
+                                                # with DIRECTION
 
 # Per-window ticker lock — INVIOLABLE
 MAX_TRADES_PER_SESSION_TICKER        = 1
-
-# Safety hardening
-SAFETY_OVERSELL_HARDENING            = True     # belt-and-braces (no exits placed
-                                                # by direction strategy, but the
-                                                # primitive defends if any ever
-                                                # are added)
+SAFETY_OVERSELL_HARDENING            = True
 
 # DISABLED / RETIRED (do NOT re-enable without explicit user direction)
-PAPER_FVG_LIVE_MODE                  = False   # 2026-05-05 06:27 PT EMERGENCY
-                                               # DISABLE: stale-cache premature-
-                                               # close + SYNC RECLAIM bug. See
-                                               # to-do/LIVE_SESSION_NOTES_2026_05_02.md
-BB_PURE_MODE                         = False   # killed 2026-05-04 19:55
-BB_MOMENTUM_ENABLED                  = False   # killed 2026-05-05 (user: FVG only)
+PAPER_FVG_LIVE_MODE                  = False  # 2026-05-05 catastrophe
 TA_FORCED_ENTRY_ENABLED              = False
 SR_FADE_ENABLED                      = False
 SNIPER_ENABLED                       = False
@@ -156,6 +178,7 @@ WALLET_COPY_ENABLED                  = False
 ATM_REVERSION_ENABLED                = False
 ARB_DETECTOR_ENABLED                 = False
 MICRO_PULLBACK_ENABLED               = False
+BB_MOMENTUM_ENABLED                  = False
 ```
 
 ---
@@ -164,52 +187,55 @@ MICRO_PULLBACK_ENABLED               = False
 
 ### 1. `_uc()` caches user_config at module import
 
-The `_uc(name, default)` function (`polymarket_copy_engine.py:105`) reads
-from a `_user_cfg` dict that is built **once** when the engine starts:
+The `_uc(name, default)` function reads from `_user_cfg`, built **once**
+when the engine starts. **Editing `user_config.py` while the engine is
+running has NO effect** until `nssm restart BTCBiasEngine`.
 
-```python
-_user_cfg = {k: v for k, v in vars(_uc).items() if not k.startswith("_")}
-```
+### 2. Multi-tier position state on `self._direction_position`
 
-**Implication:** editing `user_config.py` while the engine is running has
-**NO effect** until the engine is restarted. Don't trust any "no restart
-needed" claim unless the consuming code path explicitly re-reads the
-file.
+DIRECTION, UNIFIED, and PENNY fills **all** populate
+`self._direction_position` (with the `tier` field distinguishing them).
+BB_PURE fills go on `self._open_position`.
 
-To apply a config change:
-```powershell
-# 1. Edit user_config.py
-# 2. Save
-# 3. Restart:
-nssm restart BTCBiasEngine
-# 4. Verify the new value is in the next FIRE log line
-```
+The exit layer (`_direction_manage_exit`) treats all three uniformly —
+trailing stop, wall exit, loss cut, pre-expiry, hold-certain all apply
+regardless of tier.
 
-### 2. DIRECTION uses `self._direction_position`, NOT `self._open_position`
+Legacy exit paths gate on `self._open_position is not None` and
+auto-skip DIRECTION-class fills. `SYNC_RECLAIM` and `ORPHAN_FLATTEN`
+consult `self._direction_active_tickers` (added via `_add_direction_active`).
 
-Every BB_PURE/TA_FORCED-era exit path in the engine (~20 of them inside
-`_manage_position`, plus `VWAP_EXIT`, `MRC_FORCE_EXIT`,
-`DOMINANT_UPGRADE`, etc.) gates on `self._open_position is not None`. If
-DIRECTION fills populated `_open_position`, those paths see it and apply
-the wrong exit logic — we hit this 4 times in 2 days (commits before
-`cc07690`).
+### 3. Active exit management — NOT pure hold-to-settlement
 
-Fix: DIRECTION fills set `self._direction_position` (a separate
-attribute). `_open_position` stays `None` for DIRECTION trades. Legacy
-exit paths skip them by construction.
+**Pre-2026-05-07**: DIRECTION held to settlement, no exit orders.
+**Post-2026-05-07**: DIRECTION_EXIT_ENABLED=True applies 5 rules every
+tick. Most profitable trades close via Rule B (trailing stop) before
+expiry. The "SELL TIER FILLED" log line means Rule B fired.
 
-The only paths that scan Kalshi truth independent of `_open_position`
-are `SYNC_RECLAIM` and `ORPHAN_FLATTEN`. Both consult
-`self._direction_active_tickers` and skip DIRECTION-tier tickers.
+To revert to pure hold-to-settlement: `DIRECTION_EXIT_ENABLED=False` +
+restart.
 
-**If a DIRECTION fill appears in `_open_position`, something is broken
-upstream.** Don't add a guard — fix the upstream code path.
+### 4. Manual trades are invisible to engine state
 
-### 3. Maker-mode (`post_only=True` at ask-1) is a fail for momentum strategies
+`MANUAL_FILLS_CAPTURE_ENABLED=False` — the manual-fills poller still
+LOGS user trades from the Kalshi UI but does NOT add them to
+`self._direction_position` or any tier's state. This means:
+- User can manually trade alongside engine without conflict
+- Engine BAL checks may briefly read low during user's settlement
+  collateral periods (use confirm-with-2nd-fetch BAL protocol)
 
-Tested 2026-05-06 18:00-18:25 PT. Maker bids only fill when the market
-reverses toward our price = adverse selection. Don't try maker mode on
-DIRECTION; use IOC at `ask + slippage`.
+### 5. Race condition in IOC fills
+
+By the time a 50ms-old book read becomes an actual order, the offer
+side may have been swept. NOFILLs at slip=5c often mean "depth was
+there 50ms ago, gone now" — not "no offer in price range." Solution:
+`DIRECTION_MAX_SLIP_C=12` for adaptive walking captures more cases.
+
+### 6. Maker-mode is wrong for momentum strategies
+
+Tested 2026-05-06: maker bids only fill when market reverses =
+adverse selection. All entry tiers use IOC (`post_only=False`,
+`time_in_force=immediate_or_cancel`) at ask + slippage.
 
 ---
 
@@ -217,53 +243,28 @@ DIRECTION; use IOC at `ask + slippage`.
 
 ### Core runtime (always)
 
-- `run_copy_engine.py` — entry point, credential bootstrap
-- `polymarket_copy_engine.py` — main engine. The DIRECTION live path is in
-  `_direction_tick`. The FVG-tier path (now off) is in `_paper_fvg_tick`
-  + `_paper_fvg_live_entry` etc.
-- `user_config.py` — live config switchboard (DIRECTION knobs at line ~2060,
-  FVG knobs at ~2015 but disabled)
-- `direction_strategy.py` — pure module: direction-following decision math.
-  All logic is unit-testable here.
-- `_fvg_tiering.py` — pure module: legacy FVG tier classification (still
-  imported by `_paper_fvg_tick` paper-sim path).
-- `kalshi_client.py` — RSA-PSS signed REST client
-- `kalshi_ws.py` — WebSocket client for orderbook/trades
-- `kalshi_tape.py` — per-ticker rolling tape of trades + mids
-- `tape_pressure.py` — pressure scoring; provides `btc_move_300s` for the
-  direction strategy
-- `price_feed.py` — Binance/Coinbase ingestion + Brownian-Bridge model (`prob_engine`).
-  Provides `prob_engine.strike` for the direction strategy.
-- `signal_logger.py` — async SQLite writer (data/trades.db, data/signals.db)
+- `run_copy_engine.py` — entry point
+- `polymarket_copy_engine.py` — main engine. Tier handlers:
+  `_unified_tick`, `_direction_tick`, `_evaluate_bb_pure_signal`,
+  `_evaluate_penny_signal`. Exit layer: `_direction_manage_exit`.
+  Safety helpers: `_check_window_safety`, `_record_window_fill`.
+- `user_config.py` — live config switchboard
+- `direction_strategy.py` — pure decision math for DIRECTION
+- `unified_scorer.py` — pure 8-component composite scorer
+- `kalshi_client.py` — RSA-PSS REST client
+- `kalshi_ws.py` — WebSocket orderbook + trades
+- `kalshi_tape.py` — per-ticker rolling tape
+- `tape_pressure.py` — pressure scoring + btc_move_300s
+- `price_feed.py` — Binance/Coinbase + Brownian-Bridge prob_engine
+- `signal_logger.py` — async SQLite writer
 
 ### Validation + analytics
 
-- `tests/test_direction_strategy.py` — 25 unit tests pinning every decision
-  boundary (YES/NO sides, dist + momentum thresholds, sign-mismatch refusals,
-  invalid inputs, sizing, daily-loss halt)
-- `scripts/backtest_direction.py` — corpus backtest on 197 settled markets,
-  proves the 69-90% win rate and +$2-4/trade economics
-- `scripts/backtest_cheap_trail.py` + `backtest_cheap_trail_deep.py` —
-  alternative-strategy backtests (cheap-side + trailing TP) showing this
-  approach is inferior to direction-following
-- `tests/test_fvg_tiering.py` (23 tests) + `tests/test_fvg_live_wiring.py`
-  (10 tests) — preserved for the now-disabled FVG path
-
-### Background workers
-
-- `whale_monitor.py` — mempool whale alerts (logs only, no trading influence)
-
-### Optional / not on live path
-
-- `paper_trader.py` — used when `PAPER_TRADING=True` (mirrors KalshiClient)
-- `bb_pure.py`, `tape_pressure.py`, `protective_math.py`, `sell_safety.py` —
-  legacy BB_PURE supporting modules; FVG path uses
-  `_place_capped_side_sell` + `_reconcile_residual_position` directly
-
-### Historical / archival
-
-- `_archive/`, `docs/archive/`, retired strategies (TA_FORCED, SR_FADE,
-  SNIPER, SCALP DCA, wallet copy)
+- `tests/test_direction_strategy.py` — 35 tests for direction module
+- `scripts/backtest_direction.py` — n=197 corpus backtest (90.5% WR claim;
+  see "Known divergence" below)
+- `scripts/backtest_unified_scorer.py` — UNIFIED corpus backtest (71.5% WR)
+- `RESEARCH_KALSHI_STRATEGY_ARCHETYPES.md` — strategy research doc
 
 ---
 
@@ -276,7 +277,6 @@ Get-Content data\engine_history.log -Tail 50 -Wait
 ```
 
 Required env vars (in `credentials/kalshi.env`):
-
 - `KALSHI_API_KEY`
 - `KALSHI_PRIVATE_KEY_PATH`
 - `EXECUTE_TRADES=true`
@@ -288,7 +288,6 @@ Direct Kalshi state check:
 cd /c/Trading/btc-bias-engine && python -c "
 import asyncio, os, sys; sys.path.insert(0, '.')
 from kalshi_client import KalshiClient
-
 async def main():
     with open('credentials/kalshi.env') as f:
         for line in f:
@@ -302,10 +301,6 @@ async def main():
         positions = await c.get_positions()
         flat = all(int(p.get('position',0)) == 0 for p in positions or [])
         print(f'Position: {\"FLAT\" if flat else \"NOT FLAT\"}')
-        for p in positions or []:
-            qty = int(p.get('position', 0))
-            if qty != 0:
-                print(f'  {p.get(\"ticker\")} qty={qty}')
 asyncio.run(main())
 "
 ```
@@ -316,89 +311,90 @@ asyncio.run(main())
 
 | Pattern | Meaning |
 |---|---|
-| `DIRECTION FIRE: YES TICKER Nx @ Mc` | Direction entry placed (IOC) |
-| `DIRECTION FILL: YES Nx @ Mc oid=...` | Entry filled (settles at expiry) |
-| `DIRECTION IOC NOFILL: order=...` | IOC didn't take immediately, auto-cancelled |
-| `DIRECTION DAILY-LOSS-HALT: bal=$X day_start=$Y` | Day P&L hit -20%, halted |
-| `DIRECTION SIZING-REFUSE: bal=$X ask=Nc` | Bankroll < 1.5×cost, skip |
-| `DIRECTION place_order failed: ...` | Order rejection, lock released, 5s cooldown |
-| `DIRECTION: new session day YYYY-MM-DD` | First trade of the day |
-| `CopyEngine RESIDUAL-CLEAN: ...` | Defensive primitive (direction places no exit orders) |
-| `CopyEngine OVERSELL-DETECTED: ...` | 2026-04-22 catastrophe signature (should NEVER fire under DIRECTION) |
-| `SESSION-LOCK: restored N ticker(s)` | Per-window lock loaded from disk on startup |
+| `UNIFIED FIRE: ...` / `UNIFIED FILL: ...` | Tier 0 entry |
+| `UNIFIED DECLINE: side=X score=±N conf=N.NN ev=±Nc` | Tier 0 evaluated, didn't qualify |
+| `DIRECTION FIRE: YES TICKER Nx @ Mc IOC (ask=Mc, slip=Sc)` | Tier 1 entry attempt |
+| `DIRECTION FILL: YES Nx @ Mc oid=...` | Tier 1 entry filled |
+| `DIRECTION IOC NOFILL: ... cooldown=30s + require ask Δ≥2c` | Tier 1 didn't fill |
+| `DIRECTION DEPTH-SKIP: need=Nct, depth@+Mc=Nct` | Pre-IOC depth too shallow |
+| `BB_PURE FIRE: ...` | Tier 2 entry (only when UNIFIED off) |
+| `BB_PURE SIZE-CLAMP: kelly=Nct → cap=5ct` | Kelly sized over BB_PURE_MAX_CONTRACTS |
+| `PENNY FIRE: ... max_risk=$N` | Tier 3 asymmetric entry attempt |
+| `PENNY FILL: ... — holds to settle, no TP` | Tier 3 filled |
+| `PENNY DAILY-LOSS-HALT: ...` | PENNY halted at -20% (NEW 2026-05-07) |
+| `WINDOW-CAP RISK: tier=X cost=$N + committed=$N > cap` | $15 cap enforced |
+| `WINDOW-CAP ENTRY: tier=X already entered N/M` | 1-per-window cap enforced |
+| `WINDOW-CAP UPDATE: tier=X +Nct@Mc=$N` | Post-fill counter update |
+| `DIRECTION HOLD-CERTAIN: bid=Nc ≥ 90c` | Exit Rule C active |
+| `DIRECTION WALL-EXIT: ...` | Exit Rule A fired |
+| `DIRECTION TRAIL-EXIT: hwm=Xc bid=Yc trail=Zc phase=N` | Exit Rule B fired |
+| `DIRECTION LOSS-CUT: loss=Nc ≥ max=20c` | Exit Rule D fired |
+| `DIRECTION PRE-EXPIRY: ...` | Exit Rule E fired |
+| `SELL TIER FILLED: Nx @ Mc (+Nc)` | A DIRECTION-class exit completed (often Rule B) |
+| `CopyEngine SYNC RECLAIM SKIP-DIRECTION: ...` | Refactor guard working — legacy path correctly skipped |
 
 ---
 
-## Known gaps (priority order)
+## Known divergence: backtest vs live
 
-1. **Tier-classification refinement**: `btc_5m_move` is currently a session-
-   open proxy. Real 5-min rolling tracker needs wiring to the `tick_tracker`
-   module for higher-fidelity tier classification.
-2. **Live validation horizon**: OOS backtest validated T1/T2 fills at
-   97.4% / 92.2% on 9 days of data. Live data accumulates here; revisit
-   tier thresholds after 30 days of live fills.
-3. **Pre-fire balance gate**: my code requires `balance ≥ 1.5× cost` to
-   avoid insufficient_balance on exit. The 1.5× constant is conservative;
-   could tighten with empirical taker-fee analysis.
+**Backtest claim** (`scripts/backtest_direction.py`, n=197): 90.5% WR,
++$3.93/trade.
+
+**Live observation** (n=7 fills under fully-improved arch): ~28% WR,
+-$0.79 avg.
+
+**Hypothesis** (unverified): backtest assumes fills at historical mid;
+live pays ask+slip. On a 30c entry, 5c slip = 16.7% extra cost
+compounding into win-rate degradation. **Recommended next investigation**:
+re-run backtest with realistic IOC fill simulation (assume only 30%
+of signals fill, fills happen 5c above mid). If WR drops to ~30%,
+backtest had survivorship bias. If WR stays at 90%, there's a live
+execution bug.
+
+**Don't trust the 90.5% claim** until re-validated with realistic fills.
+The UNIFIED scorer's 71.5% backtest claim has the same caveat.
 
 ---
 
 ## Do / Don't
 
 **Do:**
-
 - Treat `user_config.py` as the live-behavior switchboard
 - Check Kalshi positions API directly before trusting any engine-side P&L
-- Verify `PAPER_TRADING=False` and `PAPER_FVG_LIVE_MODE=True` before
-  assuming live behavior
-- Use `MAX_TRADES_PER_SESSION_TICKER=1` as the inviolable rule — one
-  engine entry per 15-min ticker
-- Run `python -m pytest tests/test_fvg_tiering.py tests/test_fvg_live_wiring.py -q`
-  after any change to tier or live-wiring logic
+- Use `MAX_TRADES_PER_SESSION_TICKER=1` as inviolable
+- Use confirm-with-2nd-fetch BAL protocol before stopping on catastrophe
+- Run `python -m pytest tests/test_direction_strategy.py -q` after any
+  direction-strategy change
 
 **Don't:**
-
-- Re-enable retired strategies (`BB_PURE_MODE`, `BB_MOMENTUM_ENABLED`,
-  `TA_FORCED_ENTRY_ENABLED`, `SR_FADE_ENABLED`, `SNIPER_ENABLED`,
-  `SCALP_DCA_ENABLED`, `TP_LAYERED_ENABLED`, `MICRO_PULLBACK_ENABLED`,
-  `ATM_REVERSION_ENABLED`, `WALLET_COPY_ENABLED`) without explicit
-  user direction
+- Re-enable retired strategies without explicit user direction
 - Disable `MAX_TRADES_PER_SESSION_TICKER` or `_entered_tickers_this_window`
-  persistence
-- Disable `SAFETY_OVERSELL_HARDENING` — gates the residual reconciler
-- Edit `_fvg_tiering.py` constants without re-running OOS validation
-  (`scripts/backtest_oos_level3.py`)
-- Restart engine without verifying Kalshi state directly
-- Trust paper-sim balance for live attribution — query real balance via
-  `self._client.get_balance()` for true P&L
+- Disable `SAFETY_OVERSELL_HARDENING`
+- Disable `MAX_RISK_PER_WINDOW_DOLLARS` (universal $15 cap)
+- Disable `MANUAL_FILLS_CAPTURE_ENABLED=False` (engine should NOT adopt
+  user's manual trades)
+- Trust the 90.5% backtest WR until realistic-fill backtest validates
+- Set `DIRECTION_CONTRACTS > 1` without first confirming 15m offer-side
+  depth has improved (still 1-2ct/tier as of 2026-05-07)
 
 ---
 
 ## Reading order for new AI agents
 
 1. **This document (CLAUDE.md)** — operator-facing source of truth
-2. **`direction_strategy.py`** — pure decision math (~150 lines, the entire
-   trading thesis)
-3. **`tests/test_direction_strategy.py`** — 25 unit tests pinning every
-   decision boundary
-4. **`scripts/backtest_direction.py`** — settlement-driven backtest
-   showing the 69-90% win rate / +$2-4/trade economics
-5. **`user_config.py`** — every live behavior knob (DIRECTION section
-   at ~2060)
-6. **`polymarket_copy_engine.py:_direction_tick`** — engine integration
-   (~150 lines: gates → evaluate → place_order → log)
-7. **`polymarket_copy_engine.py:_add_session_lock`** — per-window
-   ticker lock primitive
-8. **Recent commits in chronological order** — context for *why* the code
-   looks the way it does
-
-Skip on first read: any of the disabled-tier code (TA_FORCED, SR_FADE,
-SNIPER, SCALP DCA, wallet copy, BB_PURE/BB_MOMENTUM, FVG-tier-aware
-LIVE_HOLDING). They're feature-flagged off and don't affect current
-behavior. The FVG-tier path produced an early-AM 2026-05-05 catastrophe
-loss (-19%) before being disabled — see
-`to-do/LIVE_SESSION_NOTES_2026_05_02.md` 06:27 PT entry for the
-postmortem.
+2. **`AI_COLLAB_LOG.md`** — chronological architecture decisions
+3. **`unified_scorer.py`** — Tier 0 pure decision math (~500 lines)
+4. **`direction_strategy.py`** — Tier 1 pure decision math
+5. **`tests/test_direction_strategy.py`** — 35 tests pinning DIRECTION decisions
+6. **`scripts/backtest_unified_scorer.py`** — UNIFIED backtest
+7. **`user_config.py`** — every live behavior knob
+8. **`polymarket_copy_engine.py`** key sections:
+   - `_check_window_safety`, `_record_window_fill` (~line 4499)
+   - `_evaluate_penny_signal` (~line 4600)
+   - `_unified_tick` (~line 4760)
+   - `_direction_tick` (~line 5180)
+   - `_direction_manage_exit` (~line 5800 — exit rules A-E)
+9. **Recent commits in chronological order** — context for *why*
 
 ---
 
@@ -410,41 +406,26 @@ python -m pytest tests/ -q --ignore=tests/test_bias_engine.py \
     --ignore=tests/test_strategy_index.py
 ```
 
-Expect: ~588 passing, 3 pre-existing failures (`test_late_dominant.py` 2,
-`test_sr_fade_gates.py` 1) unrelated to current strategy. Safe to delete
-those test files once the corresponding retired modules are removed.
-
-The FVG-tier-aware path is covered by:
-- `tests/test_fvg_tiering.py` — 23 tier classification + sizing tests
-- `tests/test_fvg_live_wiring.py` — 10 live-state-machine tests
-- `tests/test_residual_reconciler.py` — A5 oversell-guard tests
-- `tests/test_place_capped_side_sell.py` — MIN-TRUTH + OVERSELL-GUARD tests
-- `tests/test_session_lock_release.py` — ticker-lock release-on-failure tests
+Expect ~588 passing. The 35-test `test_direction_strategy.py` suite
+specifically validates the DIRECTION decision math (sides, thresholds,
+sign-mismatch refusals, multiplier saturation, sizing).
 
 ---
 
-## OOS validation summary (2026-05-04)
+## 2026-05-07 afternoon tuning (this update)
 
-`scripts/backtest_oos_level3.py` chronological 70/30 split on 2,485 FVG
-signals across 9.1 days:
+Six changes shipped to address the depth-wall miss-rate problem (376+
+NOFILLs / 0 fills on a single signal under prior tuning):
 
-| Tier | Backtest fill | OOS fill | Edge / trade |
-|------|---------------|----------|--------------|
-| T1   | 99%           | 97.4%    | +$0.158      |
-| T2   | 93%           | 92.2%    | +$0.085      |
-| T3   | 91%           | 81.2%    | +$0.043      |
-| T4   | 76%           | 75.0%    | +$0.018      |
+1. `DIRECTION_CONTRACTS`: 2 → **1** (effective max 1ct after 1.5x cap)
+2. `DIRECTION_MAX_SLIP_C`: 8 → **12** (race-condition resilience)
+3. `UNIFIED_MIN_EV_C`: 5 → **3** (loosened from "strict" preset)
+4. `UNIFIED_MIN_CONFIDENCE`: 0.30 → **0.25**
+5. `PENNY_MAX_PRICE_C`: 8 → **12** (more asymmetric setups)
+6. `PENNY_DAILY_LOSS_HALT_FRAC`: NEW **0.20** (parity with DIRECTION)
 
-Flat sim ($50 starting bankroll, no compounding):
-- Total P&L: +$516.33 over 9.1 days
-- Max equity-curve DD: -$17.70
-- Return:DD ratio: 29×
+Engine code change: PENNY now reads `_direction_state.day_start_balance_c`
+and refuses to fire if BAL has dropped 20% from day-start (mirroring
+DIRECTION's halt). Throttled log every 60s.
 
-Compounding sim ($50 starting, scale per current BR):
-- Mathematically extreme growth — liquidity-limited in reality
-- Zero ruin events in the OOS window
-
-**Real-world expectations**: Kalshi 15m liquidity caps will limit
-compounding well below the simulated 14000× growth. Realistic projection
-on a $35 starting bankroll: ~$50/day flat-sized, scaling to ~$200/day
-once tier-1 contracts can be filled at 50-100ct without slippage.
+**Restart required** for `_uc()` cache to pick up new values.

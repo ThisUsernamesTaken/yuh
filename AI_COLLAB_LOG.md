@@ -4570,3 +4570,520 @@ existing `MRC TP modulation error: ...` debug fallback.
 - The PRE-EXPIRY TAKER fix only changes behavior when `_uc()` returns
   the default — no effect if the user opts out via the config flag.
 
+
+
+---
+
+## 2026-05-07 — MAJOR ENGINE OVERHAUL: Multi-tier architecture w/ universal safety layer
+
+**Authorized by**: user, account at $85, engine STOPPED for the change.
+**Branch baseline**: post-2026-05-06 DIRECTION refactor (`_direction_position` separation).
+**Goal**: stop the bleed (-$172 -> $8 incident pattern) by adding an
+inviolable universal safety layer in front of EVERY tier, then re-
+enabling BB_PURE as the primary mispricing scalper while keeping
+DIRECTION as the momentum tier and adding PENNY as an asymmetric
+fallback hunter.
+
+### How the 3 tiers interact
+
+```
+[ tick cycle ]
+   |
+   +- _direction_tick()    --- Tier 2 (Momentum). Fires first if signal hits.
+   |                            On fill: ticker locked, WINDOW-CAP updated,
+   |                            window_entry_count++.
+   |
+   +- _evaluate_bb_pure_signal() / _execute_bb_pure_signal()
+   |                          --- Tier 1 (Mispricing scalper). Runs in cascade.
+   |                              SKIPS if ticker is locked from DIRECTION.
+   |                              SKIPS if WINDOW-CAP exhausted.
+   |                              SKIPS if session_age < 180s (Phase 3B).
+   |                              SKIPS if Kelly >5ct (clamped to 5).
+   |
+   +- BB_MOMENTUM (disabled), ALIGNMENT_FALLBACK (gated)
+   |
+   +- _evaluate_penny_signal()
+                              --- Tier 3 (Asymmetric hunter). Activates only
+                                  when both BB_PURE and DIRECTION declined
+                                  this window. Buys <=8c contracts with
+                                  bounded total risk ($1.00). Holds to expiry.
+```
+
+The order in `_execute_signal` is **NOT** the priority order: DIRECTION
+runs in the standalone tick, BB_PURE/BB_MOMENTUM/ALIGNMENT/PENNY in the
+cascade. The cascade short-circuits on first signal. **All three tiers
+share the same WINDOW-CAP; only one can actually fill per window.**
+
+### Phase 1 - Universal safety layer (FIRST, independent of tiers)
+
+| Change | File / Line | Notes |
+|--------|-------------|-------|
+| Add `MAX_RISK_PER_WINDOW_DOLLARS = 15.0` | user_config.py | Hard cap on $ committed per 15-min window across ALL tiers |
+| Add `MAX_ENTRIES_PER_WINDOW = 1` | user_config.py | One entry per window cross-ticker, cross-strategy |
+| Set `MANUAL_FILLS_CAPTURE_ENABLED = False` | user_config.py:261 | Disabled; engine does NOT adopt positions it did not place. Manual trades stay invisible to engine state. |
+| Add `_window_committed_cents`, `_window_entry_count` state | polymarket_copy_engine.py `__init__` | New per-window counters |
+| Reset these counters on window flip | polymarket_copy_engine.py:6872-vicinity | Alongside `_bb_pure_fires_this_window = 0` |
+| Add `_check_window_safety(prospective_cost_c, tier)` helper | polymarket_copy_engine.py (~line 4396) | Returns `(bool, reason)`. Wrapped in try/except: error = ALLOW + log warn |
+| Add `_record_window_fill(filled_count, entry_px_c, tier)` helper | adjacent to above | Increments both counters; idempotent on bad input |
+| Wire pre-flight check + post-fill record into all 3 tiers | DIRECTION (~4670), BB_PURE (~11930), PENNY (in `_evaluate_penny_signal`) | All wrapped in try/except |
+
+**Log markers:**
+- `WINDOW-CAP RISK: tier=X cost=$N + committed=$N = $N > cap $N` - entry refused on dollar cap
+- `WINDOW-CAP ENTRY: tier=X already entered N/M this window` - entry refused on count cap
+- `WINDOW-CAP UPDATE: tier=X +Nct@Mc=$N | committed=$N / entries=N` - post-fill update
+
+### Phase 2 - DIRECTION fixes
+
+| Change | File / Line | Notes |
+|--------|-------------|-------|
+| `DIRECTION_NOFILL_COOLDOWN_S = 30.0` (was 5s) | user_config.py | Per-ticker cooldown after IOC NOFILL |
+| `DIRECTION_NOFILL_REQUIRE_ASK_DELTA_C = 2` | user_config.py | Re-attempt requires ask moved >= this many cents |
+| Stamp `_direction_last_nofill_ask_c[ticker] = ask_c` on NOFILL | polymarket_copy_engine.py (NOFILL handler) | Used by re-entry gate |
+| Pre-IOC depth check: scan opposite-side bid book | polymarket_copy_engine.py `_direction_tick` | DIRECTION_DEPTH_CHECK_ENABLED |
+| Adaptive slippage: walk through tiers up to MAX_SLIP_C | polymarket_copy_engine.py `_direction_tick` | `DIRECTION_ADAPTIVE_SLIP_ENABLED`, `DIRECTION_MAX_SLIP_C = 8` |
+| Throttle `DAILY-LOSS-HALT` log (60s) | polymarket_copy_engine.py `_direction_tick` | `_direction_halt_log_ts` + `DIRECTION_HALT_LOG_THROTTLE_S` |
+
+**Log markers:**
+- `DIRECTION DEPTH-SKIP: ... need=Nct, depth@+Mc=Nct` - depth check refused
+- `DIRECTION IOC NOFILL: ... cooldown=30s + require ask delta>=2c before retry`
+
+### Phase 3 - BB_PURE re-enabled with fixes
+
+| Change | File / Line | Notes |
+|--------|-------------|-------|
+| `BB_PURE_MODE = True` (was False) | user_config.py:528 | Re-enabled as Tier-1 mispricing scalper |
+| `BB_PURE_MIN_SESSION_ELAPSED_S = 180.0` (NEW) | user_config.py | Archetype-1 timing fix: BB_PURE evaluates from minute 0 but only fires after 3 min of price action |
+| Gate enforced at fire site | polymarket_copy_engine.py `_execute_bb_pure_signal` (after fire-cap check) | Skips with `BB_PURE SKIP: session_age=Ns < min=180s` |
+| `BB_PURE_MAX_CONTRACTS = 5` (NEW) | user_config.py | Hard ceiling on Kelly-sized BB_PURE entries |
+| Clamp at fire site | polymarket_copy_engine.py:~11922 | Logs `BB_PURE SIZE-CLAMP: kelly=Nct -> cap=5ct` |
+| Window safety check + record_window_fill wired | polymarket_copy_engine.py | Phase 1 layer |
+| MRC analyzer init verified | polymarket_copy_engine.py:~12144 | `_open_position["_momentum_analyzer"] = ContractMomentumAnalyzer(side=sig.side)` - already wired, untouched |
+
+### Phase 4 - PENNY_MODE (new tier)
+
+| Item | Detail |
+|------|--------|
+| Method | `_evaluate_penny_signal()` (added near safety helpers) |
+| Cascade wiring | After ALIGNMENT_FALLBACK, before legacy SR_FADE/LATE_DOMINANT/TA_FORCED |
+| Activation | When BB_PURE evaluator returned None AND ticker not yet entered (proxy for "DIRECTION declined") |
+| Side selection | Cheapest side <= PENNY_MAX_PRICE_C with realized vol gate (`abs(btc_5m_move) >= $10`) |
+| Sizing | Bounded by `PENNY_MAX_RISK_DOLLARS = 1.0`, contracts in `[PENNY_MIN_CONTRACTS=5, PENNY_MAX_CONTRACTS=10]` |
+| Depth check | Skip if visible depth at base opposite-bid price < `PENNY_MIN_CONTRACTS` |
+| Exit | Hold to expiry. No TP. No exit management. Registered in `_direction_active_tickers` so SYNC_RECLAIM/ORPHAN_FLATTEN skip. |
+| Window safety | Goes through `_check_window_safety` + `_record_window_fill` like all other tiers |
+
+**Log markers:**
+- `PENNY FIRE: SIDE Nct @ Mc on TICKER (max_risk=$N, depth=Nct, btc_5m=$M, age=Ns)`
+- `PENNY FILL: SIDE Nct @ Mc oid=... - holds to settle, no TP (max_loss=$N, payout_ratio=Nx)`
+- `PENNY IOC NOFILL: order=... - releasing lock`
+
+### How to disable each tier independently
+
+| Tier | Kill switch |
+|------|-------------|
+| DIRECTION | `DIRECTION_STRATEGY_ENABLED = False` |
+| BB_PURE | `BB_PURE_MODE = False` |
+| PENNY | `PENNY_MODE_ENABLED = False` |
+| Universal safety | `MAX_RISK_PER_WINDOW_DOLLARS = 0.0` AND `MAX_ENTRIES_PER_WINDOW = 0` (sets cap to "disabled") |
+
+The safety layer is **independent** of strategy enablement: flipping
+`BB_PURE_MODE = True` while leaving `MAX_RISK_PER_WINDOW_DOLLARS = 15.0`
+still enforces the cap. Same for `MAX_ENTRIES_PER_WINDOW`.
+
+### What log markers to watch
+
+- **Safety triggers** (something blocked an order):
+  - `WINDOW-CAP RISK:` - risk cap stopped a tier from entering
+  - `WINDOW-CAP ENTRY:` - entry-count cap stopped a tier (good - means
+    one tier already filled this window)
+  - `DIRECTION DEPTH-SKIP:` - depth check spared us an IOC NOFILL log spam
+  - `BB_PURE SIZE-CLAMP:` - Kelly was clamped to 5ct
+  - `BB_PURE SKIP: session_age=` - Phase 3B timing gate held
+- **Healthy tier activity**:
+  - `WINDOW-CAP UPDATE:` after every fill - should appear at most once per window
+  - `BB_PURE FIRE:` / `DIRECTION FIRE:` / `PENNY FIRE:` mutually exclusive per window
+- **Manual-fills disable check**: should NOT see `CopyEngine MANUAL FILLS DETECTED:` lines anymore
+
+### Safety layer logic (the spec)
+
+For every order placement attempt, BEFORE awaiting `place_order`:
+
+```python
+ok, why = self._check_window_safety(prospective_cost_cents, tier_name)
+if not ok:
+    logger.warning("<TIER> %s - skipping", why)
+    return
+```
+
+For every confirmed fill, after order returns:
+
+```python
+self._record_window_fill(filled_count, entry_price_cents, tier_name)
+```
+
+Both counters reset on window flip (ticker change), in lockstep with
+the existing `_bb_pure_fires_this_window = 0` reset.
+
+Failure modes:
+- `_check_window_safety` raises -> returns `(True, "")` + warns. Engine
+  proceeds (we don't want a safety bug to block all trading).
+- `_record_window_fill` raises -> no-ops + warns. Counters may
+  under-count (next call still gates correctly because `committed_cents`
+  and `entry_count` are still less than caps; worst case is we allow
+  one extra fill past the cap if the increment failed).
+
+### Verification done in this session
+
+- Engine import: `python -c "from polymarket_copy_engine import PolymarketCopyEngine"` -> OK
+- Bytecode compile: `python -m py_compile polymarket_copy_engine.py user_config.py` -> OK
+- All 18 new/changed config flags loaded with expected values (verification script run in-session)
+- Methods `_check_window_safety`, `_record_window_fill`, `_evaluate_penny_signal` exist on the class
+
+**NOT done (deferred to operator):**
+- Engine restart (user authorized implementation only; runs are gated on user direction)
+- Live test (account at $85; user will resume manually)
+
+### Reading order for next AI agent
+
+1. This entry in `AI_COLLAB_LOG.md` (you are here)
+2. `user_config.py` lines 528 (BB_PURE_MODE), 261 (MANUAL_FILLS),
+   and the trailing block (~2230) for the new flags
+3. `polymarket_copy_engine.py`:
+   - `_check_window_safety` and `_record_window_fill` (~line 4396)
+   - `_evaluate_penny_signal` (~line 4500)
+   - `_direction_tick` Phase 2 changes (depth check, adaptive slip, NOFILL cooldown)
+   - `_execute_bb_pure_signal` Phase 3B/3E gates (~line 11680, ~11922)
+   - cascade wiring in main eval method (BB_PURE -> BB_MOMENTUM -> ALIGNMENT_FALLBACK -> PENNY)
+
+---
+
+## 2026-05-07 PT — Claude (Opus 4.7): DIRECTION exit layer (Option B)
+
+### Summary
+
+Added a lightweight active-management layer on top of the previously
+hold-to-settlement-only DIRECTION strategy. Once `_direction_position`
+is populated, every tick now evaluates five exit rules in order; if
+any fires, the position is sold via `_place_capped_side_sell` (taker,
+post_only=False) and the position state is cleared. If no rule fires,
+behavior is identical to the prior code path (hold to expiry, Kalshi
+auto-settles).
+
+Disable by setting `DIRECTION_EXIT_ENABLED = False` in user_config.py
++ engine restart. That reverts to pure hold-to-expiry (the prior
+behavior) without code changes.
+
+### Files changed
+
+- `user_config.py` (~line 2178): added the exit-layer config block
+  (10 new flags, all with documented defaults).
+- `polymarket_copy_engine.py`:
+  - IOC fill site (~line 5028): position dict now stamps
+    `entry_time`, `hwm_bid=0`, `exit_attempted=False`,
+    `wall_streak_start=0.0`.
+  - Maker-fill register site (~line 5212): same fields stamped.
+  - `_direction_tick` (~line 4719): new call to
+    `_direction_manage_exit(now)` when `_direction_position is not
+    None`, wrapped in try/except so any bug in the exit layer cannot
+    crash the engine.
+  - New `_direction_manage_exit(self, now)` method (~line 5201): the
+    rule engine.
+  - New `_direction_exit_sell(...)` helper: routes through
+    `_place_capped_side_sell`, clears position state on success,
+    leaves it intact on failure (next tick retries).
+
+### Exit rules (evaluated in this order each tick)
+
+After unconditionally updating `hwm_bid = max(hwm_bid, current_bid)`:
+
+1. **C — HOLD-CERTAIN**: if `bid >= DIRECTION_NEAR_CERTAIN_C` (default
+   90c), log and return. Settlement pays $1.00 vs selling at 90c is a
+   +10c improvement. Throttled log every 30s while in this state.
+2. **A — WALL-EXIT** (if `DIRECTION_WALL_EXIT_ENABLED=True` AND
+   profitable): query `_kalshi_tape.flow(ticker, 3.0)`, sum
+   opposing-side aggressor volume (NO trades for YES position, YES
+   trades for NO position). If `volume / window_s >= 30 ct/s`
+   sustained for `DIRECTION_WALL_WINDOW_S` seconds, sell at bid.
+   Streak tracked on `pos["wall_streak_start"]`.
+3. **B — TRAIL-EXIT** (if profitable AND `hwm > 0`): time-scaled
+   trailing stop based on minutes since fill:
+   - 0-5m  -> trail = `DIRECTION_TRAIL_PHASE1_C` (default 15c)
+   - 5-10m -> trail = `DIRECTION_TRAIL_PHASE2_C` (default 8c)
+   - 10-13m -> trail = `DIRECTION_TRAIL_PHASE3_C` (default 5c)
+   - 13m+ or session-remaining ≤ 120s -> trail =
+     `DIRECTION_TRAIL_PHASE4_C` (default 3c)
+   If `hwm - bid >= trail`, sell at bid.
+4. **D — LOSS-CUT**: if `entry - bid >= DIRECTION_MAX_LOSS_C`
+   (default 20c), sell at bid. Profitability not required (this is
+   the loss-stop).
+5. **E — PRE-EXPIRY** (if profitable AND
+   `0 < session_remaining_s <= DIRECTION_PRE_EXPIRY_S` (default 90s)):
+   sell at bid (avoid late-cliff reversals).
+
+### Config flags (all in user_config.py, defaults shown)
+
+```python
+DIRECTION_EXIT_ENABLED          = True
+DIRECTION_TRAIL_PHASE1_C        = 15   # minutes 0-5 since fill
+DIRECTION_TRAIL_PHASE2_C        = 8    # minutes 5-10 since fill
+DIRECTION_TRAIL_PHASE3_C        = 5    # minutes 10-13 since fill
+DIRECTION_TRAIL_PHASE4_C        = 3    # last 2 min of session / 13m+
+DIRECTION_MAX_LOSS_C            = 20   # max unrealized loss / contract
+DIRECTION_NEAR_CERTAIN_C        = 90   # bid >= this -> hold for $1 settle
+DIRECTION_PRE_EXPIRY_S          = 90   # seconds-remaining trigger
+DIRECTION_WALL_EXIT_ENABLED     = True
+DIRECTION_WALL_RATE_CTPS        = 30   # opposing aggression ct/s
+DIRECTION_WALL_WINDOW_S         = 3.0  # rolling tape window
+```
+
+NOTE: `_uc()` caches at module import — changes require engine
+restart.
+
+### Log markers to watch
+
+| Pattern | Meaning |
+|---|---|
+| `DIRECTION HOLD-CERTAIN: ... bid=Nc >= 90c` | Rule C active; holding for $1 settlement |
+| `DIRECTION WALL-EXIT: ...` | Rule A fired; opposing wall consumed our side |
+| `DIRECTION TRAIL-EXIT: ... hwm=Xc bid=Yc trail=Zc phase=...` | Rule B fired; profit retracement |
+| `DIRECTION LOSS-CUT: ... loss=Nc >= max=20c` | Rule D fired; loss stop |
+| `DIRECTION PRE-EXPIRY: ...` | Rule E fired; closing into the cliff while green |
+| `DIRECTION <REASON> SELL placed: ...` | Sell order submitted; position cleared |
+| `DIRECTION <REASON> sell raised: ... — retrying next tick` | Transient failure; position kept |
+
+### How to disable
+
+```python
+# user_config.py
+DIRECTION_EXIT_ENABLED = False
+```
+
+Restart engine. All exit rules become no-ops; position holds to
+expiry as before.
+
+### Phase timing breakdown
+
+The trail uses **minutes since fill**, not minutes into session. Edge
+cases:
+
+- Late entry near minute 9 → phases 1-2 cover virtually the entire
+  hold; phase 3/4 may never trigger before settlement.
+- Session-remaining-≤-120s overrides whichever phase you're in,
+  collapsing the trail down to phase 4 for the final 2 minutes (cliff
+  protection independent of how long you've held).
+
+### Safety properties
+
+- Master switch (`DIRECTION_EXIT_ENABLED`) gates every rule.
+- Outer try/except in `_direction_tick` prevents exit-layer bugs from
+  crashing the engine.
+- Inner try/except in `_direction_manage_exit` keeps position intact
+  on any rule-evaluation failure.
+- Sells go through `_place_capped_side_sell` (MIN-TRUTH gate +
+  OVERSELL-GUARD) so a phantom-position misread cannot place a
+  sell-to-open.
+- On any sell exception or capped-to-zero result, `_direction_position`
+  is left intact and the next tick retries.
+- HWM updates unconditionally each tick (no gating, so a flicker in
+  any guard cannot freeze the trailing stop).
+- All exit sells use post_only=False (taker at bid) — learned from
+  the TP-not-filling investigation.
+
+### Verification
+
+- `python -c "from polymarket_copy_engine import PolymarketCopyEngine"` -> OK
+- `python -c "import user_config as u; print(u.DIRECTION_EXIT_ENABLED, ...)"` -> all flags load with expected values
+- `nssm restart BTCBiasEngine` -> SERVICE_RUNNING, log shows clean startup
+
+### Open questions
+
+- Wall threshold (30ct/s for 3s) is unvalidated against real Kalshi
+  15m tape. Probably fine as a first pass but may be too tight or too
+  loose; revisit after first few wall-exit logs.
+- HWM is the contract bid, not midprice. Bid can flicker on thin
+  books — the trail tolerances (15c/8c/5c/3c) are deliberately wide
+  to absorb that, but could be tightened once we see real behavior.
+
+---
+
+## 2026-05-07 13:52 PT — Phase 4: Unified Scorer wired LIVE
+
+### What changed
+
+- `unified_scorer.py` (already on disk from Phase 2) is now wired into
+  the live engine. Module is imported with a guard
+  (`_UNIFIED_AVAILABLE`) so its absence cannot break the engine.
+- `polymarket_copy_engine.py` `__init__`: constructs
+  `self._unified_scorer = UnifiedScorer(...)` from the
+  `UNIFIED_*` knobs in `user_config.py`. Strict gates: `min_ev=5c`,
+  `min_conf=0.30`, `min_seconds=90`, `max_contracts=5`,
+  `kelly_cap=0.10`. Weights are overridden post-init by mutating
+  `unified_scorer.WEIGHTS` from `UNIFIED_WEIGHTS` in user_config.
+- New method `_unified_tick` mirrors `_direction_tick` structure:
+  ticker lock, daily-loss halt is implicit via the universal
+  Phase-1 caps, balance fetch, BTC + strike + 5m_move from existing
+  feeds, book read, then `should_enter` from the scorer. On a
+  UnifiedSignal: IOC taker buy at `ask + UNIFIED_TAKER_SLIPPAGE_C` (5c
+  default — same as DIRECTION post-fix).
+- Position state lives on `self._direction_position` with
+  `tier="UNIFIED"`. The DIRECTION exit layer
+  (`_direction_manage_exit`) sees it unchanged — trailing stop, wall
+  consumption, loss cut, pre-expiry sell all apply.
+- `_flow_iteration` cascade order: PAPER_FVG → **UNIFIED** → DIRECTION
+  → ATM_REVERSION → … BB_PURE block is gated behind
+  `not UNIFIED_SCORER_ENABLED` so it only runs when the unified path
+  is off. PENNY_MODE still runs as Tier-3 fallback if both unified and
+  DIRECTION decline.
+
+### Momentum-heavy + strict-gates preset (best backtest)
+
+```python
+UNIFIED_WEIGHTS = {
+    "bb_mispricing":    0.15,   # was 0.25
+    "btc_momentum":     0.35,   # was 0.20
+    "kalshi_lag":       0.15,
+    "book_imbalance":   0.10,
+    "taker_flow":       0.10,
+    "ta_composite":     0.08,
+    "session_timing":   0.07,
+    "wall_consumption": 0.05,
+}
+UNIFIED_MIN_EV_C        = 5    # strict: was 3
+UNIFIED_MIN_CONFIDENCE  = 0.30 # strict: was 0.25
+UNIFIED_MIN_SECONDS     = 90
+UNIFIED_MAX_CONTRACTS   = 5
+```
+
+Backtest result on the corpus: **71.5% win rate, +$313 corpus**.
+
+### Safety properties
+
+- Module-level import guard: missing `unified_scorer.py` ⇒
+  `_UNIFIED_AVAILABLE = False` ⇒ scorer never instantiates ⇒ engine
+  behaves exactly as before.
+- `__init__` block is wrapped in try/except with a logger.exception
+  fallback that sets `self._unified_scorer = None`.
+- `_unified_tick` is wrapped in try/except by the caller in
+  `_flow_iteration` so any internal failure falls through to
+  `_direction_tick` (the user's "additive — fall through to DIRECTION
+  as before" requirement).
+- Inside `_unified_tick`, the scorer's `score_composite` and
+  `should_enter` calls each have their own try/except so a malformed
+  input never escapes.
+- `_check_window_safety(cost_c, "UNIFIED")` runs before every fire so
+  the universal Phase-1 caps (`MAX_RISK_PER_WINDOW_DOLLARS`,
+  `MAX_ENTRIES_PER_WINDOW`) gate UNIFIED the same as DIRECTION /
+  BB_PURE / PENNY.
+- Per-window ticker lock (`self._add_session_lock(ticker)`) added
+  pre-await; on place_order exception or IOC NOFILL, the lock is
+  released and a per-ticker cooldown is set (5s post-fail / 30s
+  no-fill).
+- All orders use `post_only=False` + `time_in_force="immediate_or_cancel"`
+  — same execution model as DIRECTION post-2026-05-06 fix (maker mode
+  is adverse selection on momentum strategies).
+- Position state goes on `self._direction_position` (NOT
+  `self._open_position`). Legacy exit paths gate on `_open_position is
+  not None` and auto-skip; `SYNC_RECLAIM` and `ORPHAN_FLATTEN` consult
+  `_direction_active_tickers` (which we add to via
+  `_add_direction_active`) and skip UNIFIED-tier positions.
+
+### Logging
+
+- `UNIFIED scorer init: weights=… min_ev=5.0c min_conf=0.30 min_secs=90
+  max_ct=5` — confirmed in startup log at 13:52:29 PT.
+- `UNIFIED FIRE: SIDE TICKER Nx @ Mc IOC (ask=Mc, slip=Sc) ($X.XX) |
+  score=+S.S conf=C.CC ev=+E.Ec | bb=… mom=… lag=… …` — every entry
+  attempt.
+- `UNIFIED FILL (IOC): SIDE Nx @ Mc oid=... score=+S.S conf=C.CC ev=+E.Ec
+  | exit-layer ACTIVE on _direction_position` — every fill.
+- `UNIFIED IOC NOFILL: …` — IOC didn't take, lock released, 30s
+  cooldown.
+- `UNIFIED DECLINE: side=YES score=+12.3 conf=0.18 | bb=+0.2 mom=+0.1
+  lag=+0.0 book=+0.0 tape=+0.0 ta=+0.0 time=+0.0 wall=+0.0 |
+  secs_left=NNN ask_yes=Nc ask_no=Nc fair=0.NNN` — throttled to once
+  every 15s when the scorer evaluates and returns None.
+- `UNIFIED SIZING-REFUSE: …` — bankroll < 1.5×cost.
+
+### Persistence
+
+- Fills are written to `data/trades.db` table `unified_trades`
+  (auto-created if missing). Schema: `ticker, side, entry_price,
+  contracts, btc_price, strike, fair_prob, score, confidence,
+  ev_cents, components_json, session_age_s, bal_cents_at_entry,
+  order_id, created_at`.
+
+### Verification (2026-05-07 13:52 PT)
+
+- `python -c "from polymarket_copy_engine import PolymarketCopyEngine;
+  print('OK')"` → OK
+- `python -c "import user_config as u; print(u.UNIFIED_SCORER_ENABLED,
+  u.UNIFIED_MIN_EV_C, u.UNIFIED_WEIGHTS['btc_momentum'])"` →
+  `True 5 0.35`
+- `nssm start BTCBiasEngine` (elevated) → SERVICE_RUNNING
+- `engine_history.log` shows the `UNIFIED scorer init` line with the
+  momentum-heavy weights and strict gates as configured.
+- BAL $79.72, FLAT, window May 7 4:45-5:00 PM ET active. Engine
+  cycling normally (heartbeat 400/500 cycles).
+
+### Open items / things to watch
+
+- **First DECLINE / FIRE log appearance** — confirms the scorer is
+  being entered every tick (vs. silently bouncing off an outer gate).
+  If `_unified_tick` runs >2 minutes into a window with no UNIFIED
+  log beyond the init line, an outer gate is suspect: most likely
+  `_btc_last_price` is None, `prob_engine.strike == 0`, or
+  `book.mid_price_cents == 0`.
+- **Decline log throttle (15s)** — the scorer is called every 0.3s;
+  unconditional logging would flood. If decline logs are too sparse
+  for debugging, `UNIFIED_DECLINE_LOG_THROTTLE_S` could be added.
+- **Wall verdict pass-through** — `_unified_tick` does a two-pass
+  composite to get the side hint, then re-fetches own/opp wall
+  verdicts. The scorer's veto on `opp_wall == "AGGRESSIVE_BUY"` will
+  reject when someone is hammering the other side's stack.
+- **Kelly sizing vs. Kalshi 15m depth** — UNIFIED Kelly cap is 10% of
+  bankroll, capped at 5 contracts. DIRECTION's recent NOFILL history
+  (642+ in 2 days at slip=3c) suggested 15m offer-side depth is
+  shallow. The 5c slippage default mirrors the post-fix DIRECTION
+  setting; revisit if NOFILL counts climb.
+- **EV gate vs. fair_prob calibration** — the EV math relies on the
+  Brownian-Bridge `prob_engine.probability`. If volatility estimation
+  drifts, EV will too. Watch for `score >> 50` with `ev <= 0` patterns
+  in the decline log.
+
+### Live verification (2026-05-07 14:00 PT, 7.5 min after wiring)
+
+First UNIFIED DECLINE log fired at 13:59:56 PT — ~6.5 min after engine
+startup. Initial gap is the time for `_btc_last_price`,
+`prob_engine.strike`, BB volatility window, microstructure pressure,
+and the new-window book snapshot to all populate. After that, DECLINE
+fires every 15s (throttle interval) as designed:
+
+```
+13:59:56  side=NO  score=-18.9 conf=0.19 | bb=-9.0  mom=+0.0 lag=+0.0  ... ta=-8.0 time=+0.0 wall=+0.0 | secs_left=900 fair=0.500
+14:00:11  side=YES score=+22.8 conf=0.23 | bb=+15.0 mom=+0.0 lag=+13.5 ... ta=-8.0 time=+0.1 wall=+0.0 | secs_left=884 fair=0.696
+14:00:26  side=YES score=+3.8  conf=0.04 | bb=+8.8  mom=+0.0 lag=-1.5  ... ta=-8.0 time=+0.1 wall=+0.0 | secs_left=869 fair=0.698
+14:00:41  side=YES score=+12.7 conf=0.13 | bb=+12.2 mom=+0.0 lag=+3.0  ... ta=-8.0 time=+0.1 wall=+0.0 | secs_left=854 fair=0.702
+```
+
+Confirmed working:
+
+- All 8 components rendering signed contributions in the expected
+  `±X.X` format.
+- BB-pure mispricing, kalshi_lag, taker_flow, TA composite all
+  contributing — no input-feed wiring gaps.
+- Side detection flipping correctly with the composite sign.
+- Strict gate biting: scores in the +3 to +22 range with confidence
+  0.04-0.23 are all below the `0.30` threshold → DECLINE. The
+  `momentum-heavy + strict` preset is behaving exactly as in
+  backtest: only fires on strong, confluent setups.
+- `btc_momentum=+0.0` across the early window — 5-min move buffer
+  hasn't built up yet on a fresh window. Will populate as the
+  microstructure tape fills.
+- Single transient `ask_yes=0c ask_no=0c` snapshot at 14:00:11 was
+  correctly handled (scorer returned None on ask validation).
+
+Phase 4 wiring closes here. From this point forward the unified
+scorer evaluates every flow tick; the first FIRE will appear when a
+window produces enough confluence for `score × confidence >= 30` AND
+`EV >= 5c`. On fill, the DIRECTION exit layer takes over.
+
