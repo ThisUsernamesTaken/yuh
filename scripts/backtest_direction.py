@@ -174,7 +174,25 @@ def strat_market_implied(btc, strike, mom, prob, mid):
 
 
 def simulate(snaps, market_result, strike, decide,
-             *, max_offset_s, max_entry_c, contracts):
+             *, max_offset_s, max_entry_c, contracts,
+             nofill_rate=0.0, slip_c=0, fee_buffer_c=0,
+             rng=None):
+    """Simulate a single ticker's trade decision + outcome.
+
+    Realistic-fill mode (default off, all kwargs default to 0):
+    - ``nofill_rate``: probability that the IOC doesn't fill (signal is
+      seen but no execution happens). When set, we discard ``nofill_rate``
+      fraction of signals at random. This models live-observed NOFILL
+      behavior where the offer-side depth was swept between book-read and
+      order arrival.
+    - ``slip_c``: cents added to entry price (race-condition cost). Even
+      when filled, live IOCs typically pay a few cents above book ask.
+    - ``fee_buffer_c``: extra fee per contract subtracted from PnL. Models
+      Kalshi taker fees that the existing taker_fee_cents() may underweight.
+    - ``rng``: optional random.Random instance for reproducibility.
+    """
+    import random as _rand
+    _r = rng if rng is not None else _rand
     for t_off, btc_c, bid, ask, mid, mom, prob, regime in snaps:
         if t_off >= max_offset_s:
             break
@@ -184,11 +202,16 @@ def simulate(snaps, market_result, strike, decide,
         side = decide(btc, strike, mom, prob, mid)
         if side is None:
             continue
-        # Determine entry price (ask of chosen side).
+        # Realistic NOFILL simulation: skip the trade entirely with the
+        # configured probability. This is what live execution looks like
+        # when offer-side depth disappears between book-read & order send.
+        if nofill_rate > 0 and _r.random() < nofill_rate:
+            continue
+        # Determine entry price (ask of chosen side, plus slippage).
         if side == "yes":
-            entry_c = ask
+            entry_c = ask + slip_c
         else:
-            entry_c = 100 - bid  # no_ask
+            entry_c = (100 - bid) + slip_c  # no_ask + slip
         if entry_c <= 0 or entry_c > max_entry_c:
             continue
         # Bought. Now compute settlement.
@@ -197,7 +220,7 @@ def simulate(snaps, market_result, strike, decide,
             settle_c = 100
         else:
             settle_c = 0
-        fees = taker_fee_cents(entry_c, contracts)
+        fees = taker_fee_cents(entry_c, contracts) + (fee_buffer_c * contracts)
         pnl = (settle_c - entry_c) * contracts - fees
         return Trade(
             ticker="", side=side,
@@ -211,15 +234,20 @@ def simulate(snaps, market_result, strike, decide,
 
 
 def run(settled, snaps_by_ticker, decide, *,
-        max_offset_s=600, max_entry_c=99, contracts=10):
+        max_offset_s=600, max_entry_c=99, contracts=10,
+        nofill_rate=0.0, slip_c=0, fee_buffer_c=0, seed=None):
     trades = []
+    import random as _rand
+    rng = _rand.Random(seed) if seed is not None else None
     for ticker, (result, strike) in settled.items():
         s = snaps_by_ticker.get(ticker)
         if not s:
             continue
         rec = simulate(s, result, strike, decide,
                        max_offset_s=max_offset_s,
-                       max_entry_c=max_entry_c, contracts=contracts)
+                       max_entry_c=max_entry_c, contracts=contracts,
+                       nofill_rate=nofill_rate, slip_c=slip_c,
+                       fee_buffer_c=fee_buffer_c, rng=rng)
         if rec is None:
             continue
         rec.ticker = ticker
@@ -408,6 +436,85 @@ def main():
         curve.append(bal)
     print(f"  Flat  5ct, $50 BR: ${curve[0]/100:.2f} -> ${curve[-1]/100:.2f}, "
           f"peak=${max(curve)/100:.2f}, trough=${min(curve)/100:.2f}")
+
+    # ── REALISTIC-FILL VALIDATION (2026-05-07 PT evening) ────────────────
+    # The backtest above assumes 100% fills at historical ask. Live IOCs
+    # observed ~30% NOFILL rate at slip=3-5c, and the actual fill price
+    # often includes 5c+ of slippage. Re-run the best config with these
+    # production-realistic settings to validate that the +90% WR claim
+    # survives the live-execution adjustments.
+    print()
+    print("=" * 90)
+    print("REALISTIC-FILL VALIDATION — strategy E (dist+momentum sweet spot)")
+    print("=" * 90)
+    print()
+    print("Each row averages 10 RNG-seeded runs to reduce variance from")
+    print("the random NOFILL sampling.")
+    print()
+
+    def _avg_runs(decide_fn, *, contracts, nofill_rate, slip_c, fee_buffer_c,
+                  label, n_runs=10):
+        """Run with N seeded RNGs, average the summary stats."""
+        all_n, all_wins, all_pnl = 0, 0, 0
+        for seed in range(n_runs):
+            ts = run(settled, snaps, decide_fn,
+                     max_offset_s=600, max_entry_c=99,
+                     contracts=contracts,
+                     nofill_rate=nofill_rate, slip_c=slip_c,
+                     fee_buffer_c=fee_buffer_c, seed=seed)
+            all_n += len(ts)
+            all_wins += sum(1 for t in ts if t.pnl_cents > 0)
+            all_pnl += sum(t.pnl_cents for t in ts)
+        avg_n = all_n / n_runs
+        avg_pnl = all_pnl / n_runs / 100
+        wr = (all_wins / all_n * 100) if all_n > 0 else 0.0
+        mean_c = (all_pnl / all_n) if all_n > 0 else 0.0
+        print(f"  {label:<60} avg_n={avg_n:>5.1f} "
+              f"win={wr:>5.1f}% mean={mean_c:+6.1f}c "
+              f"total=${avg_pnl:>+7.2f}")
+
+    print("--- Pure backtest (100% fill, 0 slip, 0 fee buffer) ---")
+    _avg_runs(strat_dist_momentum, contracts=10,
+              nofill_rate=0.0, slip_c=0, fee_buffer_c=0,
+              label="E. Dist + momentum (idealized)", n_runs=1)
+
+    print()
+    print("--- Add 5c slippage (race-condition cost) ---")
+    _avg_runs(strat_dist_momentum, contracts=10,
+              nofill_rate=0.0, slip_c=5, fee_buffer_c=0,
+              label="E. + 5c slip", n_runs=1)
+
+    print()
+    print("--- Add 30% NOFILL (live-observed depth-wall rate) ---")
+    _avg_runs(strat_dist_momentum, contracts=10,
+              nofill_rate=0.30, slip_c=5, fee_buffer_c=0,
+              label="E. + 5c slip + 30% NOFILL")
+
+    print()
+    print("--- Add fee buffer 1c/contract (Kalshi taker fee underweight) ---")
+    _avg_runs(strat_dist_momentum, contracts=10,
+              nofill_rate=0.30, slip_c=5, fee_buffer_c=1,
+              label="E. + 5c slip + 30% NOFILL + 1c fee buffer")
+
+    print()
+    print("--- Worst-case: 50% NOFILL + 8c slip + 2c fee buffer ---")
+    _avg_runs(strat_dist_momentum, contracts=10,
+              nofill_rate=0.50, slip_c=8, fee_buffer_c=2,
+              label="E. worst-case live execution")
+
+    print()
+    print("--- 1ct sizing (post-2026-05-07 tuning) at realistic fills ---")
+    _avg_runs(strat_dist_momentum, contracts=1,
+              nofill_rate=0.30, slip_c=5, fee_buffer_c=1,
+              label="E. 1ct + 5c slip + 30% NOFILL + 1c fee")
+
+    print()
+    print("Interpretation:")
+    print("- If WR holds within ~5pp of pure across all rows, entry signal")
+    print("  is robust. Live underperformance is in execution.")
+    print("- If WR drops sharply with NOFILL/slip/fees, the signal's edge")
+    print("  was conditional on idealized fills. The live ~28% WR observed")
+    print("  on n=7 today is consistent with the realistic-fill column.")
 
 
 if __name__ == "__main__":

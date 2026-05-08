@@ -1027,8 +1027,15 @@ class PolymarketCopyEngine:
         self._unified_scorer = None
         try:
             if _UNIFIED_AVAILABLE and bool(_uc("UNIFIED_SCORER_ENABLED", False)):
+                # Fee-aware effective min_ev: bake fee buffer into the gate
+                # so an "EV-positive" signal per the gate is also EV-positive
+                # net of Kalshi taker fees (~1-2c per 50c contract).
+                # 2026-05-07 PT (evening): added UNIFIED_FEE_BUFFER_C.
+                _base_min_ev = float(_uc("UNIFIED_MIN_EV_C", 5))
+                _fee_buf = float(_uc("UNIFIED_FEE_BUFFER_C", 0))
+                _effective_min_ev = _base_min_ev + max(0.0, _fee_buf)
                 self._unified_scorer = UnifiedScorer(
-                    min_ev_c=float(_uc("UNIFIED_MIN_EV_C", 5)),
+                    min_ev_c=_effective_min_ev,
                     min_confidence=float(_uc("UNIFIED_MIN_CONFIDENCE", 0.30)),
                     min_seconds=float(_uc("UNIFIED_MIN_SECONDS", 90)),
                     max_contracts=int(_uc("UNIFIED_MAX_CONTRACTS", 5)),
@@ -4652,6 +4659,41 @@ class PolymarketCopyEngine:
         btc_5m = abs(float(getattr(pressure, "btc_move_300s", 0.0) or 0.0))
         if btc_5m < 10.0:
             return
+        # Gate 5B: regime realized_vol gate (2026-05-07 PT evening).
+        # Today's PENNY 0/2 fills both lost in low-vol environment — BTC
+        # didn't make the implied asymmetric move within remaining time.
+        # Require a minimum realized-vol regime so the cheap-OTM thesis
+        # has structural support.
+        try:
+            _min_vol_bps = float(_uc("PENNY_MIN_REALIZED_VOL_BPS", 0))
+            if _min_vol_bps > 0:
+                _regime = getattr(self, "_last_regime", None)
+                _vol_bps = float(getattr(_regime, "realized_vol_bps", 0.0) or 0.0)
+                if _vol_bps < _min_vol_bps:
+                    # Throttled log (60s)
+                    _last_ts = float(getattr(self, "_penny_vol_skip_ts", 0.0) or 0.0)
+                    if (time.time() - _last_ts) >= 60.0:
+                        logger.info(
+                            "PENNY VOL-SKIP: realized=%.1fbps < %.1fbps "
+                            "(low-vol regime; asymmetric move structurally "
+                            "unlikely)",
+                            _vol_bps, _min_vol_bps,
+                        )
+                        self._penny_vol_skip_ts = time.time()
+                    return
+        except Exception:
+            pass
+        # Gate 5C: minimum remaining time (2026-05-07 PT evening).
+        # PENNY needs runway for the move to play out. Below this, the
+        # contract is closer to coin-flip on remaining noise.
+        try:
+            _min_secs = float(_uc("PENNY_MIN_SECONDS_LEFT", 0))
+            if _min_secs > 0:
+                _secs_left = max(0.0, 900.0 - age)
+                if _secs_left < _min_secs:
+                    return
+        except Exception:
+            pass
         # Pick the cheaper side (asymmetric reversal hunt: betting AGAINST
         # the move's current direction at deep OTM is exactly the play).
         side, ask_c = min(candidates, key=lambda x: x[1])
@@ -5383,6 +5425,42 @@ class PolymarketCopyEngine:
                 balance_cents / 100, ask_c, flat_contracts, multiplier,
             )
             return
+
+        # ── CHEAP-CONTINUATION SIZING BOOST (2026-05-07 PT evening) ──────
+        # Override base sizing when:
+        #   (a) entry price ≤ DIRECTION_CHEAP_BOOST_PRICE_C (asymmetric R/R)
+        #   (b) |dist| ≥ DIRECTION_CHEAP_BOOST_MIN_DIST (signal strength)
+        #   (c) |mom| ≥ DIRECTION_CHEAP_BOOST_MIN_MOM (continuation evidence)
+        # Universal Phase-1 cap ($15/window) and bankroll check still apply.
+        # Mirrors the user's profitable manual structure: 308ct YES @ 22c
+        # → settled YES = +$236 (vs engine's 4ct @ 24c on same setup type).
+        try:
+            if bool(_uc("DIRECTION_CHEAP_BOOST_ENABLED", False)):
+                _boost_max_px = int(_uc("DIRECTION_CHEAP_BOOST_PRICE_C", 30))
+                _boost_min_dist = float(_uc("DIRECTION_CHEAP_BOOST_MIN_DIST", 0.0010))
+                _boost_min_mom = float(_uc("DIRECTION_CHEAP_BOOST_MIN_MOM", 20))
+                _boost_contracts = int(_uc("DIRECTION_CHEAP_BOOST_CONTRACTS", 15))
+                if (ask_c <= _boost_max_px
+                        and abs(sig.dist_pct) >= _boost_min_dist
+                        and abs(sig.btc_5m_move) >= _boost_min_mom):
+                    _orig_contracts = contracts
+                    _boost_cost_c = _boost_contracts * ask_c
+                    _min_x = float(_uc("DIRECTION_MIN_BANKROLL_X_COST", 1.5))
+                    if balance_cents >= int(_boost_cost_c * _min_x):
+                        contracts = _boost_contracts
+                        logger.warning(
+                            "DIRECTION CHEAP-BOOST: %s ask=%dc dist=%+.3f%% "
+                            "mom=$%+.0f → %dct (was %dct, cost=$%.2f)",
+                            sig.side.upper(), ask_c, sig.dist_pct * 100,
+                            sig.btc_5m_move, contracts, _orig_contracts,
+                            _boost_cost_c / 100,
+                        )
+        except Exception as _e:
+            # Boost-logic bug must NEVER block normal entry path.
+            try:
+                logger.warning("DIRECTION CHEAP-BOOST error: %s", _e)
+            except Exception:
+                pass
 
         # Phase 2B/2C: pre-fire depth check + adaptive slippage.
         # Asks are derived from opposite-side bids on Kalshi. To "buy YES"

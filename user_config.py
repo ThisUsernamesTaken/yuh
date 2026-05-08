@@ -2193,7 +2193,17 @@ DIRECTION_MAKER_OFFSET_C         = 1       # only used if maker mode resurrected
 # Disable by setting DIRECTION_EXIT_ENABLED = False (reverts to pure
 # hold-to-expiry).
 DIRECTION_EXIT_ENABLED          = True    # master switch for exit layer
-DIRECTION_TRAIL_PHASE1_C        = 15      # minutes 0-5 since fill (wide)
+DIRECTION_TRAIL_PHASE1_C        = 10      # 2026-05-07 PT (evening):
+                                           # tightened 15 → 10. Trail-stop
+                                           # TP was the only winning
+                                           # mechanism on today's near-money
+                                           # entries (4/5 settled NO; 1/5
+                                           # TP'd at +19c via Rule B). 15c
+                                           # is too wide — gives back too
+                                           # much profit before triggering.
+                                           # 10c phase-1 captures trail
+                                           # exits earlier on profitable
+                                           # mid-window setups.
 DIRECTION_TRAIL_PHASE2_C        = 8       # minutes 5-10 since fill
 DIRECTION_TRAIL_PHASE3_C        = 5       # minutes 10-13 since fill
 DIRECTION_TRAIL_PHASE4_C        = 3       # last 2 min of session
@@ -2203,6 +2213,26 @@ DIRECTION_PRE_EXPIRY_S          = 90      # seconds to expiry trigger
 DIRECTION_WALL_EXIT_ENABLED     = True    # rule A toggle
 DIRECTION_WALL_RATE_CTPS        = 30      # opposing aggression ct/s threshold
 DIRECTION_WALL_WINDOW_S         = 3.0     # rolling tape window for wall check
+
+# ── CHEAP-CONTINUATION SIZING BOOST (2026-05-07 PT evening) ──────────────
+# Today's user manually traded 308ct YES @ 22c on a strong-distance signal
+# and won +$236 at settlement (3.5x return). The engine fires DIRECTION
+# at similar price points (24c on May 6) but only at 4ct sizing, missing
+# the asymmetric upside. This block boosts contract count when the entry
+# is cheap AND the signal is strong enough to suggest continuation, with
+# total risk still bounded by MAX_RISK_PER_WINDOW_DOLLARS=$15.
+#
+# Math: at 22c entry × 15ct = $3.30 cost. If continuation works (BTC stays
+# past strike), payout 15 × $1 = $15 → +$11.70 net (3.5x). 30% WR breakeven.
+# Backtest WR at dist≥0.10% is well above breakeven.
+DIRECTION_CHEAP_BOOST_ENABLED   = True
+DIRECTION_CHEAP_BOOST_PRICE_C   = 30   # entries ≤ this trigger boost
+DIRECTION_CHEAP_BOOST_MIN_DIST  = 0.0010  # require dist ≥ 0.10% (sweet-spot)
+DIRECTION_CHEAP_BOOST_MIN_MOM   = 20   # require mom ≥ $20 (stronger than $10
+                                        # baseline) to confirm continuation
+DIRECTION_CHEAP_BOOST_CONTRACTS = 15   # override base when all gates hit
+                                        # (Phase-1 $15 cap will further
+                                        # bound this to fit window budget)
 
 # ── UNIFIED SCORER (Phase 4 wiring, 2026-05-07) ──────────────────────────
 # Single-EV decision module that replaces the rigid tier cascade with a
@@ -2243,6 +2273,16 @@ UNIFIED_TAKER_SLIPPAGE_C     = 5      # IOC at ask + 5c (mirrors DIRECTION
                                        # post-fix value, walks 2 depth tiers)
 UNIFIED_POST_FAIL_COOLDOWN_S = 5.0    # backoff after place_order rejection
 UNIFIED_NOFILL_COOLDOWN_S    = 30.0   # cooldown after IOC NOFILL
+UNIFIED_FEE_BUFFER_C         = 2      # 2026-05-07 PT (evening): NEW.
+                                       # Subtracted from ev_cents BEFORE
+                                       # the min_ev gate, so the gate
+                                       # represents net-of-fees EV. Kalshi
+                                       # taker fee on 50c contract is
+                                       # ~1-2c; 2c is conservative. Without
+                                       # this, an "EV-positive" trade per
+                                       # the 3c gate is actually 1c
+                                       # net-of-fees → slightly negative
+                                       # after fee variance.
 # Momentum-heavy + strict-gates weights (best backtest result).
 # Sum should equal 1.0; the scorer normalizes anyway when signals are
 # missing.
@@ -2344,6 +2384,21 @@ PENNY_DAILY_LOSS_HALT_FRAC  = 0.20  # 2026-05-07 PT (afternoon): NEW.
                                      # damage already capped at $1/trade
                                      # but a string of losses w/o halt
                                      # could drain meaningful capital.
+# ── PENNY regime gates (2026-05-07 PT evening) ───────────────────────────
+# PENNY's thesis is "BTC makes asymmetric move in remaining time." This
+# requires (a) enough volatility to move + (b) enough remaining time. Today
+# both PENNY fills (10:20 + 10:39) lost in low-vol regime — BTC didn't
+# move enough to flip the cheap-OTM contract. Gate firing on minimum vol +
+# minimum remaining time so we only bet when the asymmetric move is
+# structurally possible.
+PENNY_MIN_REALIZED_VOL_BPS  = 25   # require realized_vol ≥ this (in bps).
+                                    # ~25bps = enough vol for the implied
+                                    # move on a 7-12c contract to be
+                                    # plausible within remaining session.
+                                    # Set 0 to disable.
+PENNY_MIN_SECONDS_LEFT      = 240  # require ≥4 min remaining. Below this,
+                                    # the asymmetric move has no time to
+                                    # play out. Set 0 to disable.
 
 # Tier sizing fractions (Level 3 — Half-Kelly, OOS-validated)
 FVG_TIER_FRAC_T1                 = 0.35
