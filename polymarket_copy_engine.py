@@ -26103,12 +26103,43 @@ class PolymarketCopyEngine:
                                                 else _bk.best_no_bid
                                             ) or 0
                                         if _curr_bid > 0:
+                                            # 2026-05-09 (Fix N): derive ACTUAL
+                                            # cost basis from Kalshi's reported
+                                            # market_exposure_dollars instead
+                                            # of using current_bid as the
+                                            # phantom-rearm "entry." Prior
+                                            # behavior caused a destructive
+                                            # cycle: position rises 61c→85c
+                                            # (real +$1.20 profit), phantom-
+                                            # sell, re-arm at 85c, STALE
+                                            # immediately fires (entry=85c
+                                            # bid=85c "no profit"), exit
+                                            # again, phantom again, re-arm
+                                            # at 85c again — endless cycle
+                                            # at the high, never consolidating
+                                            # the actual gain. Witnessed
+                                            # 12:19-12:25 PT 2026-05-09.
+                                            # Using true cost basis means
+                                            # entry stays at 61c, hwm stays
+                                            # at 85c, position correctly
+                                            # reports +$1.20 unrealized,
+                                            # STALE doesn't fire, profit-
+                                            # locked trail (Fix I) takes over.
+                                            _cost_basis_c = _curr_bid  # safe fallback
+                                            try:
+                                                if exposure > 0 and kalshi_count > 0:
+                                                    _cost_basis_c = int(
+                                                        round(exposure / kalshi_count * 100)
+                                                    )
+                                            except Exception:
+                                                pass
+                                            _hwm_c = max(_curr_bid, _cost_basis_c)
                                             _now_rearm = time.time()
                                             self._scalp_filled_side = kalshi_side
                                             self._scalp_filled_count = kalshi_count
                                             self._scalp_fill_time = _now_rearm
-                                            self._scalp_entry_price = _curr_bid
-                                            self._scalp_hwm_bid = _curr_bid
+                                            self._scalp_entry_price = _cost_basis_c
+                                            self._scalp_hwm_bid = _hwm_c
                                             self._scalp_ticker = ticker
                                             self._scalp_btc_hwm = float(
                                                 getattr(self, "_btc_last_price", 0)
@@ -26121,7 +26152,7 @@ class PolymarketCopyEngine:
                                                 self._direction_position = {
                                                     "order_id": "phantom_rearm",
                                                     "side": kalshi_side,
-                                                    "entry_cents": _curr_bid,
+                                                    "entry_cents": _cost_basis_c,
                                                     "original_count": kalshi_count,
                                                     "ticker": ticker,
                                                     "tier": "SCALP",
@@ -26130,17 +26161,19 @@ class PolymarketCopyEngine:
                                                     "fill_time": _now_rearm,
                                                     "_hold_to_settle": False,
                                                     "entry_time": _now_rearm,
-                                                    "hwm_bid": _curr_bid,
+                                                    "hwm_bid": _hwm_c,
                                                     "exit_attempted": False,
                                                     "wall_streak_start": 0.0,
                                                     "_phantom_rearm": True,
                                                 }
                                             logger.warning(
                                                 "SCALP RE-ARM (phantom-sell): %s %s %dx "
-                                                "anchored @ current_bid=%dc — exit layer "
-                                                "resumes management",
+                                                "cost_basis=%dc bid=%dc hwm=%dc "
+                                                "(unrealized=%+dc/ct) — exit layer resumes",
                                                 ticker[-15:], kalshi_side.upper(),
-                                                kalshi_count, _curr_bid,
+                                                kalshi_count, _cost_basis_c,
+                                                _curr_bid, _hwm_c,
+                                                _curr_bid - _cost_basis_c,
                                             )
                                     except Exception:
                                         logger.exception(
