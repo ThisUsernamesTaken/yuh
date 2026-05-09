@@ -2649,6 +2649,27 @@ INVERSE_REENTRY_CONTRACTS             = 5    # contracts per re-entry
 # trigger via _direction_manage_exit on DIRECTION-class positions).
 SYNC_RECLAIM_AUTO_TP_ENABLED          = False  # was implicitly True
 SCALP_TO_HOLD_UPGRADE_ENABLED         = False  # was implicitly True
+
+# 2026-05-08 PT (evening, round 4): mark SYNC RECLAIM'd positions as
+# _hold_to_settle so PROTECTIVE [TP] / PROTECTIVE [HOLD] auto-TP layer
+# (the 4th auto-TP path discovered after the user's complaint about
+# small-margin profit-takes) treats them as opt-out and stands down.
+# The protective layer's existing opt-out check at engine.py:20020
+# already handles this cleanly: if pos["_hold_to_settle"] is True, it
+# returns "owned but doing nothing until expiry."
+#
+# Without this, SCALP fills get rescued by SYNC RECLAIM into _open_position
+# with no tier tag, default-tagged TA_FORCED_SIGNAL, then PROTECTIVE [TP]
+# auto-places sells at entry+5c on every cycle — exactly the small-margin
+# profit-take pattern we're trying to eliminate.
+SYNC_RECLAIM_HOLD_TO_SETTLE_ENABLED   = True
+
+# 2026-05-08 PT (evening, round 4): pre-IOC ticker-lock check on SCALP
+# MARKET path. The 19:33:26 trade (BUY YES @ 67c, lost full -$3.43)
+# happened because the SCALP IOC retry timer fired again on the SAME
+# ticker after a position had already closed. The legacy SKIP-REENTRY
+# log fired AFTER the order was placed — too late.
+SCALP_PRE_IOC_TICKER_LOCK_CHECK       = True
 SCALP_REENTRY_SLIP_C                  = 5     # IOC slippage above ask
 
 # Reversal-confidence scorer threshold (2026-05-08). On TRAIL / BTC-TRAIL

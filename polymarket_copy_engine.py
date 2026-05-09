@@ -5163,6 +5163,21 @@ class PolymarketCopyEngine:
                 self._scalp_evaluated = False
                 return
 
+            # 2026-05-08 PT (round 4): pre-IOC ticker-lock check.
+            # Without this, the SCALP MARKET retry timer fires another
+            # IOC on a ticker we've already traded this window — the
+            # 19:33 trade lost $3.43 from this exact pattern. The legacy
+            # SKIP-REENTRY check fires AFTER place_order, too late.
+            if bool(_uc("SCALP_PRE_IOC_TICKER_LOCK_CHECK", False)):
+                _entered = getattr(self, "_entered_tickers_this_window", set())
+                if ticker in _entered:
+                    logger.info(
+                        "SCALP MARKET SKIP: %s already entered this "
+                        "window (pre-IOC lock check)",
+                        ticker[-15:],
+                    )
+                    return  # do NOT re-fire; do NOT increment count
+
             self._window_entry_count = int(
                 getattr(self, "_window_entry_count", 0) or 0
             ) + 1
@@ -25730,6 +25745,16 @@ class PolymarketCopyEngine:
                             else:
                                 _reclaim_tier = "TA_FORCED"
                                 _reclaim_strat = "TA_FORCED_SIGNAL"
+                            # 2026-05-08 PT (round 4): hold-to-settle flag.
+                            # When SYNC_RECLAIM_HOLD_TO_SETTLE_ENABLED=True,
+                            # reclaimed positions get _hold_to_settle=True.
+                            # PROTECTIVE [TP]/[HOLD] layer (engine.py:20020)
+                            # has an existing opt-out for _hold_to_settle that
+                            # returns "owned, doing nothing until expiry."
+                            # This breaks the small-margin auto-TP chain.
+                            _hold_to_settle = bool(
+                                _uc("SYNC_RECLAIM_HOLD_TO_SETTLE_ENABLED", False)
+                            )
                             self._open_position = {
                                 "order_id": "synced_reclaim",
                                 "side": kalshi_side,
@@ -25742,6 +25767,7 @@ class PolymarketCopyEngine:
                                 "count": kalshi_count,
                                 "fill_time": time.time(),
                                 "_dca_maxed": True,  # don't re-DCA reclaimed positions
+                                "_hold_to_settle": _hold_to_settle,  # round 4 fix
                                 "entry_conviction": 0.0,
                                 "entry_wallets": 0,
                                 "entry_wallet_count_at_last_scale": 0,
@@ -25758,6 +25784,12 @@ class PolymarketCopyEngine:
                                 "tp_order_ids": [],
                                 "tp_price": 0,
                             }
+                            if _hold_to_settle:
+                                logger.info(
+                                    "CopyEngine SYNC RECLAIM: tagged "
+                                    "_hold_to_settle=True (PROTECTIVE auto-TP "
+                                    "will stand down per opt-out)"
+                                )
                             if _is_bb_reclaim:
                                 # Cache the BB_PURE context fields so
                                 # _maintain_protective_order's BB_PURE
