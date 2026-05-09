@@ -1,16 +1,20 @@
 # BTC Bias Engine — Current System Reference
 
-**Last updated**: 2026-05-08 (per-ticker lock bypassed for BB_PURE scalp)
+**Last updated**: 2026-05-09 PT (post MOMENTUM_SCALP overhaul + 5 paralysis fixes)
 **Entry point**: `run_copy_engine.py` (NSSM service `BTCBiasEngine` on Windows)
-**Live tiers (cascade order)**: `UNIFIED` → `DIRECTION` → `BB_PURE` (gated off when UNIFIED on) → `PENNY_MODE`
-**Status**: Multi-tier architecture with universal safety layer. Active exit management on all DIRECTION-class fills.
+**Live tier**: `MOMENTUM_SCALP` (single-tier — UNIFIED / DIRECTION / BB_PURE /
+PENNY all retired/gated off in `user_config.py`).
+**Status**: Live trading. Velocity-aware exit + multi-flip inverse re-entry.
+Five paralysis-mode fixes shipped 2026-05-09 (commits `96c6bb2`, `53aaf55`).
 
-> **For the AI agent inheriting this session**: as of 2026-05-07 PT, the
-> engine runs **four entry tiers** in cascade with a universal $15/window
-> risk cap and 1-entry-per-window count cap. All fills route through the
-> same exit layer (5 rules: hold-certain, wall-exit, trail-exit, loss-cut,
-> pre-expiry). DIRECTION's "holds to settlement" promise is **NO LONGER
-> ACCURATE** — the exit layer is active by default.
+> **For the AI agent inheriting this session**: the architecture cascade
+> documented in older versions of this file (UNIFIED → DIRECTION →
+> BB_PURE → PENNY) is **not what runs today**. Every one of those tiers
+> is gated off in `user_config.py`. The only live entry path is
+> MOMENTUM_SCALP. **If this doc and the code disagree, the code wins.**
+> Verify with `grep -E "_ENABLED\s*=\s*True" user_config.py` and check
+> the latest fills via direct Kalshi API (see `docs/NEW_INSTANCE_SETUP.md`
+> Section 12).
 >
 > - Pure modules: `direction_strategy.py`, `unified_scorer.py`
 > - Engine handlers: `_unified_tick`, `_direction_tick`, `_evaluate_bb_pure_signal`,
