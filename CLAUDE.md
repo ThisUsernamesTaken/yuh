@@ -1,6 +1,6 @@
 # BTC Bias Engine — Current System Reference
 
-**Last updated**: 2026-05-07 (multi-tier overhaul + fill-rate tuning)
+**Last updated**: 2026-05-08 (per-ticker lock bypassed for BB_PURE scalp)
 **Entry point**: `run_copy_engine.py` (NSSM service `BTCBiasEngine` on Windows)
 **Live tiers (cascade order)**: `UNIFIED` → `DIRECTION` → `BB_PURE` (gated off when UNIFIED on) → `PENNY_MODE`
 **Status**: Multi-tier architecture with universal safety layer. Active exit management on all DIRECTION-class fills.
@@ -163,8 +163,14 @@ PENNY_MAX_RISK_DOLLARS               = 1.0
 PENNY_DAILY_LOSS_HALT_FRAC           = 0.20    # 2026-05-07 PT NEW: parity
                                                 # with DIRECTION
 
-# Per-window ticker lock — INVIOLABLE
-MAX_TRADES_PER_SESSION_TICKER        = 1
+# Per-window ticker lock — partially relaxed 2026-05-08
+MAX_TRADES_PER_SESSION_TICKER        = 99    # was 1; uncapped per user
+BB_PURE_PER_TICKER_LOCK_ENABLED      = False # NEW: scalp tier bypasses
+                                              # _entered_tickers_this_window
+                                              # at preflight. DIRECTION,
+                                              # UNIFIED, PENNY, TA_FORCED,
+                                              # and oversell-hardening sites
+                                              # still honor the lock.
 SAFETY_OVERSELL_HARDENING            = True
 
 # DISABLED / RETIRED (do NOT re-enable without explicit user direction)
@@ -361,14 +367,21 @@ The UNIFIED scorer's 71.5% backtest claim has the same caveat.
 **Do:**
 - Treat `user_config.py` as the live-behavior switchboard
 - Check Kalshi positions API directly before trusting any engine-side P&L
-- Use `MAX_TRADES_PER_SESSION_TICKER=1` as inviolable
+- Treat the $15/window risk cap (`MAX_RISK_PER_WINDOW_DOLLARS`) as the
+  primary safety net (the per-ticker lock is now relaxed for BB_PURE)
 - Use confirm-with-2nd-fetch BAL protocol before stopping on catastrophe
 - Run `python -m pytest tests/test_direction_strategy.py -q` after any
   direction-strategy change
 
 **Don't:**
 - Re-enable retired strategies without explicit user direction
-- Disable `MAX_TRADES_PER_SESSION_TICKER` or `_entered_tickers_this_window`
+- Disable `MAX_RISK_PER_WINDOW_DOLLARS` (universal $15 cap) — this is now
+  the load-bearing safety net after the per-ticker lock relaxation
+- Re-enable `BB_PURE_PER_TICKER_LOCK_ENABLED` or restore
+  `MAX_TRADES_PER_SESSION_TICKER=1` without explicit user direction
+  (2026-05-08 override; user opted into scalp re-entry on same ticker)
+- Bypass `_entered_tickers_this_window` for any tier OTHER than BB_PURE
+  scalp without explicit user direction
 - Disable `SAFETY_OVERSELL_HARDENING`
 - Disable `MAX_RISK_PER_WINDOW_DOLLARS` (universal $15 cap)
 - Disable `MANUAL_FILLS_CAPTURE_ENABLED=False` (engine should NOT adopt

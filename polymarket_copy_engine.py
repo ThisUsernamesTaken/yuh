@@ -101,6 +101,17 @@ except ImportError:
     UnifiedSignal = None  # type: ignore[assignment,misc]
     _UNIFIED_AVAILABLE = False
 
+# Admission Filter (2026-05-08) — universal 5-gate rejection layer that
+# wraps every entry path. Pure module, additive: if construction or
+# evaluation throws, callers fall through to normal signal evaluation.
+try:
+    from admission_filter import AdmissionFilter, AdmissionResult  # noqa: F401
+    _ADMISSION_AVAILABLE = True
+except ImportError:
+    AdmissionFilter = None  # type: ignore[assignment,misc]
+    AdmissionResult = None  # type: ignore[assignment,misc]
+    _ADMISSION_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 # ── Load user overrides (if user_config.py exists) ──
@@ -923,6 +934,57 @@ class PolymarketCopyEngine:
         # maintain, residual reconciler, post-close sweep) stand down.
         self._pre_expiry_consolidating: bool = False
 
+        # 2026-05-08 MOMENTUM SCALP tier — dual-limit symmetric resting
+        # buy pair at window open. Standalone state (not plumbed through
+        # _direction_position or _open_position to keep the existing exit
+        # cascade out of it; scalp manages its own trail). All fields are
+        # reset in the window-change handler.
+        # _scalp_evaluated: True after we've made the place-or-skip
+        #   decision for the current window (idempotent placement guard).
+        # _scalp_yes_order_id / _scalp_no_order_id: resting order IDs;
+        #   None if not placed or already cancelled/filled.
+        # _scalp_filled_side: "yes" / "no" / "both" / None
+        # _scalp_ticker / _scalp_entry_price / _scalp_filled_count: fill ctx
+        # _scalp_hwm_bid: highest contract bid (filled side) seen since fill
+        # _scalp_fill_time: unix ts of fill (used by pre-expiry exit gate)
+        # _scalp_exit_placed: True after we've fired a sell exit (stops the
+        #   trail loop from re-firing).
+        self._scalp_evaluated: bool = False
+        self._scalp_yes_order_id: str | None = None
+        self._scalp_no_order_id: str | None = None
+        self._scalp_filled_side: str | None = None
+        self._scalp_ticker: str = ""
+        self._scalp_entry_price: int = 0
+        self._scalp_filled_count: int = 0
+        self._scalp_hwm_bid: int = 0
+        self._scalp_btc_hwm: float = 0.0   # BTC price HWM for co-integrated trail
+        self._scalp_btc_side: str = ""      # "yes" or "no" — which side BTC favors
+        self._scalp_ladder_yes_ids: list = []
+        self._scalp_ladder_no_ids: list = []
+        self._scalp_last_ioc_ts: float = 0.0
+        self._scalp_contracts_placed_window: int = 0
+        self._scalp_cap_logged: bool = False
+        self._scalp_fill_time: float = 0.0
+        self._scalp_exit_placed: bool = False
+        # exit order tracking — needed to cancel orphans on window flip
+        self._scalp_exit_order_id: str | None = None
+        self._scalp_exit_price_c: int = 0
+        self._scalp_exit_fire_ts: float = 0.0
+        # "both" tail bookkeeping
+        self._scalp_yes_filled_count: int = 0
+        self._scalp_no_filled_count: int = 0
+        # Asymmetric re-entry after a TRAIL exit (2026-05-08). When True,
+        # the next PHASE 1 placement uses dual-sided asymmetric pricing
+        # rather than the normal single-sided BTC-aware bid. Set in
+        # _scalp_fire_exit() only on reason=="TRAIL"; cleared after the
+        # re-entry pair is placed (or on window flip).
+        self._scalp_reentry_mode: bool = False
+        self._scalp_prior_exit_side: str = ""
+        # 2026-05-08 reversal-confidence scorer: snapshot of the INVERSE
+        # side's best bid at fill time, used by _scalp_fire_exit() to
+        # compute the velocity component of the reversal score.
+        self._scalp_inv_bid_at_fill: int = 0
+
         # Daily loss tracking (circuit breaker)
         self._daily_pnl: float = 0.0           # Running P&L for current UTC day
         self._daily_pnl_date: str = ""         # UTC date string for reset detection
@@ -1070,6 +1132,20 @@ class PolymarketCopyEngine:
         # Per-ticker post-failure cooldown for unified fires
         self._unified_post_fail_cooldown: dict = {}
         self._unified_last_decline_log_ts: float = 0.0
+
+        # Admission Filter (2026-05-08) — universal 5-gate rejection layer.
+        # Stateless; constructed once and reused. See admission_filter.py
+        # for gate definitions. Caller passes live thresholds per call so
+        # tuning user_config + restart picks up new values.
+        self._admission_filter = None
+        try:
+            if _ADMISSION_AVAILABLE and bool(_uc("ADMISSION_FILTER_ENABLED", True)):
+                self._admission_filter = AdmissionFilter()
+                logger.info("ADMISSION filter init: 5-gate architecture active")
+        except Exception:
+            logger.exception("ADMISSION filter init failed — falling through")
+            self._admission_filter = None
+        self._admission_last_log_ts: float = 0.0
 
         # Regime + drawdown instrumentation (Phase 1, 2026-04-21)
         # Pure observation. Does NOT gate entries, does NOT size, does NOT exit.
@@ -1395,10 +1471,56 @@ class PolymarketCopyEngine:
             logger.warning("KalshiWS: failed to start websocket, falling back to REST: %s", e)
             self._kalshi_ws = None
         # ── Recover orphaned positions from previous session ──
-        # If the engine crashed with an open position, recover it and set TPs
+        # If the engine crashed with an open position, recover it and set TPs.
+        #
+        # CONFIRM-WITH-2ND-FETCH (Claude 2026-05-08): live incident this
+        # morning — startup recovery adopted a YES 5x position that Kalshi
+        # reported only on the first fetch; subsequent fetches showed 0
+        # (likely just-settled / cache-lag artifact). The engine then spent
+        # 71s spamming sell-cap blocks before FLAT-CONFIRMED cleared it,
+        # and the spurious _closed_tickers.add (below) caused SYNC RESIDUAL
+        # FLATTEN to cross-spread sell a real upcoming-window position.
+        # Re-fetch ~2s after the first call and only adopt positions that
+        # appear with non-zero count in BOTH responses.
         try:
             positions = await self._client.get_positions()
-            for pos_data in positions:
+            _verified_positions = positions
+            try:
+                _first_btc = {
+                    p.get("ticker", ""): int(float(p.get("position_fp", "0")))
+                    for p in positions or []
+                    if str(p.get("ticker", "")).startswith("KXBTC15M")
+                    and int(float(p.get("position_fp", "0"))) != 0
+                }
+                if _first_btc:
+                    await asyncio.sleep(2.0)
+                    _positions2 = await self._client.get_positions()
+                    _second_btc = {
+                        p.get("ticker", ""): int(float(p.get("position_fp", "0")))
+                        for p in _positions2 or []
+                    }
+                    _phantoms = {
+                        t: c for t, c in _first_btc.items()
+                        if int(_second_btc.get(t, 0)) == 0
+                    }
+                    if _phantoms:
+                        for _pt, _pc in _phantoms.items():
+                            logger.warning(
+                                "CopyEngine STARTUP PHANTOM-AVOIDED: %s "
+                                "first_fetch=%d second_fetch=0 — refusing to "
+                                "adopt; treating as Kalshi cache-lag artifact",
+                                _pt[-15:], _pc,
+                            )
+                        _verified_positions = [
+                            p for p in positions or []
+                            if p.get("ticker", "") not in _phantoms
+                        ]
+            except Exception as _verify_e:
+                logger.warning(
+                    "CopyEngine STARTUP recovery verification failed "
+                    "(proceeding with first fetch): %s", _verify_e,
+                )
+            for pos_data in _verified_positions:
                 pos_count = int(float(pos_data.get("position_fp", "0")))
                 ticker = pos_data.get("ticker", "")
                 resting = pos_data.get("resting_orders_count", 0)
@@ -1449,7 +1571,16 @@ class PolymarketCopyEngine:
                     }
                     # Lock window immediately — recovered positions should NOT trigger re-entry
                     self._window_locked = True
-                    self._closed_tickers.add(ticker)
+                    # NOTE (Claude 2026-05-08): do NOT add the recovered ticker
+                    # to _closed_tickers. _closed_tickers semantically means
+                    # "we sold here; any leftover ct on Kalshi is unintended
+                    # residual — flatten on sight" (consumed only by SYNC
+                    # RESIDUAL FLATTEN). At startup recovery the engine is
+                    # ADOPTING the position, not closing it. Adding it here
+                    # caused SYNC RESIDUAL FLATTEN to cross-spread sell the
+                    # recovered position 64s into startup (witnessed live
+                    # 2026-05-08 12:48 PT). _window_locked=True above is the
+                    # actual re-entry guard.
         except Exception as e:
             logger.warning("CopyEngine STARTUP position recovery failed: %s", e)
 
@@ -2411,6 +2542,20 @@ class PolymarketCopyEngine:
             except Exception:
                 pass
 
+        # ── Momentum scalp tier (2026-05-08) ──────────────────────────
+        # Dual-limit symmetric resting BUY pair at window open. Runs
+        # FIRST in the cascade because it places at PLACEMENT time
+        # (incrementing _window_entry_count immediately), so other
+        # tiers see the 1-per-window cap and stand down during the
+        # placement→fill gap. After fill, manages its own trail/HOLD/
+        # PRE-EXPIRY exits via _scalp_fire_exit (sells route through
+        # _place_capped_side_sell with MIN-TRUTH + OVERSELL-GUARD).
+        if bool(_uc("MOMENTUM_SCALP_ENABLED", False)):
+            try:
+                await self._momentum_scalp_tick()
+            except Exception:
+                logger.exception("CopyEngine SCALP tick error")
+
         # ── Unified scorer (Phase 4 wiring, 2026-05-07) ────────────────
         # Single-EV decision module with momentum-heavy + strict-gates
         # weights. Runs BEFORE the existing DIRECTION/BB_PURE cascade so
@@ -2474,7 +2619,7 @@ class PolymarketCopyEngine:
         # ── Signal cascade (priority order — matches profitable version) ──
         # ONE TRADE PER SESSION. After any exit, window is locked.
         if getattr(self, '_window_locked', False):
-            self._publish_state()
+            pass  # _publish_state removed (method not defined on class)
             return
 
         # ═══════════════════════════════════════════════════════════════════
@@ -2499,7 +2644,7 @@ class PolymarketCopyEngine:
                 bb_sig = await self._evaluate_bb_pure_signal()
                 if bb_sig is not None:
                     await self._execute_bb_pure_signal(bb_sig)
-                    self._publish_state()
+                    pass  # _publish_state removed (method not defined on class)
                     return  # BB_PURE took the session — skip composite cascade
             except Exception:
                 logger.exception("CopyEngine BB_PURE evaluator/execute error")
@@ -2512,7 +2657,7 @@ class PolymarketCopyEngine:
                 mom_sig = await self._evaluate_bb_momentum_signal()
                 if mom_sig is not None:
                     await self._execute_bb_pure_signal(mom_sig)  # reuse path
-                    self._publish_state()
+                    pass  # _publish_state removed (method not defined on class)
                     return
             except Exception:
                 logger.exception("CopyEngine BB_MOMENTUM evaluator/execute error")
@@ -2529,7 +2674,7 @@ class PolymarketCopyEngine:
                 af_sig = await self._evaluate_alignment_fallback_signal()
                 if af_sig is not None:
                     await self._execute_bb_pure_signal(af_sig)  # reuse path
-                    self._publish_state()
+                    pass  # _publish_state removed (method not defined on class)
                     return
             except Exception:
                 logger.exception(
@@ -2577,7 +2722,7 @@ class PolymarketCopyEngine:
         if signal:
             await self._execute_signal(signal)
 
-        self._publish_state()
+        pass  # _publish_state removed (method not defined on class)
 
     async def _discover_active_poly_market(self) -> Optional[dict]:
         """Find the active BTC 15m market via deterministic slug."""
@@ -2839,7 +2984,7 @@ class PolymarketCopyEngine:
         # the direction should update. A bullish pullback that crashes through
         # VWAP and keeps falling is a bearish VWAP cross, not a buy signal.
         if pt["direction_set"] and pt["vwap_triggered"]:
-            _vwap_val = pt.get("vwap_value", 0)
+            _vwap_val = pt.get("vwap_value", 0) or 0
             _btc = getattr(self, '_btc_last_price', 0) or 0
             if _vwap_val > 0 and _btc > 0:
                 # YES direction but BTC crashed well below VWAP → flip to NO
@@ -4593,6 +4738,245 @@ class PolymarketCopyEngine:
                 pass
 
     # ═══════════════════════════════════════════════════════════════════
+    # ADMISSION FILTER (2026-05-08) — universal 5-gate rejection layer
+    # ═══════════════════════════════════════════════════════════════════
+    # The admission filter wraps EVERY entry path. Before any order placement
+    # in any tier, the caller invokes this helper with tier-specific inputs
+    # plus a small set of context fields (ticker, side, ask). The helper
+    # collects the rest from engine state (_last_pressure, _kalshi_tape,
+    # _kalshi_ws book, _last_regime) and returns the AdmissionResult.
+    #
+    # Philosophy: build a bot that is mostly bored. ~87% rejection target
+    # → ~1 trade per 2 hours / per 8 windows. Every gate is throttle-logged.
+    #
+    # Rejection short-circuits per-gate; full result is logged for postmortem.
+    # If the filter is disabled, missing, or throws → returns None (caller
+    # treats this as PASS-THROUGH and proceeds with normal signal eval).
+    # ═══════════════════════════════════════════════════════════════════
+
+    def _admission_evaluate(
+        self,
+        tier: str,
+        ticker: str,
+        side: Optional[str],
+        ask_c: int,
+        fair_prob: float,
+        mid_cents: Optional[float],
+        seconds_elapsed: float,
+        seconds_remaining: float,
+        signal_type: str = "momentum",
+        estimated_slippage_c: Optional[float] = None,
+    ):
+        """Run the universal 5-gate admission filter for any tier.
+
+        Returns:
+            AdmissionResult on success (caller must check .admitted)
+            None if filter is disabled, unavailable, or threw an exception
+            (caller treats None as pass-through to keep filter additive).
+        """
+        try:
+            if self._admission_filter is None:
+                return None
+            if not bool(_uc("ADMISSION_FILTER_ENABLED", True)):
+                return None
+
+            # ── Gate-1 inputs: BTC velocity, contract volume, spread ─────
+            pressure = getattr(self, "_last_pressure", None)
+            btc_30s = float(getattr(pressure, "btc_move_30s", 0.0) or 0.0)
+            btc_velocity_30s = btc_30s / 30.0  # $/s
+
+            tape = getattr(self, "_kalshi_tape", None)
+            contract_volume_session = 0
+            try:
+                if tape is not None:
+                    flow = tape.flow(ticker, 900.0)
+                    contract_volume_session = int(
+                        flow.get("total_volume", 0) or 0
+                    )
+            except Exception:
+                contract_volume_session = 0
+
+            ws = getattr(self, "_kalshi_ws", None)
+            book = None
+            if ws is not None and hasattr(ws, "get_book"):
+                try:
+                    book = ws.get_book(ticker)
+                except Exception:
+                    book = None
+            book_spread_c = 99
+            best_yes_ask = 0
+            best_yes_bid = 0
+            try:
+                if book is not None:
+                    best_yes_ask = int(getattr(book, "best_yes_ask", 0) or 0)
+                    yes_bids = getattr(book, "yes_bids", {}) or {}
+                    if yes_bids:
+                        best_yes_bid = max(int(p) for p in yes_bids.keys())
+                    if best_yes_ask > 0 and best_yes_bid > 0:
+                        book_spread_c = max(0, best_yes_ask - best_yes_bid)
+            except Exception:
+                book_spread_c = 99
+
+            # ── Gate-2 inputs: BB mispricing magnitude ───────────────────
+            bb_mispricing_c = 0.0
+            try:
+                if mid_cents is not None and 0.0 < fair_prob < 1.0:
+                    fair_c = fair_prob * 100.0
+                    bb_mispricing_c = fair_c - float(mid_cents)
+            except Exception:
+                bb_mispricing_c = 0.0
+
+            # Slippage default: tier's configured taker slip (or override)
+            if estimated_slippage_c is None:
+                if tier == "DIRECTION":
+                    estimated_slippage_c = float(
+                        _uc("DIRECTION_TAKER_SLIPPAGE_C", 5)
+                    )
+                elif tier == "UNIFIED":
+                    estimated_slippage_c = float(
+                        _uc("UNIFIED_TAKER_SLIPPAGE_C", 5)
+                    )
+                else:
+                    estimated_slippage_c = 3.0
+
+            # ── Gate-3 input: ask-side depth within 2c of best ask ───────
+            # When side is unknown (e.g. pre-scoring in UNIFIED), use the
+            # max of YES-side and NO-side depths as a "is the book alive
+            # somewhere?" proxy. When side is known, use that side's depth.
+            ask_depth_at_target = 0
+            try:
+                if book is not None:
+                    def _depth(_side: str, _ask: int) -> int:
+                        if _ask <= 0:
+                            return 0
+                        opp_bids = (
+                            getattr(book, "no_bids", {}) if _side == "yes"
+                            else getattr(book, "yes_bids", {})
+                        ) or {}
+                        base_opp_px = max(1, 100 - int(_ask))
+                        cum = 0
+                        for k in range(0, 3):  # 0, 1, 2 cents of slip
+                            opp_px = max(1, base_opp_px - k)
+                            cum += int(opp_bids.get(opp_px, 0) or 0)
+                        return cum
+                    if side == "yes":
+                        ask_depth_at_target = _depth("yes", ask_c)
+                    elif side == "no":
+                        ask_depth_at_target = _depth("no", ask_c)
+                    else:
+                        # Side unknown — use the better of the two sides.
+                        _yes_d = _depth("yes", best_yes_ask)
+                        _no_ask = int(getattr(book, "best_no_ask", 0) or 0)
+                        _no_d = _depth("no", _no_ask)
+                        ask_depth_at_target = max(_yes_d, _no_d)
+            except Exception:
+                ask_depth_at_target = 0
+
+            # ── Gate-5 inputs: regime detection ──────────────────────────
+            btc_5m_move = 0.0
+            try:
+                btc_5m_move = float(
+                    getattr(pressure, "btc_move_300s", 0.0) or 0.0
+                )
+            except Exception:
+                btc_5m_move = 0.0
+            # Trending: 5m move > $30 AND 30s velocity sign agrees.
+            btc_trending = (
+                abs(btc_5m_move) >= 30.0
+                and (
+                    btc_5m_move > 0 and btc_30s > 0
+                    or btc_5m_move < 0 and btc_30s < 0
+                )
+            )
+            # Choppy: 5m move small OR 30s velocity sign opposite 5m sign.
+            btc_choppy = (
+                abs(btc_5m_move) < 10.0
+                or (btc_5m_move > 0 and btc_30s < 0)
+                or (btc_5m_move < 0 and btc_30s > 0)
+            )
+
+            # Live thresholds from user_config
+            min_velocity = float(_uc("ADMISSION_MIN_VELOCITY", 0.50))
+            min_volume = int(_uc("ADMISSION_MIN_VOLUME", 5))
+            max_spread_c = int(_uc("ADMISSION_MAX_SPREAD_C", 5))
+            big_edge_c = float(_uc("ADMISSION_BIG_EDGE_BYPASS_C", 15.0))
+            buf_c = float(_uc("ADMISSION_MIN_MISPRICING_BUFFER_C", 2.0))
+            min_depth = int(_uc("ADMISSION_MIN_DEPTH", 3))
+            early_s = float(_uc("ADMISSION_EARLY_REJECT_S", 120.0))
+            late_s = float(_uc("ADMISSION_LATE_REJECT_S", 60.0))
+            pref_start = float(_uc("ADMISSION_PREF_WINDOW_START_S", 420.0))
+            pref_end = float(_uc("ADMISSION_PREF_WINDOW_END_S", 720.0))
+            cert_min_left = float(_uc("ADMISSION_CERTAINTY_MIN_LEFT_S", 120.0))
+            fee_c = float(_uc("ADMISSION_FEE_C", 1.0))
+
+            return self._admission_filter.evaluate(
+                btc_velocity_30s=btc_velocity_30s,
+                contract_volume_session=contract_volume_session,
+                book_spread_c=book_spread_c,
+                bb_mispricing_c=bb_mispricing_c,
+                estimated_slippage_c=float(estimated_slippage_c),
+                fee_c=fee_c,
+                ask_depth_at_target=ask_depth_at_target,
+                min_fill_target=min_depth,
+                seconds_elapsed=seconds_elapsed,
+                seconds_remaining=seconds_remaining,
+                signal_type=signal_type,
+                btc_trending=btc_trending,
+                btc_choppy=btc_choppy,
+                min_velocity=min_velocity,
+                min_volume=min_volume,
+                max_spread_c=max_spread_c,
+                big_mispricing_bypass_c=big_edge_c,
+                mispricing_buffer_c=buf_c,
+                early_reject_s=early_s,
+                late_reject_s=late_s,
+                preferred_window_start_s=pref_start,
+                preferred_window_end_s=pref_end,
+                certainty_min_seconds_remaining=cert_min_left,
+            )
+        except Exception:
+            # Filter must NEVER block the engine. Log once and pass through.
+            try:
+                logger.exception(
+                    "ADMISSION filter raised — falling through (tier=%s)",
+                    tier,
+                )
+            except Exception:
+                pass
+            return None
+
+    def _admission_log(self, tier: str, ticker: str, result) -> None:
+        """Throttled admission-result logger.
+
+        Pass-through (result=None) is silent. Otherwise:
+          - PASS  → INFO (always log; rare event)
+          - REJECT → INFO, throttled per-tier per-reason (every 30s)
+        """
+        if result is None:
+            return
+        try:
+            if result.admitted:
+                logger.info(
+                    "CopyEngine ADMISSION PASS [%s %s]: %s",
+                    tier, ticker[-15:] if ticker else "-",
+                    result.log_line(),
+                )
+                return
+            # Throttle rejects so we don't flood the log.
+            now = time.time()
+            key = f"_admission_reject_log_{tier}_{result.rejection_reason or 'x'}"
+            last = float(getattr(self, key, 0.0) or 0.0)
+            if (now - last) >= 30.0:
+                logger.info(
+                    "CopyEngine ADMISSION REJECT [%s %s]: %s",
+                    tier, ticker[-15:] if ticker else "-",
+                    result.log_line(),
+                )
+                setattr(self, key, now)
+        except Exception:
+            pass
+
+    # ═══════════════════════════════════════════════════════════════════
     # PHASE 4 (2026-05-07 OVERHAUL) — PENNY_MODE asymmetric hunter
     # ═══════════════════════════════════════════════════════════════════
     # Tier-3 strategy. Activates ONLY when BB_PURE and DIRECTION both
@@ -4603,6 +4987,1102 @@ class PolymarketCopyEngine:
     # non-trivial reversal probability over the remaining window time.
     # Asymmetric payout: 5ct × 5c = $0.25 risk → up to $5 settlement.
     # ═══════════════════════════════════════════════════════════════════
+
+    # ═══════════════════════════════════════════════════════════════════
+    # MOMENTUM SCALP tier (2026-05-08) — market-consensus resting pullback trap
+    # ───────────────────────────────────────────────────────────────────
+    # Primary state lives on `_scalp_*` attributes (state machine, fill
+    # tracking, trail HWM) and is wiped on window flip.
+    #
+    # 2026-05-08 GHOST-DESYNC FIX: SCALP fills now ALSO populate
+    # self._direction_position (tier="SCALP" / "SCALP_BOTH") and add the
+    # ticker to self._direction_active_tickers + self._entered_tickers_this_window
+    # + self._recent_placement_tickers. This is purely so the reconcile
+    # loop in _maintain_protective_order takes the SYNC RECLAIM
+    # SKIP-DIRECTION elif (suppresses spurious GHOST IGNORED warnings on
+    # legitimate scalp fills). _direction_manage_exit short-circuits
+    # early when strategy_name=="SCALP" — exits are still driven by
+    # PHASE 3 below (trail / PRE-EXPIRY) for single-leg fills, and the
+    # "both" leg holds to settlement.
+    #
+    # Window-safety counters: increments _window_entry_count at PLACEMENT
+    # so other tiers see the 1-per-window cap and stand down. Increments
+    # _window_committed_cents on actual fill (entry_c × filled_count).
+    # _record_window_fill() is intentionally NOT called at fill — it would
+    # double-increment _window_entry_count, which was already +1 at PLACE
+    # for race prevention.
+    # Sells are routed through _place_capped_side_sell (MIN-TRUTH +
+    # OVERSELL-GUARD) so a stale or duplicated exit cannot drain the
+    # account via Kalshi's sell-to-open inverse semantics.
+    # ═══════════════════════════════════════════════════════════════════
+    async def _momentum_scalp_tick(self) -> None:
+        """One iteration of the MOMENTUM SCALP tier. Idempotent across the
+        full window lifecycle (place → poll → cancel-other → trail → exit).
+        Wrapped in caller's try/except so failures cannot break the cascade.
+        """
+        if not bool(_uc("MOMENTUM_SCALP_ENABLED", False)):
+            return
+
+        ticker = getattr(self, "_current_kalshi_ticker", "") or ""
+        if not ticker:
+            return
+
+        now = time.time()
+
+        # ── PHASE 1: PLACE (idempotent — fires once per window) ──────────
+        if not self._scalp_evaluated:
+            self._scalp_evaluated = True
+
+            # Honor the universal startup-skip lock: on the first window
+            # after engine boot, _window_locked=True so we don't trade
+            # against unknown pre-existing positions. Other tiers obey
+            # this via the early-return at the top of the cascade; scalp
+            # runs above that return so it must check inline.
+            if getattr(self, "_window_locked", False):
+                logger.info(
+                    "SCALP SKIP: _window_locked=True (startup-skip)",
+                )
+                return
+
+            # 2026-05-08 BOOT-DETECT FIX: _window_start_time is reset to
+            # `now` whenever the tape poll first observes a ticker —
+            # including engine boot. So a 4-min-old window looks 0s old
+            # to that timer. Use the contract's real session-open time
+            # (expiry - 900_000 ms) as ground truth for window age.
+            session_start_ms = float(
+                getattr(self, "_kalshi_session_start_ms", 0) or 0,
+            )
+            real_window_age = (
+                (now * 1000 - session_start_ms) / 1000.0
+                if session_start_ms > 0 else 9999.0
+            )
+            max_age = float(_uc("SCALP_PLACE_MAX_AGE_S", 30.0))
+            if session_start_ms <= 0 or real_window_age > max_age:
+                logger.info(
+                    "SCALP SKIP: real window age=%.1fs > max=%.1fs "
+                    "(boot mid-window or late tick) — won't place",
+                    real_window_age, max_age,
+                )
+                return
+
+            entry_c = int(_uc("SCALP_ENTRY_C", 58))
+            contracts = int(_uc("SCALP_CONTRACTS", 5))
+            max_risk_d = float(_uc("SCALP_MAX_RISK_DOLLARS", 5.0))
+
+            if entry_c <= 0 or entry_c >= 100 or contracts <= 0:
+                logger.warning(
+                    "SCALP SKIP: invalid config entry=%dc count=%d",
+                    entry_c, contracts,
+                )
+                return
+
+            per_side_cost_c = entry_c * contracts
+            if per_side_cost_c / 100.0 > max_risk_d:
+                logger.warning(
+                    "SCALP SKIP: per-side cost $%.2f > "
+                    "SCALP_MAX_RISK_DOLLARS $%.2f",
+                    per_side_cost_c / 100.0, max_risk_d,
+                )
+                return
+
+            # Safety check: single-side cost (we only place one side now)
+            ok, reason = self._check_window_safety(per_side_cost_c, "SCALP")
+            if not ok:
+                logger.info("SCALP SKIP: %s", reason)
+                return
+
+            self._scalp_ticker = ticker
+
+            # ── MARKET ENTRY (2026-05-08) ────────────────────────────
+            # IOC at ask+slip on the side with the higher ask (the
+            # market's slight favorite). No resting limits — trades
+            # every window immediately. Trail + reversal scorer manage
+            # everything from there.
+            #
+            # SAFETY (2026-05-08 post-mortem): 5s cooldown between IOC
+            # attempts + hard 10ct cap per window. The 300ms retry loop
+            # drained $62 via undetected partial fills.
+            _scalp_cooldown = float(_uc("SCALP_IOC_COOLDOWN_S", 5.0))
+            _last_ioc = float(
+                getattr(self, "_scalp_last_ioc_ts", 0) or 0,
+            )
+            if (now - _last_ioc) < _scalp_cooldown:
+                return  # respect cooldown
+
+            # Hard per-window contract cap
+            _max_cts_window = int(_uc("SCALP_MAX_CONTRACTS_WINDOW", 10))
+            _cts_placed = int(
+                getattr(self, "_scalp_contracts_placed_window", 0) or 0,
+            )
+            if _cts_placed >= _max_cts_window:
+                if not getattr(self, "_scalp_cap_logged", False):
+                    logger.info(
+                        "SCALP CAP: %d/%d contracts placed this window",
+                        _cts_placed, _max_cts_window,
+                    )
+                    self._scalp_cap_logged = True
+                return
+
+            slip_c = int(_uc("SCALP_REENTRY_SLIP_C", 5))
+            yes_ask, no_ask = 0, 0
+            try:
+                _ws = getattr(self, "_kalshi_ws", None)
+                if _ws and hasattr(_ws, "get_book"):
+                    _bk = _ws.get_book(ticker)
+                    if _bk and getattr(_bk, "is_ready", False):
+                        yes_ask = int(getattr(_bk, "best_yes_ask", 0) or 0)
+                        no_ask = int(getattr(_bk, "best_no_ask", 0) or 0)
+            except Exception:
+                pass
+
+            if yes_ask <= 0 and no_ask <= 0:
+                self._scalp_evaluated = False
+                return  # book not ready, retry next tick
+
+            # Pick the market favorite (higher ask = more demand)
+            if yes_ask >= no_ask:
+                pick_side = "yes"
+                pick_ask = yes_ask
+            else:
+                pick_side = "no"
+                pick_ask = no_ask
+
+            ioc_price = min(pick_ask + slip_c, 95)
+            ioc_cost_c = ioc_price * contracts
+
+            # Safety
+            ok, reason = self._check_window_safety(ioc_cost_c, "SCALP")
+            if not ok:
+                logger.info("SCALP SKIP: %s", reason)
+                self._scalp_evaluated = False
+                return
+
+            self._window_entry_count = int(
+                getattr(self, "_window_entry_count", 0) or 0
+            ) + 1
+            try:
+                self._add_session_lock(ticker)
+            except Exception:
+                pass
+            try:
+                self._recent_placement_tickers[ticker] = now
+            except Exception:
+                pass
+
+            self._scalp_last_ioc_ts = now  # stamp BEFORE the call
+
+            try:
+                mkt_order = await self._client.place_order(
+                    ticker=ticker, side=pick_side,
+                    count=contracts, price=ioc_price,
+                    order_type="limit", action="buy",
+                    time_in_force="immediate_or_cancel",
+                )
+                mkt_oid = getattr(mkt_order, "order_id", None)
+                mkt_filled = int(
+                    getattr(mkt_order, "count_filled", 0) or 0,
+                )
+                mkt_avg = int(
+                    getattr(mkt_order, "average_price", 0) or 0,
+                )
+
+                if mkt_filled > 0:
+                    self._scalp_contracts_placed_window = int(
+                        getattr(self, "_scalp_contracts_placed_window", 0) or 0,
+                    ) + mkt_filled
+                    self._scalp_filled_side = pick_side
+                    self._scalp_filled_count = mkt_filled
+                    self._scalp_fill_time = now
+                    self._scalp_entry_price = mkt_avg
+                    self._scalp_hwm_bid = mkt_avg
+                    self._scalp_btc_hwm = float(
+                        getattr(self, "_btc_last_price", 0) or 0,
+                    )
+                    self._scalp_btc_side = pick_side
+                    # Snapshot inverse bid for reversal velocity calc
+                    try:
+                        inv_bid_key = (
+                            "best_no_bid" if pick_side == "yes"
+                            else "best_yes_bid"
+                        )
+                        self._scalp_inv_bid_at_fill = int(
+                            getattr(_bk, inv_bid_key, 0) or 0,
+                        )
+                    except Exception:
+                        self._scalp_inv_bid_at_fill = 0
+                    # Window accounting
+                    try:
+                        self._window_committed_cents = int(
+                            getattr(self, "_window_committed_cents", 0) or 0,
+                        ) + mkt_avg * mkt_filled
+                    except Exception:
+                        pass
+                    # Ghost-desync: register in direction position
+                    self._direction_position = {
+                        "order_id": mkt_oid or "",
+                        "side": pick_side,
+                        "entry_cents": mkt_avg,
+                        "original_count": mkt_filled,
+                        "ticker": ticker,
+                        "tier": "SCALP",
+                        "strategy_name": "SCALP",
+                        "count": mkt_filled,
+                        "fill_time": now,
+                        "_hold_to_settle": False,
+                        "entry_time": now,
+                        "hwm_bid": mkt_avg,
+                        "exit_attempted": False,
+                        "wall_streak_start": 0.0,
+                    }
+                    try:
+                        self._add_direction_active(ticker)
+                    except Exception:
+                        pass
+                    if mkt_oid:
+                        self._engine_placed_order_ids[mkt_oid] = now
+                    logger.info(
+                        "SCALP MARKET FILL: %s %dx @ %dc IOC "
+                        "(ask=%dc+%dc) yes_ask=%dc no_ask=%dc | "
+                        "ticker=%s",
+                        pick_side.upper(), mkt_filled, mkt_avg,
+                        pick_ask, slip_c, yes_ask, no_ask,
+                        ticker[-15:],
+                    )
+                else:
+                    logger.info(
+                        "SCALP MARKET NOFILL: %s IOC@%dc "
+                        "(ask=%dc) — retry in %.0fs | ticker=%s",
+                        pick_side.upper(), ioc_price, pick_ask,
+                        _scalp_cooldown, ticker[-15:],
+                    )
+                    # Un-evaluate so we retry, but cooldown timer gates
+                    # the next attempt (no more 300ms spam)
+                    self._scalp_evaluated = False
+            except Exception as e:
+                logger.exception("SCALP MARKET entry error: %s", e)
+                self._scalp_evaluated = False
+
+            return
+
+        # ── PHASE 2: POLL for fills across the ladder ────────────────
+        # Aggregate fills from ALL ladder orders per side. When any
+        # fill is detected on one side, cancel the entire opposite
+        # side's ladder.
+        if self._scalp_filled_side is None:
+            yes_filled, no_filled = 0, 0
+            yes_cost_total, no_cost_total = 0, 0  # for weighted avg
+
+            for _yid in getattr(self, "_scalp_ladder_yes_ids", []):
+                try:
+                    _yo = await self._client.get_order(_yid)
+                    _yf = int(getattr(_yo, "filled_count", 0) or 0)
+                    _ya = getattr(_yo, "average_price", None)
+                    _ya = int(round(float(_ya))) if _ya is not None else 0
+                    if _yf > 0:
+                        yes_filled += _yf
+                        yes_cost_total += _yf * (_ya if _ya > 0 else self._scalp_entry_price)
+                except Exception:
+                    pass
+
+            for _nid in getattr(self, "_scalp_ladder_no_ids", []):
+                try:
+                    _no = await self._client.get_order(_nid)
+                    _nf = int(getattr(_no, "filled_count", 0) or 0)
+                    _na = getattr(_no, "average_price", None)
+                    _na = int(round(float(_na))) if _na is not None else 0
+                    if _nf > 0:
+                        no_filled += _nf
+                        no_cost_total += _nf * (_na if _na > 0 else self._scalp_entry_price)
+                except Exception:
+                    pass
+
+            # Weighted average fill prices
+            yes_avg = (
+                int(round(yes_cost_total / yes_filled))
+                if yes_filled > 0 else 0
+            )
+            no_avg = (
+                int(round(no_cost_total / no_filled))
+                if no_filled > 0 else 0
+            )
+
+            # Defensive: if filled_count > 0 but avg_price is missing/0
+            # (rare, race against Kalshi's fill cost denormalization),
+            # fall back to limit price so we don't divide-by-zero P&L.
+            limit_c = self._scalp_entry_price  # the limit price we placed at
+            if yes_filled > 0 and yes_avg <= 0:
+                yes_avg = limit_c
+            if no_filled > 0 and no_avg <= 0:
+                no_avg = limit_c
+
+            if yes_filled > 0 and no_filled > 0:
+                # Both legs filled — choppy window. Hold both to settlement
+                # (one wins +$1, one loses cost; net = $1 - yes_avg - no_avg).
+                self._scalp_filled_side = "both"
+                self._scalp_yes_filled_count = yes_filled
+                self._scalp_no_filled_count = no_filled
+                self._scalp_filled_count = yes_filled + no_filled
+                self._scalp_fill_time = now
+                # Track avg for both — use a weighted single price for
+                # log convenience; both-fill exits don't run the trail.
+                try:
+                    self._window_committed_cents = int(
+                        getattr(self, "_window_committed_cents", 0) or 0,
+                    ) + yes_avg * yes_filled + no_avg * no_filled
+                except Exception:
+                    pass
+                # 2026-05-08 GHOST-DESYNC FIX: register on _direction_position
+                # + _direction_active_tickers so the reconcile loop's
+                # SKIP-DIRECTION elif fires for both Kalshi position records
+                # (set is keyed by ticker, not side). _direction_position
+                # only tracks one side; pick YES for log/exit attribution.
+                # Hedge holds to settlement, so the exit layer is intentionally
+                # not engaged (tier="SCALP_BOTH" + _hold_to_settle=True).
+                _now_fill = now
+                self._direction_position = {
+                    "order_id": self._scalp_yes_order_id or "",
+                    "side": "yes",
+                    "entry_cents": yes_avg,
+                    "original_count": yes_filled + no_filled,
+                    "ticker": ticker,
+                    "tier": "SCALP_BOTH",
+                    "strategy_name": "SCALP",
+                    "count": yes_filled + no_filled,
+                    "fill_time": _now_fill,
+                    "_hold_to_settle": True,
+                    "entry_time": _now_fill,
+                    "hwm_bid": 0,
+                    "exit_attempted": False,
+                    "wall_streak_start": 0.0,
+                    "_scalp_yes_count": yes_filled,
+                    "_scalp_no_count": no_filled,
+                    "_scalp_yes_avg_c": yes_avg,
+                    "_scalp_no_avg_c": no_avg,
+                }
+                try:
+                    self._add_direction_active(ticker)
+                except Exception:
+                    pass
+                try:
+                    logger.info(
+                        "WINDOW-CAP UPDATE: tier=SCALP_BOTH "
+                        "+%dct@%dc + %dct@%dc=$%.2f | committed=$%.2f / "
+                        "entries=%d (caps: $%.2f / %d)",
+                        yes_filled, yes_avg, no_filled, no_avg,
+                        (yes_avg * yes_filled + no_avg * no_filled) / 100,
+                        self._window_committed_cents / 100,
+                        self._window_entry_count,
+                        float(_uc("MAX_RISK_PER_WINDOW_DOLLARS", 0.0) or 0.0),
+                        int(_uc("MAX_ENTRIES_PER_WINDOW", 0) or 0),
+                    )
+                except Exception:
+                    pass
+                logger.warning(
+                    "SCALP BOTH-FILL: choppy window, accepting hedge loss "
+                    "(yes=%dx@%dc + no=%dx@%dc on %s, limit=%dc) — holding "
+                    "to settle",
+                    yes_filled, yes_avg, no_filled, no_avg, ticker[-15:],
+                    limit_c,
+                )
+                return
+
+            if yes_filled > 0:
+                self._scalp_filled_side = "yes"
+                self._scalp_filled_count = yes_filled
+                self._scalp_fill_time = now
+                self._scalp_entry_price = yes_avg  # actual fill, not limit
+                self._scalp_hwm_bid = yes_avg
+                # BTC co-integrated trail: snapshot BTC at fill time
+                self._scalp_btc_hwm = float(
+                    getattr(self, "_btc_last_price", 0) or 0,
+                )
+                self._scalp_btc_side = "yes"
+                # Reversal-confidence scorer: snapshot the INVERSE side's
+                # bid at fill time. _scalp_fire_exit() compares the
+                # current inverse bid to this baseline as the velocity
+                # component of the reversal score.
+                try:
+                    _ws_snap = getattr(self, "_kalshi_ws", None)
+                    if _ws_snap and hasattr(_ws_snap, "get_book"):
+                        _bk_snap = _ws_snap.get_book(ticker)
+                        if _bk_snap and getattr(
+                            _bk_snap, "is_ready", False,
+                        ):
+                            self._scalp_inv_bid_at_fill = int(
+                                getattr(_bk_snap, "best_no_bid", 0) or 0,
+                            )
+                        else:
+                            self._scalp_inv_bid_at_fill = 0
+                    else:
+                        self._scalp_inv_bid_at_fill = 0
+                except Exception:
+                    self._scalp_inv_bid_at_fill = 0
+                try:
+                    self._window_committed_cents = int(
+                        getattr(self, "_window_committed_cents", 0) or 0,
+                    ) + yes_avg * yes_filled
+                except Exception:
+                    pass
+                # 2026-05-08 GHOST-DESYNC FIX: register on _direction_position
+                # + _direction_active_tickers so the reconcile loop's
+                # SKIP-DIRECTION elif fires (suppresses GHOST IGNORED on
+                # this ticker). _hold_to_settle=False — SCALP runs its own
+                # trail/PRE-EXPIRY exits in PHASE 3, not the DIRECTION
+                # exit layer. The position record exists purely for the
+                # ghost/reconcile path; PHASE 3 still drives sells.
+                _now_fill = now
+                self._direction_position = {
+                    "order_id": self._scalp_yes_order_id or "",
+                    "side": "yes",
+                    "entry_cents": yes_avg,
+                    "original_count": yes_filled,
+                    "ticker": ticker,
+                    "tier": "SCALP",
+                    "strategy_name": "SCALP",
+                    "count": yes_filled,
+                    "fill_time": _now_fill,
+                    "_hold_to_settle": False,
+                    "entry_time": _now_fill,
+                    "hwm_bid": yes_avg,
+                    "exit_attempted": False,
+                    "wall_streak_start": 0.0,
+                }
+                try:
+                    self._add_direction_active(ticker)
+                except Exception:
+                    pass
+                try:
+                    logger.info(
+                        "WINDOW-CAP UPDATE: tier=SCALP +%dct@%dc=$%.2f | "
+                        "committed=$%.2f / entries=%d (caps: $%.2f / %d)",
+                        yes_filled, yes_avg, (yes_filled * yes_avg) / 100,
+                        self._window_committed_cents / 100,
+                        self._window_entry_count,
+                        float(_uc("MAX_RISK_PER_WINDOW_DOLLARS", 0.0) or 0.0),
+                        int(_uc("MAX_ENTRIES_PER_WINDOW", 0) or 0),
+                    )
+                except Exception:
+                    pass
+                logger.info(
+                    "SCALP FILL: YES filled %dx @ avg=%dc (ladder %dc-%dc) "
+                    "on %s — cancelling NO ladder",
+                    yes_filled, yes_avg,
+                    int(_uc("SCALP_ENTRY_C", 58)),
+                    int(_uc("SCALP_LADDER_TOP_C", 62)),
+                    ticker[-15:],
+                )
+                # Cancel entire NO ladder
+                for _cid in getattr(self, "_scalp_ladder_no_ids", []):
+                    try:
+                        await self._client.cancel_order(_cid)
+                    except Exception:
+                        pass
+                self._scalp_ladder_no_ids = []
+                self._scalp_no_order_id = None
+                return
+
+            if no_filled > 0:
+                self._scalp_filled_side = "no"
+                self._scalp_filled_count = no_filled
+                self._scalp_fill_time = now
+                self._scalp_entry_price = no_avg  # actual fill, not limit
+                self._scalp_hwm_bid = no_avg
+                # BTC co-integrated trail: snapshot BTC at fill time
+                self._scalp_btc_hwm = float(
+                    getattr(self, "_btc_last_price", 0) or 0,
+                )
+                self._scalp_btc_side = "no"
+                # Reversal-confidence scorer: snapshot the INVERSE side's
+                # bid (YES bid) at fill time. See yes branch for context.
+                try:
+                    _ws_snap = getattr(self, "_kalshi_ws", None)
+                    if _ws_snap and hasattr(_ws_snap, "get_book"):
+                        _bk_snap = _ws_snap.get_book(ticker)
+                        if _bk_snap and getattr(
+                            _bk_snap, "is_ready", False,
+                        ):
+                            self._scalp_inv_bid_at_fill = int(
+                                getattr(_bk_snap, "best_yes_bid", 0) or 0,
+                            )
+                        else:
+                            self._scalp_inv_bid_at_fill = 0
+                    else:
+                        self._scalp_inv_bid_at_fill = 0
+                except Exception:
+                    self._scalp_inv_bid_at_fill = 0
+                try:
+                    self._window_committed_cents = int(
+                        getattr(self, "_window_committed_cents", 0) or 0,
+                    ) + no_avg * no_filled
+                except Exception:
+                    pass
+                # 2026-05-08 GHOST-DESYNC FIX: see "yes" branch for context.
+                _now_fill = now
+                self._direction_position = {
+                    "order_id": self._scalp_no_order_id or "",
+                    "side": "no",
+                    "entry_cents": no_avg,
+                    "original_count": no_filled,
+                    "ticker": ticker,
+                    "tier": "SCALP",
+                    "strategy_name": "SCALP",
+                    "count": no_filled,
+                    "fill_time": _now_fill,
+                    "_hold_to_settle": False,
+                    "entry_time": _now_fill,
+                    "hwm_bid": no_avg,
+                    "exit_attempted": False,
+                    "wall_streak_start": 0.0,
+                }
+                try:
+                    self._add_direction_active(ticker)
+                except Exception:
+                    pass
+                try:
+                    logger.info(
+                        "WINDOW-CAP UPDATE: tier=SCALP +%dct@%dc=$%.2f | "
+                        "committed=$%.2f / entries=%d (caps: $%.2f / %d)",
+                        no_filled, no_avg, (no_filled * no_avg) / 100,
+                        self._window_committed_cents / 100,
+                        self._window_entry_count,
+                        float(_uc("MAX_RISK_PER_WINDOW_DOLLARS", 0.0) or 0.0),
+                        int(_uc("MAX_ENTRIES_PER_WINDOW", 0) or 0),
+                    )
+                except Exception:
+                    pass
+                logger.info(
+                    "SCALP FILL: NO filled %dx @ avg=%dc (ladder %dc-%dc) "
+                    "on %s — cancelling YES ladder",
+                    no_filled, no_avg,
+                    int(_uc("SCALP_ENTRY_C", 58)),
+                    int(_uc("SCALP_LADDER_TOP_C", 62)),
+                    ticker[-15:],
+                )
+                # Cancel entire YES ladder
+                for _cid in getattr(self, "_scalp_ladder_yes_ids", []):
+                    try:
+                        await self._client.cancel_order(_cid)
+                    except Exception:
+                        pass
+                self._scalp_ladder_yes_ids = []
+                self._scalp_yes_order_id = None
+                return
+
+            return  # nothing filled yet — wait for next tick
+
+        # ── PHASE 3: TRAIL on the filled side ────────────────────────────
+        if self._scalp_filled_side == "both":
+            return  # accept the hedge — no exit, hold to settlement
+
+        if self._scalp_exit_placed:
+            return  # exit already fired this window
+
+        side = self._scalp_filled_side  # "yes" or "no"
+        bid = self._scalp_get_side_bid(ticker, side)
+        if bid <= 0:
+            return  # no usable book quote; wait one tick
+
+        if bid > self._scalp_hwm_bid:
+            self._scalp_hwm_bid = bid
+
+        near_certain_c = int(_uc("SCALP_NEAR_CERTAIN_C", 90))
+        pre_expiry_s = int(_uc("SCALP_PRE_EXPIRY_S", 60))
+        entry_c = self._scalp_entry_price
+
+        if bid >= near_certain_c:
+            return  # rule C: HOLD-CERTAIN
+
+        expiry_ms = float(getattr(self, "_kalshi_expiry_ms", 0) or 0)
+        secs_left = (
+            max(0.0, (expiry_ms - now * 1000) / 1000.0) if expiry_ms else 0.0
+        )
+
+        # Phase-gated trail width: wide early (let position develop),
+        # tightens toward expiry to lock in gains. Same approach as the
+        # DIRECTION exit layer but tuned for the scalp.
+        fill_age = now - (self._scalp_fill_time or now)
+        if fill_age < 300:          # 0-5 min
+            trail_c = int(_uc("SCALP_TRAIL_PHASE1_C", 15))
+        elif fill_age < 600:        # 5-10 min
+            trail_c = int(_uc("SCALP_TRAIL_PHASE2_C", 10))
+        elif fill_age < 780:        # 10-13 min
+            trail_c = int(_uc("SCALP_TRAIL_PHASE3_C", 5))
+        else:                       # 13m+ or ≤120s left
+            trail_c = int(_uc("SCALP_TRAIL_PHASE4_C", 3))
+
+        if 0 < secs_left <= pre_expiry_s and bid > entry_c:
+            logger.info(
+                "SCALP PRE-EXPIRY: side=%s bid=%dc entry=%dc secs_left=%.0f",
+                side.upper(), bid, entry_c, secs_left,
+            )
+            await self._scalp_fire_exit(ticker, side, bid, "PRE-EXPIRY")
+            return
+
+        # ── BTC CO-INTEGRATED TRAIL ──────────────────────────────────
+        # BTC price is the leading indicator; contract bid may lag or be
+        # absent (bid=0). If BTC retraces SCALP_BTC_TRAIL_DOLLARS from
+        # its HWM in the adverse direction, exit regardless of contract
+        # bid. This is the "market is going against us" safety net.
+        btc_trail_d = float(_uc("SCALP_BTC_TRAIL_DOLLARS", 30.0))
+        btc_now = float(getattr(self, "_btc_last_price", 0) or 0)
+        if btc_now > 0 and self._scalp_btc_hwm > 0:
+            if self._scalp_btc_side == "yes":
+                # YES wins when BTC > strike. Track BTC rising.
+                if btc_now > self._scalp_btc_hwm:
+                    self._scalp_btc_hwm = btc_now
+                btc_retrace = self._scalp_btc_hwm - btc_now
+                if btc_retrace >= btc_trail_d:
+                    sell_bid = bid if bid > 0 else entry_c  # use entry as fallback
+                    logger.info(
+                        "SCALP BTC-TRAIL: btc_hwm=$%.0f btc_now=$%.0f "
+                        "retrace=$%.0f >= trail=$%.0f → exit YES "
+                        "entry=%dc sell_bid=%dc (%+dc/ct)",
+                        self._scalp_btc_hwm, btc_now, btc_retrace,
+                        btc_trail_d, entry_c, sell_bid,
+                        sell_bid - entry_c,
+                    )
+                    await self._scalp_fire_exit(
+                        ticker, side, sell_bid, "BTC-TRAIL",
+                    )
+                    return
+            elif self._scalp_btc_side == "no":
+                # NO wins when BTC < strike. Track BTC falling.
+                if btc_now < self._scalp_btc_hwm:
+                    self._scalp_btc_hwm = btc_now
+                btc_retrace = btc_now - self._scalp_btc_hwm
+                if btc_retrace >= btc_trail_d:
+                    sell_bid = bid if bid > 0 else entry_c
+                    logger.info(
+                        "SCALP BTC-TRAIL: btc_lwm=$%.0f btc_now=$%.0f "
+                        "retrace=$%.0f >= trail=$%.0f → exit NO "
+                        "entry=%dc sell_bid=%dc (%+dc/ct)",
+                        self._scalp_btc_hwm, btc_now, btc_retrace,
+                        btc_trail_d, entry_c, sell_bid,
+                        sell_bid - entry_c,
+                    )
+                    await self._scalp_fire_exit(
+                        ticker, side, sell_bid, "BTC-TRAIL",
+                    )
+                    return
+
+        # ── CONTRACT BID TRAIL ────────────────────────────────────────
+        trail_trigger = self._scalp_hwm_bid - trail_c
+        if bid <= trail_trigger:
+            logger.info(
+                "SCALP TRAIL: hwm=%dc bid=%dc trail=%dc → exit "
+                "side=%s entry=%dc (%+dc/contract)",
+                self._scalp_hwm_bid, bid, trail_c, side.upper(),
+                entry_c, bid - entry_c,
+            )
+            await self._scalp_fire_exit(ticker, side, bid, "TRAIL")
+            return
+
+        # ── LOSS-CUT: max unrealized loss per contract ───────────────
+        # If bid is below entry by more than SCALP_MAX_LOSS_C, exit
+        # immediately. Prevents riding a losing position to $0.
+        max_loss_c = int(_uc("SCALP_MAX_LOSS_C", 15))
+        if bid < entry_c and (entry_c - bid) >= max_loss_c:
+            logger.info(
+                "SCALP LOSS-CUT: bid=%dc entry=%dc loss=%dc >= max=%dc "
+                "→ exit side=%s",
+                bid, entry_c, entry_c - bid, max_loss_c, side.upper(),
+            )
+            await self._scalp_fire_exit(ticker, side, bid, "LOSS-CUT")
+            return
+
+    def _scalp_get_side_bid(self, ticker: str, side: str) -> int:
+        """Best contract bid for SIDE (yes/no), in cents. Returns 0 if no
+        usable quote. Reads from the WS local book (low-latency); the
+        REST fallback is intentionally skipped since the trail can wait
+        one tick rather than block the loop on a synchronous fetch.
+        """
+        try:
+            ws = getattr(self, "_kalshi_ws", None)
+            if ws is None or not hasattr(ws, "get_book"):
+                return 0
+            book = ws.get_book(ticker)
+            if book is None or not getattr(book, "is_ready", False):
+                return 0
+            return int(
+                book.best_yes_bid if side == "yes" else book.best_no_bid,
+            )
+        except Exception:
+            return 0
+
+    async def _scalp_fire_exit(
+        self, ticker: str, side: str, bid: int, reason: str,
+    ) -> None:
+        """Place sell-to-close at bid via the OVERSELL-GUARDED helper.
+        Stamps `_scalp_exit_placed=True` so the trail loop stops re-firing.
+        Tracks the returned order_id for orphan cancellation on window flip.
+        """
+        try:
+            order, count = await self._place_capped_side_sell(
+                ticker=ticker, side=side, price=bid,
+                requested_count=int(self._scalp_filled_count),
+                post_only=False,
+                reason=f"SCALP-{reason}",
+            )
+            self._scalp_exit_placed = True
+            self._scalp_exit_fire_ts = time.time()
+            self._scalp_exit_price_c = bid
+            if order is None:
+                logger.warning(
+                    "SCALP EXIT BLOCKED (%s): %s side=%s — sell helper "
+                    "returned None (truth=0 or oversell-guard)",
+                    reason, ticker[-15:], side.upper(),
+                )
+                return
+            self._scalp_exit_order_id = getattr(order, "order_id", None)
+            entry_c = self._scalp_entry_price
+            logger.info(
+                "SCALP EXIT (%s): sold %dx %s @ %dc (entry=%dc, "
+                "%+dc/contract) oid=%s",
+                reason, count, side.upper(), bid, entry_c, bid - entry_c,
+                (self._scalp_exit_order_id or "?")[:12],
+            )
+            if self._scalp_exit_order_id:
+                try:
+                    self._engine_placed_order_ids[
+                        self._scalp_exit_order_id
+                    ] = time.time()
+                except Exception:
+                    pass
+
+            # ── RE-ENTRY RESET ──────────────────────────────────────
+            # Clear the scalp state machine so the next tick of
+            # _momentum_scalp_tick() sees "no orders, no fill" and
+            # cycles back to PHASE 1 (PLACE).  The window-level
+            # entry counter (_window_fills / MAX_ENTRIES_PER_WINDOW)
+            # still caps runaway re-entries; this just unlocks the
+            # state machine within that cap.
+            logger.info(
+                "SCALP RE-ENTRY RESET after %s exit — state machine "
+                "unlocked for next tick", reason,
+            )
+            # 2026-05-08 GHOST-DESYNC FIX: clear the position record + the
+            # SKIP-DIRECTION ticker set we set at fill time. Only clear if
+            # the open _direction_position is actually ours (defensive: a
+            # later DIRECTION/UNIFIED fill on this same ticker should not
+            # be wiped). _direction_active_tickers can be discarded
+            # unconditionally — it's idempotent.
+            try:
+                _dp = getattr(self, "_direction_position", None)
+                if (
+                    _dp is not None
+                    and _dp.get("ticker") == ticker
+                    and _dp.get("strategy_name") == "SCALP"
+                ):
+                    self._direction_position = None
+            except Exception:
+                pass
+            try:
+                self._direction_active_tickers.discard(ticker)
+                self._persist_direction_active()
+            except Exception:
+                pass
+            # ── REVERSAL CONFIDENCE SCORER (2026-05-08) ──────────────
+            # Trail firing tells us our side stopped trending UP. It does
+            # NOT tell us the inverse side is now winning. Score 4 signals
+            # to decide: INVERT (IOC the opposite side) vs RE-ENTER SAME
+            # (let the ladder re-place on our original side). Only runs
+            # when we'd otherwise consider an inverse re-entry.
+            _do_invert: bool = True
+            _reversal_conf: float = 1.0
+            if reason in ("TRAIL", "BTC-TRAIL"):
+                # 1. Time factor (weight 0.25)
+                _fill_age = time.time() - float(
+                    self._scalp_fill_time or time.time(),
+                )
+                if _fill_age < 180.0:
+                    _t_score = 0.1
+                elif _fill_age < 600.0:
+                    _t_score = 0.5
+                else:
+                    _t_score = 1.0
+
+                # 2. BTC vs strike (weight 0.30)
+                _btc_now = float(
+                    getattr(self, "_btc_last_price", 0) or 0,
+                )
+                _strike = 0.0
+                try:
+                    _pf = getattr(self, "_price_feed", None)
+                    _pe = getattr(_pf, "prob_engine", None) if _pf else None
+                    _strike = float(getattr(_pe, "strike", 0.0) or 0.0)
+                except Exception:
+                    _strike = 0.0
+                if _btc_now > 0 and _strike > 0:
+                    _crossed = (
+                        (side == "yes" and _btc_now < _strike)
+                        or (side == "no" and _btc_now > _strike)
+                    )
+                    _near_pct = (
+                        abs(_btc_now - _strike) / _strike
+                        if _strike else 1.0
+                    )
+                    if _crossed:
+                        _b_score = 1.0
+                    elif _near_pct <= 0.0005:  # within 0.05%
+                        _b_score = 0.4
+                    else:
+                        _b_score = 0.0
+                else:
+                    _b_score = 0.4  # neutral when data missing
+
+                # 3. Book imbalance (weight 0.25): inverse-bid vs our-bid
+                _our_bid_now = 0
+                _inv_bid_now = 0
+                try:
+                    _ws_sc = getattr(self, "_kalshi_ws", None)
+                    if _ws_sc and hasattr(_ws_sc, "get_book"):
+                        _bk_sc = _ws_sc.get_book(ticker)
+                        if _bk_sc and getattr(_bk_sc, "is_ready", False):
+                            _our_bid_now = int(
+                                getattr(_bk_sc, "best_yes_bid", 0)
+                                if side == "yes"
+                                else getattr(_bk_sc, "best_no_bid", 0),
+                            ) or 0
+                            _inv_bid_now = int(
+                                getattr(_bk_sc, "best_no_bid", 0)
+                                if side == "yes"
+                                else getattr(_bk_sc, "best_yes_bid", 0),
+                            ) or 0
+                except Exception:
+                    pass
+                if _inv_bid_now > 0 and _our_bid_now > 0:
+                    _diff = _inv_bid_now - _our_bid_now
+                    if _diff > 10:
+                        _bk_score = 1.0
+                    elif _diff > 0:
+                        _bk_score = 0.5
+                    elif abs(_diff) <= 5:
+                        _bk_score = 0.3
+                    else:
+                        _bk_score = 0.0
+                else:
+                    _bk_score = 0.3  # neutral when book unreadable
+
+                # 4. Inverse price velocity (weight 0.20)
+                _inv_snap = int(self._scalp_inv_bid_at_fill or 0)
+                if _inv_snap > 0 and _inv_bid_now > 0:
+                    _delta = _inv_bid_now - _inv_snap
+                    if _delta >= 10:
+                        _v_score = 1.0
+                    elif _delta >= 5:
+                        _v_score = 0.7
+                    elif _delta >= 2:
+                        _v_score = 0.4
+                    else:
+                        _v_score = 0.1
+                else:
+                    _v_score = 0.1  # no snapshot → assume noise
+
+                _reversal_conf = (
+                    _t_score * 0.25
+                    + _b_score * 0.10
+                    + _bk_score * 0.35
+                    + _v_score * 0.30
+                )
+                _threshold = float(
+                    _uc("SCALP_REVERSAL_THRESHOLD", 0.50),
+                )
+                _do_invert = _reversal_conf > _threshold
+                logger.info(
+                    "SCALP REVERSAL-SCORE: time=%.1f btc=%.1f book=%.1f "
+                    "velocity=%.1f → total=%.2f → %s",
+                    _t_score, _b_score, _bk_score, _v_score,
+                    _reversal_conf,
+                    "INVERT" if _do_invert else "SAME",
+                )
+
+            # ── INVERSE MARKET RE-ENTRY ─────────────────────────────
+            # Trail firing = confirmation that momentum shifted. Enter
+            # the opposite side AT MARKET immediately. Only on TRAIL /
+            # BTC-TRAIL exits (PRE-EXPIRY = too little time left).
+            # The 58c resting limit is ONLY for the initial window-open
+            # entry. All re-entries are taker orders.
+            self._scalp_reentry_mode = False
+            self._scalp_prior_exit_side = ""
+            self._scalp_evaluated = False
+            self._scalp_yes_order_id = None
+            self._scalp_no_order_id = None
+            self._scalp_ladder_yes_ids = []
+            self._scalp_ladder_no_ids = []
+            self._scalp_filled_side = None
+            self._scalp_ticker = ""
+            self._scalp_entry_price = 0
+            self._scalp_filled_count = 0
+            self._scalp_hwm_bid = 0
+            self._scalp_btc_hwm = 0.0
+            self._scalp_btc_side = ""
+            self._scalp_fill_time = 0.0
+            self._scalp_exit_placed = False
+            self._scalp_exit_order_id = None
+            self._scalp_exit_price_c = 0
+            self._scalp_inv_bid_at_fill = 0
+
+            if reason in ("TRAIL", "BTC-TRAIL") and bool(
+                _uc("SCALP_INVERSE_REENTRY_ENABLED", True)
+            ) and _do_invert:
+                inv_side = "no" if side == "yes" else "yes"
+                inv_contracts = int(_uc("SCALP_CONTRACTS", 5))
+                inv_slip = int(_uc("SCALP_REENTRY_SLIP_C", 5))
+
+                # Read the inverse side's current ask for the IOC price
+                inv_ask = 0
+                try:
+                    _ws = getattr(self, "_kalshi_ws", None)
+                    if _ws and hasattr(_ws, "get_book"):
+                        _bk = _ws.get_book(ticker)
+                        if _bk and getattr(_bk, "is_ready", False):
+                            inv_ask = int(
+                                _bk.best_no_ask if side == "yes"
+                                else _bk.best_yes_ask,
+                            ) or 0
+                except Exception:
+                    pass
+
+                if inv_ask <= 0:
+                    logger.info(
+                        "SCALP INVERSE SKIP: no ask for %s (book not ready)",
+                        inv_side.upper(),
+                    )
+                else:
+                    ioc_price = min(inv_ask + inv_slip, 95)
+                    # Safety check before placing
+                    inv_cost_c = ioc_price * inv_contracts
+                    ok_inv, reason_inv = self._check_window_safety(
+                        inv_cost_c, "SCALP-INV",
+                    )
+                    if not ok_inv:
+                        logger.info(
+                            "SCALP INVERSE SKIP: %s", reason_inv,
+                        )
+                    else:
+                        try:
+                            inv_order = await self._client.place_order(
+                                ticker=ticker, side=inv_side,
+                                count=inv_contracts, price=ioc_price,
+                                order_type="limit", action="buy",
+                                time_in_force="immediate_or_cancel",
+                            )
+                            inv_oid = getattr(
+                                inv_order, "order_id", None,
+                            )
+                            inv_avg = int(
+                                getattr(inv_order, "average_price", 0)
+                                or 0,
+                            )
+                            inv_filled = int(
+                                getattr(inv_order, "count_filled", 0)
+                                or 0,
+                            )
+                            if inv_filled > 0:
+                                # Register the new position
+                                _now_inv = time.time()
+                                self._scalp_evaluated = True
+                                self._scalp_filled_side = inv_side
+                                self._scalp_filled_count = inv_filled
+                                self._scalp_fill_time = _now_inv
+                                self._scalp_entry_price = inv_avg
+                                self._scalp_hwm_bid = inv_avg
+                                self._scalp_ticker = ticker
+                                self._scalp_exit_placed = False
+                                # BTC co-integrated trail
+                                self._scalp_btc_hwm = float(
+                                    getattr(self, "_btc_last_price", 0)
+                                    or 0,
+                                )
+                                self._scalp_btc_side = inv_side
+                                # Reversal-confidence: snapshot the new
+                                # inverse side's bid (which is the side
+                                # we just exited from). Used by the next
+                                # _scalp_fire_exit's velocity component.
+                                try:
+                                    _ws_inv = getattr(
+                                        self, "_kalshi_ws", None,
+                                    )
+                                    if _ws_inv and hasattr(
+                                        _ws_inv, "get_book",
+                                    ):
+                                        _bk_inv = _ws_inv.get_book(ticker)
+                                        if _bk_inv and getattr(
+                                            _bk_inv, "is_ready", False,
+                                        ):
+                                            self._scalp_inv_bid_at_fill = int(
+                                                getattr(
+                                                    _bk_inv,
+                                                    "best_no_bid"
+                                                    if inv_side == "yes"
+                                                    else "best_yes_bid",
+                                                    0,
+                                                ) or 0,
+                                            )
+                                        else:
+                                            self._scalp_inv_bid_at_fill = 0
+                                    else:
+                                        self._scalp_inv_bid_at_fill = 0
+                                except Exception:
+                                    self._scalp_inv_bid_at_fill = 0
+                                # Window accounting
+                                self._window_entry_count = int(
+                                    getattr(
+                                        self, "_window_entry_count", 0,
+                                    ) or 0,
+                                ) + 1
+                                try:
+                                    self._window_committed_cents = int(
+                                        getattr(
+                                            self,
+                                            "_window_committed_cents", 0,
+                                        ) or 0,
+                                    ) + inv_avg * inv_filled
+                                except Exception:
+                                    pass
+                                # Ghost-desync: register in direction
+                                self._direction_position = {
+                                    "order_id": inv_oid or "",
+                                    "side": inv_side,
+                                    "entry_cents": inv_avg,
+                                    "original_count": inv_filled,
+                                    "ticker": ticker,
+                                    "tier": "SCALP",
+                                    "strategy_name": "SCALP",
+                                    "count": inv_filled,
+                                    "fill_time": _now_inv,
+                                    "_hold_to_settle": False,
+                                    "entry_time": _now_inv,
+                                    "hwm_bid": inv_avg,
+                                    "exit_attempted": False,
+                                    "wall_streak_start": 0.0,
+                                }
+                                try:
+                                    self._add_direction_active(ticker)
+                                except Exception:
+                                    pass
+                                logger.info(
+                                    "SCALP INVERSE FILL: %s %dx @ %dc "
+                                    "IOC (ask=%dc+%dc) on %s — trail "
+                                    "active",
+                                    inv_side.upper(), inv_filled,
+                                    inv_avg, inv_ask, inv_slip,
+                                    ticker[-15:],
+                                )
+                            else:
+                                logger.info(
+                                    "SCALP INVERSE NOFILL: %s IOC@%dc "
+                                    "on %s — no liquidity",
+                                    inv_side.upper(), ioc_price,
+                                    ticker[-15:],
+                                )
+                        except Exception as inv_e:
+                            logger.exception(
+                                "SCALP INVERSE error: %s", inv_e,
+                            )
+        except Exception as e:
+            # Don't latch _scalp_exit_placed on raise — let next tick retry.
+            logger.exception("SCALP EXIT error (%s): %s", reason, e)
 
     async def _evaluate_penny_signal(self) -> None:
         """One iteration of the PENNY tier. Self-contained: gates,
@@ -4697,6 +6177,37 @@ class PolymarketCopyEngine:
         # Pick the cheaper side (asymmetric reversal hunt: betting AGAINST
         # the move's current direction at deep OTM is exactly the play).
         side, ask_c = min(candidates, key=lambda x: x[1])
+
+        # ═══════════════════════════════════════════════════════════════
+        # ADMISSION FILTER — universal 5-gate rejection (2026-05-08)
+        # PENNY uses signal_type="momentum" (BTC needs to move for the
+        # cheap-OTM thesis to play out). Pass-through (None) on any error.
+        # ═══════════════════════════════════════════════════════════════
+        try:
+            _pf_pn = getattr(self, "_price_feed", None)
+            _prob_pn = getattr(_pf_pn, "prob_engine", None) if _pf_pn else None
+            _fair_pn = float(getattr(_prob_pn, "probability", 0.0) or 0.0) if _prob_pn else 0.0
+        except Exception:
+            _fair_pn = 0.0
+        _mid_pn = float(getattr(book, "mid_price_cents", 0) or 0) or None
+        _secs_left_pn = max(0.0, 900.0 - age)
+        adm = self._admission_evaluate(
+            tier="PENNY",
+            ticker=ticker,
+            side=side,
+            ask_c=ask_c,
+            fair_prob=_fair_pn,
+            mid_cents=_mid_pn,
+            seconds_elapsed=age,
+            seconds_remaining=_secs_left_pn,
+            signal_type="momentum",
+        )
+        if adm is not None and not adm.admitted:
+            self._admission_log("PENNY", ticker, adm)
+            return
+        if adm is not None and adm.admitted:
+            self._admission_log("PENNY", ticker, adm)
+
         # Gate 6: sizing within risk bound
         max_ct = int(_uc("PENNY_MAX_CONTRACTS", 10))
         min_ct = int(_uc("PENNY_MIN_CONTRACTS", 5))
@@ -4925,6 +6436,28 @@ class PolymarketCopyEngine:
                 book_imbalance = float(book_imbalance)
             except Exception:
                 book_imbalance = None
+
+        # ═══════════════════════════════════════════════════════════════
+        # ADMISSION FILTER — universal 5-gate rejection (2026-05-08)
+        # Runs BEFORE signal scoring. Side unknown at this point — Gate 3
+        # uses max(yes_depth, no_depth). Pass-through (None) on any error.
+        # ═══════════════════════════════════════════════════════════════
+        adm = self._admission_evaluate(
+            tier="UNIFIED",
+            ticker=ticker,
+            side=None,
+            ask_c=min(best_yes_ask, best_no_ask) if (best_yes_ask and best_no_ask) else max(best_yes_ask, best_no_ask),
+            fair_prob=fair_prob,
+            mid_cents=mid_cents,
+            seconds_elapsed=session_age,
+            seconds_remaining=seconds_left,
+            signal_type="momentum",
+        )
+        if adm is not None and not adm.admitted:
+            self._admission_log("UNIFIED", ticker, adm)
+            return
+        if adm is not None and adm.admitted:
+            self._admission_log("UNIFIED", ticker, adm)
 
         # Microstructure-derived signals
         pressure = getattr(self, "_last_pressure", None)
@@ -5396,6 +6929,34 @@ class PolymarketCopyEngine:
         if ask_c <= 0 or ask_c >= 100:
             return
 
+        # ═══════════════════════════════════════════════════════════════
+        # ADMISSION FILTER — universal 5-gate rejection (2026-05-08)
+        # Side known here → Gate 3 uses the chosen side's depth. Pass-
+        # through (None) on any error. Additive: never blocks the engine.
+        # ═══════════════════════════════════════════════════════════════
+        try:
+            _fair_prob = float(getattr(prob, "probability", 0.0) or 0.0)
+        except Exception:
+            _fair_prob = 0.0
+        _mid_cents = float(getattr(book, "mid_price_cents", 0) or 0) or None
+        _seconds_left_dir = max(0.0, 900.0 - session_age)
+        adm = self._admission_evaluate(
+            tier="DIRECTION",
+            ticker=ticker,
+            side=sig.side,
+            ask_c=ask_c,
+            fair_prob=_fair_prob,
+            mid_cents=_mid_cents,
+            seconds_elapsed=session_age,
+            seconds_remaining=_seconds_left_dir,
+            signal_type="momentum",
+        )
+        if adm is not None and not adm.admitted:
+            self._admission_log("DIRECTION", ticker, adm)
+            return
+        if adm is not None and adm.admitted:
+            self._admission_log("DIRECTION", ticker, adm)
+
         # ── PRICE-BAND SKIP (2026-05-08 PT: NEW) ─────────────────────────
         # Skip 30-49c entries — weakest-WR bucket per realistic-fill backtest:
         # 30-39c = 42% WR / +$0.45 mean (worst), 40-49c = 65% / +$1.79
@@ -5840,6 +7401,15 @@ class PolymarketCopyEngine:
         pos = self._direction_position
         if not pos:
             return
+        # 2026-05-08 GHOST-DESYNC FIX: SCALP fills now park on
+        # _direction_position purely so the reconcile loop's
+        # SKIP-DIRECTION elif fires (suppresses GHOST IGNORED). SCALP
+        # has its own exit machinery in _momentum_scalp_tick PHASE 3
+        # (trail / PRE-EXPIRY) and the "both" leg holds to settlement.
+        # Letting the DIRECTION exit layer fire on a SCALP record would
+        # race-sell — short-circuit early.
+        if str(pos.get("strategy_name") or "") == "SCALP":
+            return
         try:
             ticker = str(pos.get("ticker") or "")
             side = str(pos.get("side") or "").lower()
@@ -5967,42 +7537,60 @@ class PolymarketCopyEngine:
                 bool(_uc("DIRECTION_WALL_EXIT_ENABLED", True))
                 and profitable
             ):
-                try:
-                    tape = getattr(self, "_kalshi_tape", None)
-                    if tape is not None and hasattr(tape, "flow"):
-                        win_s = float(_uc("DIRECTION_WALL_WINDOW_S", 3.0))
-                        flow = tape.flow(ticker, win_s) or {}
-                        # Opposing-side aggression:
-                        #  - YES position: "no" trades = NO takers hitting YES bids
-                        #  - NO position:  "yes" trades = YES takers lifting NO offers
-                        opp_vol = int(
-                            flow.get("no_volume", 0) if side == "yes"
-                            else flow.get("yes_volume", 0)
-                        )
-                        rate = (opp_vol / win_s) if win_s > 0 else 0.0
-                        threshold = float(_uc("DIRECTION_WALL_RATE_CTPS", 30))
-                        # Streak: require sustained pressure for win_s seconds
-                        streak_start = float(pos.get("wall_streak_start") or 0.0)
-                        if rate >= threshold:
-                            if streak_start <= 0:
-                                pos["wall_streak_start"] = now
-                                streak_start = now
-                            sustained = (now - streak_start) >= win_s
-                            if sustained:
-                                ok = await self._direction_exit_sell(
-                                    ticker=ticker, side=side, count=count,
-                                    bid_c=bid_c, entry_c=entry_c,
-                                    reason="WALL-EXIT",
-                                    extra=f"opposing aggression={rate:.1f}ct/s ({opp_vol}ct in {win_s:.0f}s) profit={profit_c}c",
-                                )
-                                if ok:
-                                    return
-                        else:
-                            # Reset streak when pressure subsides
-                            if streak_start > 0:
-                                pos["wall_streak_start"] = 0.0
-                except Exception as _wall_err:
-                    logger.debug("DIRECTION wall-check failed: %s", _wall_err)
+                # Deep-ITM suppression: when our side's implied prob is
+                # already ≥ ITM_SUPPRESS_C (default 75c), opposing
+                # aggression is just noise around an already-winning
+                # position. Bailing here locks in less than the
+                # near-certain settlement value. Suppress wall-exit and
+                # let TAKE-CEILING / settlement carry it home.
+                _itm_suppress_c = int(
+                    _uc("DIRECTION_WALL_EXIT_ITM_SUPPRESS_C", 75)
+                )
+                if bid_c >= _itm_suppress_c:
+                    if float(pos.get("wall_streak_start") or 0.0) > 0:
+                        pos["wall_streak_start"] = 0.0
+                    logger.info(
+                        "DIRECTION WALL-EXIT SUPPRESSED [%s]: deep ITM "
+                        "(bid=%dc >= %dc), holding side=%s",
+                        ticker[-15:], bid_c, _itm_suppress_c, side.upper(),
+                    )
+                else:
+                    try:
+                        tape = getattr(self, "_kalshi_tape", None)
+                        if tape is not None and hasattr(tape, "flow"):
+                            win_s = float(_uc("DIRECTION_WALL_WINDOW_S", 3.0))
+                            flow = tape.flow(ticker, win_s) or {}
+                            # Opposing-side aggression:
+                            #  - YES position: "no" trades = NO takers hitting YES bids
+                            #  - NO position:  "yes" trades = YES takers lifting NO offers
+                            opp_vol = int(
+                                flow.get("no_volume", 0) if side == "yes"
+                                else flow.get("yes_volume", 0)
+                            )
+                            rate = (opp_vol / win_s) if win_s > 0 else 0.0
+                            threshold = float(_uc("DIRECTION_WALL_RATE_CTPS", 30))
+                            # Streak: require sustained pressure for win_s seconds
+                            streak_start = float(pos.get("wall_streak_start") or 0.0)
+                            if rate >= threshold:
+                                if streak_start <= 0:
+                                    pos["wall_streak_start"] = now
+                                    streak_start = now
+                                sustained = (now - streak_start) >= win_s
+                                if sustained:
+                                    ok = await self._direction_exit_sell(
+                                        ticker=ticker, side=side, count=count,
+                                        bid_c=bid_c, entry_c=entry_c,
+                                        reason="WALL-EXIT",
+                                        extra=f"opposing aggression={rate:.1f}ct/s ({opp_vol}ct in {win_s:.0f}s) profit={profit_c}c",
+                                    )
+                                    if ok:
+                                        return
+                            else:
+                                # Reset streak when pressure subsides
+                                if streak_start > 0:
+                                    pos["wall_streak_start"] = 0.0
+                    except Exception as _wall_err:
+                        logger.debug("DIRECTION wall-check failed: %s", _wall_err)
 
             # 4. Rule B — time-scaled trailing stop
             if profitable and hwm > 0:
@@ -8240,6 +9828,78 @@ class PolymarketCopyEngine:
                 # 2026-05-07 OVERHAUL Phase 1: reset universal safety counters.
                 self._window_committed_cents = 0
                 self._window_entry_count = 0
+                # 2026-05-08 MOMENTUM SCALP — cancel any orphan resting
+                # orders from the prior window (entry pair + any unfilled
+                # exit), then wipe state. Cancels are best-effort (don't
+                # crash the window flip on API err).
+                for _label, _attr in (
+                    ("YES entry", "_scalp_yes_order_id"),
+                    ("NO entry",  "_scalp_no_order_id"),
+                    ("EXIT",      "_scalp_exit_order_id"),
+                ):
+                    _oid = getattr(self, _attr, None)
+                    if not _oid:
+                        continue
+                    try:
+                        asyncio.ensure_future(self._client.cancel_order(_oid))
+                        logger.info(
+                            "SCALP WINDOW-RESET: cancelling orphan %s order %s",
+                            _label, _oid[:12],
+                        )
+                    except Exception:
+                        logger.exception(
+                            "SCALP window-reset cancel error (%s)", _label,
+                        )
+                # 2026-05-08 GHOST-DESYNC FIX: also clear the
+                # _direction_position record + _direction_active_tickers
+                # entry that the SCALP fill registered (PHASE 2). Settled
+                # contracts should not leave stale ghost-suppression state
+                # behind. _entered_tickers_this_window was already cleared
+                # at the top of this block.
+                _prev_scalp_ticker = getattr(self, "_scalp_ticker", "") or ""
+                if _prev_scalp_ticker:
+                    try:
+                        _dp = getattr(self, "_direction_position", None)
+                        if (
+                            _dp is not None
+                            and _dp.get("ticker") == _prev_scalp_ticker
+                            and _dp.get("strategy_name") == "SCALP"
+                        ):
+                            self._direction_position = None
+                    except Exception:
+                        pass
+                    try:
+                        self._direction_active_tickers.discard(
+                            _prev_scalp_ticker,
+                        )
+                        self._persist_direction_active()
+                    except Exception:
+                        pass
+                self._scalp_evaluated = False
+                self._scalp_yes_order_id = None
+                self._scalp_no_order_id = None
+                self._scalp_ladder_yes_ids = []
+                self._scalp_ladder_no_ids = []
+                self._scalp_last_ioc_ts = 0.0
+                self._scalp_contracts_placed_window = 0
+                self._scalp_cap_logged = False
+                self._scalp_filled_side = None
+                self._scalp_ticker = ""
+                self._scalp_entry_price = 0
+                self._scalp_filled_count = 0
+                self._scalp_hwm_bid = 0
+                self._scalp_btc_hwm = 0.0
+                self._scalp_btc_side = ""
+                self._scalp_fill_time = 0.0
+                self._scalp_exit_placed = False
+                self._scalp_exit_order_id = None
+                self._scalp_exit_price_c = 0
+                self._scalp_exit_fire_ts = 0.0
+                self._scalp_yes_filled_count = 0
+                self._scalp_no_filled_count = 0
+                self._scalp_reentry_mode = False
+                self._scalp_prior_exit_side = ""
+                self._scalp_inv_bid_at_fill = 0
                 # NOFILL ask-snapshots are window-scoped; a new window has
                 # a new orderbook, so old snapshots are meaningless.
                 try:
@@ -10670,8 +12330,15 @@ class PolymarketCopyEngine:
                 # Losing pattern (April 16 $50 drain):
                 #   RSI 75+ triggered OR gate → bought the top → settled wrong
                 #   side. OR logic is the root cause.
+                #
+                # 2026-05-08: gate now bypassable via DOMINANT_GATE_ENABLED.
+                # Live tiers (UNIFIED/DIRECTION/BB_PURE/PENNY) do not enter
+                # this branch — the gate only ever ran on the retired
+                # FVG/TA_FORCED entry kinds. Flag added so any residual
+                # FVG-class evaluator activity stops short-circuiting on
+                # the April-15 profile.
                 # ═══════════════════════════════════════════════════════════
-                if _pressure_ready:
+                if _pressure_ready and bool(_uc("DOMINANT_GATE_ENABLED", True)):
                     _ta_res_gate = getattr(getattr(self, '_ta_scorer', None), 'last_result', None)
                     _rsi_gate = _ta_res_gate.rsi_7 if _ta_res_gate and hasattr(_ta_res_gate, 'rsi_7') else 50
                     _prob_pct_gate = prob.probability * 100 if prob and prob.is_ready else 50
@@ -11902,6 +13569,37 @@ class PolymarketCopyEngine:
         if sig is None:
             return None
 
+        # ═══════════════════════════════════════════════════════════════
+        # ADMISSION FILTER — universal 5-gate rejection (2026-05-08)
+        # BB_PURE uses signal_type="reversion" (mean-reverting fair-value
+        # mispricing). Rejected in trending regime per Gate 5. Pass-
+        # through (None) on any error.
+        # ═══════════════════════════════════════════════════════════════
+        try:
+            _entry_px = int(getattr(sig, "suggested_entry_cents", 0) or 0)
+            _bb_fair_prob = float(fair_yes_cents) / 100.0
+            _sess_age_bb = (
+                time.time() - float(getattr(self, "_window_start_time", 0) or 0)
+            ) if getattr(self, "_window_start_time", 0) else 0.0
+            adm = self._admission_evaluate(
+                tier="BB_PURE",
+                ticker=ticker,
+                side=sig.side,
+                ask_c=_entry_px,
+                fair_prob=_bb_fair_prob,
+                mid_cents=float(market_mid_cents),
+                seconds_elapsed=_sess_age_bb,
+                seconds_remaining=secs_to_exp,
+                signal_type="reversion",
+            )
+            if adm is not None and not adm.admitted:
+                self._admission_log("BB_PURE", ticker, adm)
+                return None
+            if adm is not None and adm.admitted:
+                self._admission_log("BB_PURE", ticker, adm)
+        except Exception:
+            logger.exception("BB_PURE admission wrap raised — falling through")
+
         # ── 2026-05-02 STRATEGIC RESET GATES ──────────────────────────────
         # User insights validated by manual trading observation:
         #   1. "Market confidence is far less speculative when < ±0.04% of strike"
@@ -12773,8 +14471,12 @@ class PolymarketCopyEngine:
                 self._bb_pure_streak_decay_counter = 0
         except Exception:
             pass
-        # 1-trade-per-window lock check
-        if ticker in getattr(self, '_entered_tickers_this_window', set()):
+        # 1-trade-per-window lock check (2026-05-08: gated by
+        # BB_PURE_PER_TICKER_LOCK_ENABLED — when False, scalp tier may
+        # re-enter same ticker within a window. $15/window risk cap is
+        # the safety net.)
+        if (bool(_uc("BB_PURE_PER_TICKER_LOCK_ENABLED", True))
+                and ticker in getattr(self, '_entered_tickers_this_window', set())):
             logger.info(
                 "BB_PURE SKIP: %s already entered this window",
                 ticker[-15:],
@@ -18787,7 +20489,24 @@ class PolymarketCopyEngine:
                 _opp_v = str(_opp_wall.get("verdict", "UNKNOWN"))
                 _same_v = str(_same_wall.get("verdict", "UNKNOWN"))
                 # Opposing aggression while profitable → force cross-spread exit
+                # Deep-ITM suppression: if our side's implied prob is
+                # already ≥ ITM_SUPPRESS_C (default 75c), opposing
+                # aggression is noise on a near-certain win — let the
+                # trade ride to settlement / TP rather than locking in
+                # less than what's already in hand.
+                _itm_suppress_c = int(
+                    _uc("DIRECTION_WALL_EXIT_ITM_SUPPRESS_C", 75)
+                )
                 if (_opp_v == "AGGRESSIVE_BUY"
+                        and bid > entry
+                        and target_state != "sl"
+                        and bid >= _itm_suppress_c):
+                    logger.info(
+                        "WALL-EXIT SUPPRESSED [%s]: deep ITM "
+                        "(bid=%dc >= %dc), holding side=%s",
+                        ticker[-15:], bid, _itm_suppress_c, side.upper(),
+                    )
+                elif (_opp_v == "AGGRESSIVE_BUY"
                         and bid > entry
                         and target_state != "sl"):
                     logger.warning(
@@ -19056,12 +20775,25 @@ class PolymarketCopyEngine:
                         )
                         return False
                 except Exception as _e:
-                    logger.error(
-                        "PROTECTIVE cancel-verify get_order(%s) raised: %s "
-                        "— aborting cycle to avoid oversell",
-                        cur_id[:12], _e,
-                    )
-                    return False
+                    # 2026-05-08: If get_order 404s, the order no longer
+                    # exists on Kalshi — treat as terminal and proceed.
+                    # Previously this aborted the entire protective cycle
+                    # every tick when a stale order ID was stuck in state.
+                    _err_str = str(_e).lower()
+                    if "404" in _err_str or "not_found" in _err_str:
+                        logger.info(
+                            "PROTECTIVE cancel-verify get_order(%s) 404 "
+                            "— order gone, clearing stale ID and proceeding",
+                            cur_id[:12],
+                        )
+                        self._protective_state["order_id"] = None
+                    else:
+                        logger.error(
+                            "PROTECTIVE cancel-verify get_order(%s) raised: "
+                            "%s — aborting cycle to avoid oversell",
+                            cur_id[:12], _e,
+                        )
+                        return False
 
         # 2026-05-01 SL EXECUTION FIX: when target_state is "sl" (bid has
         # already broken below entry), use post_only=False AND price at
@@ -23241,6 +24973,52 @@ class PolymarketCopyEngine:
                         if kalshi_count == 0 or exposure == 0:
                             # True no-op: Kalshi agrees the ticker is flat.
                             continue
+                        # ── ACTIVE-POSITION GUARD (Claude 2026-05-08) ──────
+                        # Bug witnessed live: SCALP filled NO 5x @ 42c on a
+                        # ticker that was in _closed_tickers (added during a
+                        # prior FLAT-CONFIRMED clear of an unrelated phantom
+                        # recovery on the same ticker). 28s later this path
+                        # treated the live scalp as a stuck residual and
+                        # market-sold it.
+                        #
+                        # _closed_tickers means "we previously closed this
+                        # ticker"; it does NOT mean "engine has no position
+                        # here right now". Mirror the SKIP-DIRECTION pattern
+                        # used by SYNC RECLAIM (line ~25030) and ORPHAN-SKIP-
+                        # DIRECTION (line ~21998): if the engine currently
+                        # tracks an active fill on this ticker, leave it
+                        # alone — the exit layer / protective_maintain owns
+                        # the position.
+                        _active_dir = ticker in getattr(
+                            self, "_direction_active_tickers", set(),
+                        )
+                        _active_open = (
+                            self._open_position is not None
+                            and self._open_position.get("ticker") == ticker
+                        )
+                        if _active_dir or _active_open:
+                            _skip_log_map = getattr(
+                                self, "_residual_skip_log", None,
+                            )
+                            if _skip_log_map is None:
+                                self._residual_skip_log = {}
+                                _skip_log_map = self._residual_skip_log
+                            _last_skip_t = float(
+                                _skip_log_map.get(ticker, 0.0) or 0.0
+                            )
+                            if time.time() - _last_skip_t > 30.0:
+                                _skip_log_map[ticker] = time.time()
+                                logger.info(
+                                    "CopyEngine SYNC RESIDUAL SKIP-ACTIVE: %s "
+                                    "%dct on %s — engine has active position "
+                                    "(direction_active=%s, open_position=%s); "
+                                    "exit layer owns this, not flatten",
+                                    ticker[-15:], kalshi_count,
+                                    "yes" if float(pos_data.get(
+                                        "position_fp", "0")) > 0 else "no",
+                                    _active_dir, _active_open,
+                                )
+                            continue
                         # ── Manual-trade safety gates (Claude 2026-04-28) ──────
                         # Today's incident: SYNC tried to "flatten" 1164ct NO
                         # and 1221ct YES — both were USER MANUAL TRADES, not
@@ -25223,7 +27001,7 @@ class PolymarketCopyEngine:
 
                 # Signal 2: VWAP flipped against our position
                 _pt_inv = getattr(self, '_paper_tracker', {})
-                _vwap_val = _pt_inv.get("vwap_value", 0)
+                _vwap_val = _pt_inv.get("vwap_value", 0) or 0
                 _btc_now = getattr(self, '_btc_last_price', 0) or 0
                 _vwap_against = False
                 if _vwap_val > 0 and _btc_now > 0:
@@ -25937,7 +27715,7 @@ class PolymarketCopyEngine:
                     # still valid.
                     and pos.get("strategy_name") != "SR_FADE"):
                 _pt_exit = getattr(self, '_paper_tracker', {})
-                _vwap_val_exit = _pt_exit.get("vwap_value", 0)
+                _vwap_val_exit = _pt_exit.get("vwap_value", 0) or 0 or 0
                 _btc_exit = getattr(self, '_btc_last_price', 0) or 0
                 if _vwap_val_exit > 0 and _btc_exit > 0:
                     _vwap_flip_against = (
@@ -26469,7 +28247,7 @@ class PolymarketCopyEngine:
             # ── VWAP EXIT TIGHTENER: if BTC crosses VWAP against our position,
             # tighten the profit trail arm threshold so we exit faster ──
             _pt = getattr(self, '_paper_tracker', {})
-            _vwap_val = _pt.get("vwap_value", 0)
+            _vwap_val = _pt.get("vwap_value", 0) or 0
             _btc_now = getattr(self, '_btc_last_price', 0) or 0
             if _vwap_val > 0 and _btc_now > 0 and not pos.get("_vwap_tightened", False):
                 vwap_against = (
@@ -26969,547 +28747,12 @@ class PolymarketCopyEngine:
                                         self._open_position["tp_order_ids"] = tp_ids
                                         self._open_position["tp_price"] = tp_price
                                         self._trades_this_window += 1
-
-                                    # Now fire a ladder signal for the remaining scale-in
-                                    tape = self._kalshi_tape
-                                    invert_signal = CrossVenueSignal(
-                                        kalshi_side=inverted_side,
-                                        smart_flow_direction=inverted_dir,
-                                        smart_flow_conviction=flow.flow_conviction,
-                                        smart_wallets_active=flow.up_wallets + flow.down_wallets,
-                                        smart_avg_wr=flow.avg_smart_wr,
-                                        smart_weighted_volume=flow.total_weighted_volume,
-                                        kalshi_mid_cents=tape.mid_price_cents,
-                                        kalshi_taker_imbalance=tape.taker_imbalance,
-                                        divergence=0.50,
-                                        implied_edge_cents=50.0,
-                                        generated_at=time.time(),
-                                    )
-                                    invert_signal._is_flip_invert = True  # Bypass window lock
-                                    self._window_locked = False  # Unlock for the inversion
-                                    logger.info("CopyEngine FLIP-INVERT LADDER: deploying passive scale-in for %s",
-                                                inverted_side.upper())
-                                    await self._execute_signal(invert_signal)
-
-                                except Exception as e:
-                                    logger.error("CopyEngine FLIP-INVERT market entry failed: %s", e)
-                            else:
-                                logger.warning("CopyEngine FLIP-INVERT SKIP: inverted ask=%dc outside range", inv_ask or 0)
-
-                        except Exception as e:
-                            logger.error("CopyEngine flow flip sell failed (POSITION STILL OPEN): %s", e)
-                    return
-
-                if flow_supports:
-                    # Smart wallets agree — check momentum exit before holding
-                    book = await self._client.get_orderbook(pos["ticker"])
-                    bid = book.best_yes_bid if pos["side"] == "yes" else book.best_no_bid
-                    hwm = pos.get("high_water_bid", pos["entry_cents"])
-                    if bid > hwm:
-                        pos["high_water_bid"] = bid
-
-                    # ── Catastrophic stop: proportional to entry price ──
-                    # Cheap entries (30-40c): stop at -10c (30% loss is enough)
-                    # Mid entries (50-70c):   stop at -15c
-                    # High entries (70c+):    stop at -15c
-                    loss_cents = pos["entry_cents"] - bid
-                    count = pos.get("count", 1)
-                    # CATASTROPHIC STOP FULLY REMOVED
-                    if False:  # NEVER FIRES — hardcoded False
-                        logger.warning(
-                            "CopyEngine CATASTROPHIC STOP: %s entry=%dc bid=%dc loss=%dc | "
-                            "wallets confirm but position too deep — cutting %dx",
-                            pos["side"].upper(), pos["entry_cents"], bid, loss_cents, count,
-                        )
-                        if bid >= 1:
-                            try:
-                                await self._cancel_tp_order()
-                                await self._client.place_order(
-                                    ticker=pos["ticker"], side=pos["side"],
-                                    price=bid, count=count, action="sell",
-                                )
-                                self._last_stop_ticker = pos["ticker"]
-                                self._last_stop_time = time.time()
-                                cat_pnl = (bid - pos["entry_cents"]) * count / 100.0
-                                await self._record_trade_outcome(cat_pnl, False, pos["side"], "exited_loss")
-                                self._record_daily_pnl(cat_pnl)
-                                self._closed_tickers.add(pos["ticker"])
-                                self._open_position = None
-                            except Exception as e:
-                                logger.error("CopyEngine catastrophic stop sell failed: %s", e)
-                        return
-
-                    if int(fill_age) % 30 < 4:
-                        rsi_str = f"RSI={self._btc_rsi:.0f}" if self._btc_rsi is not None else "RSI=n/a"
-                        logger.info(
-                            "CopyEngine HOLDING: %s entry=%dc bid=%dc hwm=%dc | flow=%s conv=%.0f%% vol=$%.0f | %s (wallets confirm)",
-                            pos["side"].upper(), pos["entry_cents"], bid,
-                            pos.get("high_water_bid", pos["entry_cents"]),
-                            flow.flow_direction, flow.flow_conviction * 100,
-                            flow.total_weighted_volume, rsi_str,
-                        )
-                    return  # Smart money says hold — momentum hasn't reversed yet
-
-            # ═══════════════════════════════════════════════════════════════
-            # Below here: NO active wallet data — use mechanical stops only
-            # If position was entered WITH wallet conviction, trust it and
-            # skip deviation stop. Wallets bet once then go silent — their
-            # original signal is valid for the full 15m window.
-            # ═══════════════════════════════════════════════════════════════
-
-            # ── BTC price deviation stop (ONLY for non-wallet entries) ──
-            if DEVIATION_STOP_ENABLED and not pos.get("had_flow_at_entry", False):
-                dev = self._btc_deviation_pct()
-                if dev is not None:
-                    adverse = (pos["side"] == "yes" and dev < -DEVIATION_STOP_PCT) or \
-                              (pos["side"] == "no" and dev > DEVIATION_STOP_PCT)
-                    if adverse and not in_grace:
-                        book = await self._client.get_orderbook(pos["ticker"])
-                        bid = book.best_yes_bid if pos["side"] == "yes" else book.best_no_bid
-                        count = pos.get("count", 1)
-                        logger.warning(
-                            "CopyEngine DEVIATION STOP (no flow): %s entry=%dc | BTC dev=%.3f%% (open=$%.0f now=$%.0f) | "
-                            "selling %d @ %dc",
-                            pos["side"].upper(), pos["entry_cents"], dev,
-                            self._btc_session_open, self._btc_last_price,
-                            count, bid,
-                        )
-                        if bid < 1:
-                            logger.warning("CopyEngine deviation stop SKIP: no bids on book (bid=0)")
-                        else:
-                            try:
-                                await self._cancel_tp_order()
-                                await self._client.place_order(
-                                    ticker=pos["ticker"], side=pos["side"],
-                                    price=bid, count=count, action="sell",
-                                )
-                                self._last_stop_ticker = pos["ticker"]
-                                self._last_stop_time = time.time()
-                                dev_pnl = (bid - pos["entry_cents"]) * count / 100.0
-                                is_win = dev_pnl > 0
-                                await self._record_trade_outcome(dev_pnl, is_win, pos["side"], "exited_win" if is_win else "exited_loss")
-                                self._record_daily_pnl(dev_pnl)
-                                self._closed_tickers.add(pos["ticker"])
-                                self._open_position = None
-                            except Exception as e:
-                                logger.error("CopyEngine deviation stop sell failed (POSITION STILL OPEN): %s", e)
-                        return
-            elif DEVIATION_STOP_ENABLED and pos.get("had_flow_at_entry", False):
-                dev = self._btc_deviation_pct()
-                if dev is not None:
-                    adverse = (pos["side"] == "yes" and dev < -DEVIATION_STOP_PCT) or \
-                              (pos["side"] == "no" and dev > DEVIATION_STOP_PCT)
-                    if adverse and not in_grace and int(fill_age) % 30 < 4:
-                        logger.info(
-                            "CopyEngine DEVIATION SKIP (wallet entry): %s entry=%dc | BTC dev=%.3f%% | "
-                            "trusting wallet conviction=%.0f%% wallets=%d",
-                            pos["side"].upper(), pos["entry_cents"], dev,
-                            pos.get("entry_conviction", 0) * 100,
-                            pos.get("entry_wallets", 0),
-                        )
-
-            # ── Fallback trailing stop (only when flow data absent/stale) ──
-            # Wallet-entered positions get no trailing stop — trust the conviction
-            if pos.get("had_flow_at_entry", False):
-                # ── Wallet backstop: catastrophic cutoff when flow data is absent ──
-                # DATA: 88c YES expired worthless (-$9.68) because flow went stale and
-                # the flow-block catastrophic stop never ran. This backstop prevents
-                # full-loss expiry when flow_has_data=False for wallet-entered positions.
-                if not in_grace:
-                    _bs_book = await self._client.get_orderbook(pos["ticker"])
-                    _bs_bid = _bs_book.best_yes_bid if pos["side"] == "yes" else _bs_book.best_no_bid
-                    if _bs_bid and _bs_bid >= 1:
-                        _bs_loss = pos["entry_cents"] - _bs_bid
-                        # WALLET BACKSTOP FULLY REMOVED
-                        if False:  # NEVER FIRES
-                            count = pos.get("count", 1)
-                            logger.warning(
-                                "CopyEngine WALLET BACKSTOP: %s entry=%dc bid=%dc loss=%dc | "
-                                "flow absent/stale — cutting %dx (threshold=%dc)",
-                                pos["side"].upper(), pos["entry_cents"], _bs_bid,
-                                _bs_loss, count, _bs_thresh,
-                            )
-                            try:
-                                await self._cancel_tp_order()
-                                await self._client.place_order(
-                                    ticker=pos["ticker"], side=pos["side"],
-                                    price=_bs_bid, count=count, action="sell",
-                                )
-                                self._last_stop_ticker = pos["ticker"]
-                                self._last_stop_time = time.time()
-                                _bs_pnl = (_bs_bid - pos["entry_cents"]) * count / 100.0
-                                await self._record_trade_outcome(_bs_pnl, False, pos["side"], "exited_loss")
-                                self._record_daily_pnl(_bs_pnl)
-                                self._closed_tickers.add(pos["ticker"])
-                                self._open_position = None
-                            except Exception as e:
-                                logger.error("CopyEngine wallet backstop sell failed: %s", e)
-                            return
-                # Wallet conviction supports — log but DON'T skip mechanical stops
-                # The unconditional -8c stop above already protects us
-                if int(fill_age) % 60 < 4:
-                    book = await self._client.get_orderbook(pos["ticker"])
-                    bid = book.best_yes_bid if pos["side"] == "yes" else book.best_no_bid
-                    logger.info(
-                        "CopyEngine HOLDING (wallet supports): %s entry=%dc bid=%dc | "
-                        "conv=%.0f%% wallets=%d — hard stop at -%dc still active",
-                        pos["side"].upper(), pos["entry_cents"], bid,
-                        pos.get("entry_conviction", 0) * 100,
-                        pos.get("entry_wallets", 0),
-                        SIGNAL_STOP_CENTS_HIGH_ENTRY if pos["entry_cents"] >= HIGH_ENTRY_STOP_THRESHOLD else SIGNAL_STOP_CENTS,
-                    )
-                # Continue to trailing stop logic below (don't return)
-
-            if pos["entry_cents"] >= HIGH_ENTRY_STOP_THRESHOLD:
-                effective_stop = SIGNAL_STOP_CENTS_HIGH_ENTRY
-            elif (pos["tier"] == "PRIMARY"
-                    and pos.get("entry_conviction", 0) >= SIGNAL_PRIMARY_WIDE_MIN_CONVICTION):
-                effective_stop = SIGNAL_STOP_CENTS_PRIMARY_WIDE
-            else:
-                effective_stop = SIGNAL_STOP_CENTS
-
-            if False and effective_stop > 0:  # TRAILING STOP DISABLED — hold to expiry
-                book = await self._client.get_orderbook(pos["ticker"])
-                bid = book.best_yes_bid if pos["side"] == "yes" else book.best_no_bid
-
-                hwm = pos.get("high_water_bid", pos["entry_cents"])
-                if bid > hwm:
-                    pos["high_water_bid"] = bid
-                    hwm = bid
-
-                if not in_grace:
-                    count = pos.get("count", 1)
-                    drop_from_hwm = hwm - bid
-                    if drop_from_hwm >= effective_stop:
-                        logger.warning(
-                            "CopyEngine TRAILING STOP (no flow): %s entry=%dc hwm=%dc bid=%dc "
-                            "drop=%dc stop=%dc count=%d",
-                            pos["side"].upper(), pos["entry_cents"], hwm, bid,
-                            drop_from_hwm, effective_stop, count,
-                        )
-                        if bid < 1:
-                            logger.warning("CopyEngine trailing stop SKIP: no bids on book (bid=0)")
-                        else:
-                            try:
-                                await self._cancel_tp_order()
-                                await self._client.place_order(
-                                    ticker=pos["ticker"], side=pos["side"],
-                                    price=bid, count=count, action="sell",
-                                )
-                                self._last_stop_ticker = pos["ticker"]
-                                self._last_stop_time = time.time()
-                                trail_pnl = (bid - pos["entry_cents"]) * count / 100.0
-                                is_win = trail_pnl > 0
-                                await self._record_trade_outcome(trail_pnl, is_win, pos["side"], "exited_win" if is_win else "exited_loss")
-                                self._record_daily_pnl(trail_pnl)
-                                self._closed_tickers.add(pos["ticker"])
-                                self._open_position = None
-                            except Exception as e:
-                                logger.error("CopyEngine trailing stop sell failed (POSITION STILL OPEN): %s", e)
-
-        except Exception as e:
-            logger.debug("CopyEngine position mgmt error: %s", e)
-
-    def _publish_state(self) -> None:
-        self._state.smart_flow = self._smart_flow
-        self._state.kalshi_tape = self._kalshi_tape
-        self._state.trades_this_window = self._trades_this_window
-        self._state.total_trades = self._total_trades
-        self._state.updated_at = time.time()
-        self._ref["state"] = self._state
-        # Dashboard JSON for terminal monitor (throttled to 2s)
-        now = time.time()
-        if now - self._last_dashboard_write >= 2.0:
-            self._write_dashboard_json()
-            self._last_dashboard_write = now
-
-    def _write_dashboard_json(self) -> None:
-        """Write engine decision state to JSON for the terminal monitor."""
-        try:
-            import json as _dj
-
-            now = time.time()
-
-            # Refresh balance from Kalshi every 30s — keeps dashboard accurate
-            # between _snapshot_balance() calls (which only fire on window changes)
-            if now - getattr(self, '_last_bal_refresh', 0) >= 30:
-                try:
-                    _br = asyncio.get_event_loop().create_task(self._client.get_balance())
-                    # Schedule but don't await — fire-and-forget, result captured next cycle
-                    _br.add_done_callback(lambda t: setattr(self, '_last_known_balance_cents', t.result().balance) if not t.cancelled() and not t.exception() else None)
-                    self._last_bal_refresh = now
-                except Exception:
-                    pass
-
-            tape = self._kalshi_tape
-            pf = getattr(self, '_price_feed', None)
-            prob = pf.prob_engine if pf and hasattr(pf, 'prob_engine') else None
-            fs = pf.five_sec if pf and hasattr(pf, 'five_sec') else None
-            tt = pf.tick_tracker if pf and hasattr(pf, 'tick_tracker') else None
-            ta = self._ta_scorer.last_result if self._ta_scorer else None
-            pos = self._open_position
-            flow = self._smart_flow
-
-            # Use Kalshi's actual expiry timestamp for accurate timer
-            _expiry_ms = getattr(self, '_kalshi_expiry_ms', 0)
-            if _expiry_ms > 0:
-                secs_left = max((_expiry_ms / 1000.0) - now, 0)
-                session_age = 900 - secs_left
-            else:
-                window_open = getattr(self, '_poly_window_open_time', 0)
-                session_age = now - window_open if window_open > 0 else 0
-                secs_left = max(900 - session_age, 0)
-
-            # Keep prob engine updated even during locked windows so dashboard has data
-            if prob and prob.is_ready:
-                btc_price_upd = getattr(self, '_btc_last_price', 0) or 0
-                mid_upd = tape.mid_price_cents if tape else 0
-                if prob.strike <= 0:
-                    btc_open_upd = getattr(self, '_btc_session_open', 0) or btc_price_upd
-                    if btc_open_upd > 0:
-                        prob.set_strike(btc_open_upd)
-                if btc_price_upd > 0 and mid_upd > 0:
-                    prob.update(btc_price_upd, mid_upd, max(secs_left, 1))
-
-            baseline = getattr(self, '_session_baseline_price', 0)
-            baseline_set = getattr(self, '_session_baseline_set', False)
-            baseline_samples = len(getattr(self, '_session_baseline_mids', []))
-
-            # Prob engine
-            p_ready = prob.is_ready if prob else False
-            p_fv = prob.fair_value if prob and p_ready else 0
-            p_prob = prob.probability if prob and p_ready else 0
-            p_misp = prob.mispricing if prob and p_ready else 0
-            p_vol = prob.volatility if prob and hasattr(prob, 'volatility') else 0
-            p_strike = prob.strike if prob else 0
-            p_side = prob.side if prob and p_ready else ""
-            p_edge = prob.edge_cents if prob and p_ready else 0
-
-            # FVG
-            fvg = p_fv - baseline if p_ready and baseline > 0 else 0
-            if session_age < 180:
-                fvg_thresh = 5
-            elif session_age < 420:
-                fvg_thresh = 8
-            else:
-                fvg_thresh = 12
-            fvg_crossed = abs(fvg) >= fvg_thresh if baseline_set else False
-
-            # BTC
-            btc = getattr(self, '_btc_last_price', 0) or 0
-            btc_open = getattr(self, '_btc_session_open', 0) or 0
-            strike = p_strike if p_strike > 0 else btc
-            btc_dist = abs(btc - strike) / strike * 100 if strike > 0 else 0
-
-            # Tick velocity
-            tv = tt.tick_velocity if tt and not tt.is_stale else 0
-
-            # Position
-            pos_data = {"active": False}
-            if pos:
-                mid = tape.mid_price_cents if tape else 0
-                entry = pos.get("entry_cents", 0)
-                ct = pos.get("count", 0)
-                if pos["side"] == "yes":
-                    unreal = (mid - entry) * ct
-                else:
-                    unreal = ((100 - mid) - entry) * ct  # NO value = 100 - YES mid
-                # Reversal tracker: how much edge has evaporated
-                _ep = pos.get("_entry_prob", 0.5)
-                _cp = p_prob
-                if pos["side"] == "yes" and _ep > 0.55:
-                    _rev_frac = max(0, (_ep - _cp) / (_ep - 0.5))
-                elif pos["side"] == "no" and _ep < 0.45:
-                    _rev_frac = max(0, (_cp - _ep) / (0.5 - _ep))
-                else:
-                    _rev_frac = 0
-
-                pos_data = {
-                    "active": True,
-                    "side": pos.get("side", ""),
-                    "count": ct,
-                    "entry_cents": entry,
-                    "tp_price": pos.get("tp_price", 0),
-                    "high_water": pos.get("high_water_bid", 0),
-                    "low_water": pos.get("low_water_bid", 0),
-                    "unrealized_cents": unreal,
-                    "dca_tiers": pos.get("_dca_tiers_hit", 0),
-                    "dca_maxed": pos.get("_dca_maxed", False),
-                    "ticker": pos.get("ticker", ""),
-                    "entry_prob": round(_ep * 100, 1),
-                    "current_prob": round(_cp * 100, 1),
-                    "reversal_pct": round(_rev_frac * 100),
-                    # New v6 fields
-                    "exit_mode": pos.get("_exit_mode", "SCALP"),
-                    "exec_path": pos.get("_exec_path", ""),
-                    "entry_kind": pos.get("_entry_kind", ""),
-                    "scalp_dca_fired": pos.get("_scalp_dca_fired", False),
-                    "scalp_stopped": pos.get("_scalp_stopped", False),
-                    "original_entry": pos.get("original_entry_cents", entry),
-                    "original_count": pos.get("original_count", ct),
-                    # Refinement B (2026-04-20): how many cycles the trail exit
-                    # has been held back by strong on-side pressure + tight book.
-                    # Monitor shows this as a MAGENTA "trail:HELD Nc" badge.
-                    "_trail_held_count": int(pos.get("_trail_held_count", 0) or 0),
-                    # Per-trade factor attribution — shown in monitor's ENTRY FACTORS panel
-                    # so the operator can see exactly which signals drove this position.
-                    "entry_factors": {
-                        "pressure_score": round(pos.get("_pressure_score", 0.0), 3),
-                        "pressure_conf":  round(pos.get("_pressure_confidence", 0.0), 3),
-                        "btc_impulse":    round(pos.get("_pressure_impulse", 0.0), 3),
-                        "book_pressure":  round(pos.get("_pressure_book", 0.0), 3),
-                        "flow_momentum":  round(pos.get("_pressure_flow", 0.0), 3),
-                        "kalshi_lag":     round(pos.get("_pressure_lag", 0.0), 3),
-                        "persistence":    pos.get("_pressure_persistence", 0),
-                        "btc_5m_move":    round(pos.get("_entry_btc_5m", 0.0), 2),
-                        "rsi":            round(pos.get("_entry_rsi", 50.0), 1),
-                        "fvg_signed":     int(pos.get("_gate_snapshot", {}).get("fvg_signed", 0)),
-                        "spread_cents":   pos.get("_entry_spread", 0),
-                        "session_age_s":  round(pos.get("_entry_session_age", 0), 0),
-                        # Refinement A (2026-04-20): direction source drives the
-                        # monitor's CAP WIDEN badge ("microstructure" + conf>=.75).
-                        "direction_source": pos.get("_direction_source", ""),
-                    },
-                    "entry_gate": pos.get("_gate_snapshot", {}),
-                }
-
-            state = {
-                "ts": now,
-                "session": {
-                    "ticker": getattr(self, '_current_kalshi_ticker', '') or '',
-                    "seconds_remaining": round(secs_left, 1),
-                    "baseline_set": baseline_set,
-                    "baseline_price": baseline,
-                    "baseline_samples": baseline_samples,
-                    "regime": getattr(self, '_session_regime', 'UNKNOWN'),
-                    "regime_vol": round(getattr(self, '_session_regime_vol', 0), 1),
-                    "window_locked": getattr(self, '_window_locked', False),
-                    "trades_this_window": self._trades_this_window,
-                },
-                "prob": {
-                    "is_ready": p_ready,
-                    "fair_value": round(p_fv, 1),
-                    "probability": round(p_prob, 4),
-                    "mispricing": round(p_misp, 1),
-                    "volatility": round(p_vol * 100, 1) if p_vol < 10 else round(p_vol, 1),
-                    "strike": round(p_strike, 2),
-                    "side": p_side,
-                    "edge_cents": round(p_edge, 1),
-                },
-                "fvg": {
-                    "fvg_vs_baseline": round(fvg, 1),
-                    "threshold": fvg_thresh,
-                    "crossed": fvg_crossed,
-                    "btc_dist_ok": True,  # distance gate removed — FVG divergence is sufficient
-                    "btc_dist_pct": round(btc_dist, 4),
-                    "entry_ready": fvg_crossed and 0.005 < btc_dist < 0.15,
-                },
-                "tape": {
-                    "mid_cents": tape.mid_price_cents if tape else 0,
-                    "taker_imbalance": round(tape.taker_imbalance, 3) if tape else 0,
-                    "vwap_cents": round(tape.vwap_cents, 1) if tape else 0,
-                },
-                "btc": {
-                    "price": round(btc, 2),
-                    "session_open": round(btc_open, 2),
-                    "distance_pct": round(btc_dist, 4),
-                },
-                "ta": {
-                    "direction": ta.direction if ta else "n/a",
-                    "confidence": round(ta.confidence) if ta else 0,
-                    "tier": ta.confidence_tier if ta else "NONE",
-                    "rsi": round(ta.rsi_7, 1) if ta else 0,
-                    "ema_spread": round(ta.ema_spread_pct, 3) if ta else 0,
-                    "candle_pressure": round(ta.candle_pressure, 2) if ta else 0,
-                    "kst_bullish": ta.kst_bullish if ta else False,
-                    "adx": round(ta.adx_value, 1) if ta else 0,
-                },
-                "five_sec": {
-                    "is_ready": fs.is_ready if fs else False,
-                    "bb_upper": round(fs.bb_upper, 2) if fs and fs.is_ready else 0,
-                    "bb_mid": round(fs.bb_mid, 2) if fs and fs.is_ready else 0,
-                    "bb_lower": round(fs.bb_lower, 2) if fs and fs.is_ready else 0,
-                    "tick_velocity": round(tv, 2),
-                },
-                "position": pos_data,
-                "account": {
-                    "balance_cents": self._last_known_balance_cents,
-                    "daily_pnl": round(getattr(self, '_daily_pnl', 0), 2),
-                },
-                # 2026-04-19 authoritative account state pulled from Kalshi REST
-                # (populated by _balance_poll_loop + _settlement_poll_loop).
-                # This is the source of truth — legacy "account.balance_cents"
-                # above is the engine's internal estimate and can drift.
-                "real_account": {
-                    "cash_cents":      getattr(self, '_real_cash_cents', 0),
-                    "portfolio_cents": getattr(self, '_real_portfolio_cents', 0),
-                    "total_cents":     getattr(self, '_real_total_cents', 0),
-                    "snapshot_ts_ms":  getattr(self, '_real_balance_ts_ms', 0),
-                },
-                # Current UTC hour live performance + last 24h history.
-                # Measured off Kalshi settlements, NOT the unreliable DB pnl column.
-                "hourly": {
-                    "current":   dict(getattr(self, '_current_hour_perf', {}) or {}),
-                    "recent":    list(getattr(self, '_recent_hourly_perf', []) or [])[:24],
-                    "updated_ms": getattr(self, '_last_hour_recompute_ms', 0),
-                },
-                "flow": {
-                    "direction": flow.flow_direction if flow else "none",
-                    "conviction": round(flow.flow_conviction * 100, 1) if flow else 0,
-                    "up_wallets": flow.up_wallets if flow else 0,
-                    "down_wallets": flow.down_wallets if flow else 0,
-                },
-                "pressure": {
-                    "score": self._last_pressure.score,
-                    "direction": self._last_pressure.direction,
-                    "confidence": self._last_pressure.confidence,
-                    "btc_impulse": self._last_pressure.btc_impulse,
-                    "book_pressure": self._last_pressure.book_pressure,
-                    "flow_momentum": self._last_pressure.flow_momentum,
-                    "kalshi_lag": self._last_pressure.kalshi_lag,
-                    "threshold": self._last_pressure.entry_threshold,
-                    "crossed": self._last_pressure.crossed,
-                    "persistent": self._last_pressure.persistent,
-                    "persist_count": self._last_pressure.persistence_count,
-                    "ready": self._last_pressure.persistent and self._last_pressure.confidence >= 0.5,
-                    # 5-min BTC trend — Dominant-Direction gate primary input
-                    "btc_move_5s": self._last_pressure.btc_move_5s,
-                    "btc_move_30s": self._last_pressure.btc_move_30s,
-                    "btc_move_300s": getattr(self._last_pressure, 'btc_move_300s', 0.0),
-                },
-                # Dominant-Direction gate — last evaluation (per-factor state).
-                # Shown in the monitor's GATE DECISION panel so the operator
-                # can see exactly which factor(s) blocked / allowed the entry.
-                "dominant_gate": self._last_gate,
-                # Option C — missed-opportunity counters + recent upgrades.
-                # `missed_dominant.session` resets every 15m window; `total`
-                # is lifetime (until process restart). `recent_upgrades` holds
-                # the last 5 Option A/B events for in-flight visibility.
-                "missed_dominant": {
-                    "session": int(getattr(self, '_missed_dominant_session', 0)),
-                    "total": int(getattr(self, '_missed_dominant_total', 0)),
-                    "upgrade_fired_this_window": bool(
-                        getattr(self, '_dominant_upgrade_fired_this_window', False)
-                    ),
-                },
-                "recent_upgrades": list(
-                    getattr(self, '_recent_upgrade_events', [])
-                )[-5:],
-                # Profit re-entry carveout (2026-04-17): record every time
-                # the window stays unlocked after a WIN because the Dominant
-                # gate still qualifies. Validation for the lifted lock —
-                # expected to fire multiple times per session when BTC is
-                # trending; should fire 0 times on loss exits.
-                "profit_reentry_events": list(
-                    getattr(self, '_profit_reentry_events', [])
-                )[-5:],
-            }
-
-            import os as _os
-            tmp_path = _os.path.join("data", "dashboard_state.json.tmp")
-            final_path = _os.path.join("data", "dashboard_state.json")
-            with open(tmp_path, 'w') as f:
-                _dj.dump(state, f)
-            _os.replace(tmp_path, final_path)
+                                except Exception:
+                                    pass  # try at 28630
+                        except Exception:
+                            pass  # try at 28592
         except Exception:
-            pass  # Never crash engine for dashboard writes
+            pass  # try at 26272
+
+        return True
+                             
