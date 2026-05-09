@@ -2566,6 +2566,18 @@ SCALP_TRAIL_PHASE1_C                  = 15    # restored
 SCALP_TRAIL_PHASE2_C                  = 10    # restored
 SCALP_TRAIL_PHASE3_C                  = 5     # restored
 SCALP_TRAIL_PHASE4_C                  = 3     # restored
+
+# ── 2026-05-09 — ASYMMETRIC LOSS-SIDE TRAIL (Fix F) ───────────────────────
+# When the position is underwater (bid < entry), the cents-trail tightens
+# to SCALP_LOSS_TRAIL_C so we exit + flip earlier on losers rather than
+# riding the full phase-trail give-back. Combined with Fix G (LOSS-CUT
+# now triggers INVERSE_REENTRY consideration), this gives us proactive
+# side-swapping when BTC moves against us.
+#
+# Set to 0 to disable (use phase-trail symmetrically). Default 8c —
+# tighter than PHASE1 (15c) and PHASE2 (10c), looser than PHASE3 (5c)
+# and PHASE4 (3c) since the late-window phases are already aggressive.
+SCALP_LOSS_TRAIL_C                    = 8
 SCALP_BTC_TRAIL_DOLLARS               = 60.0  # 2026-05-08 PT (round 5 REVERT):
                                                 # restored from 99999 → 60
                                                 # Used as fallback when

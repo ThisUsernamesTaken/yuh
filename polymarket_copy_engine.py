@@ -5852,13 +5852,28 @@ class PolymarketCopyEngine:
                     return
 
         # ── CONTRACT BID TRAIL ────────────────────────────────────────
-        trail_trigger = self._scalp_hwm_bid - trail_c
+        # 2026-05-09 (Fix F): asymmetric loss-side trail. When the
+        # position is underwater (bid < entry), use the tighter
+        # SCALP_LOSS_TRAIL_C so we exit + flip earlier on losers
+        # rather than waiting for the full phase-trail give-back. The
+        # 02:10 PT YES leg sat in legacy state from -22c down to -43c
+        # because nothing in the SCALP path triggered until 15c
+        # absolute loss — by then the bid had already collapsed past
+        # the inverse-fill liquidity window. Tighter loss-trail =
+        # earlier flip = better chance the inverse fills.
+        effective_trail_c = trail_c
+        if bid < entry_c:
+            _loss_trail_c = int(_uc("SCALP_LOSS_TRAIL_C", 8))
+            if _loss_trail_c > 0 and _loss_trail_c < trail_c:
+                effective_trail_c = _loss_trail_c
+        trail_trigger = self._scalp_hwm_bid - effective_trail_c
         if bid <= trail_trigger:
             logger.info(
-                "SCALP TRAIL: hwm=%dc bid=%dc trail=%dc → exit "
+                "SCALP TRAIL: hwm=%dc bid=%dc trail=%dc%s → exit "
                 "side=%s entry=%dc (%+dc/contract)",
-                self._scalp_hwm_bid, bid, trail_c, side.upper(),
-                entry_c, bid - entry_c,
+                self._scalp_hwm_bid, bid, effective_trail_c,
+                " (loss-tight)" if effective_trail_c < trail_c else "",
+                side.upper(), entry_c, bid - entry_c,
             )
             await self._scalp_fire_exit(ticker, side, bid, "TRAIL")
             return
@@ -5973,9 +5988,14 @@ class PolymarketCopyEngine:
             # to decide: INVERT (IOC the opposite side) vs RE-ENTER SAME
             # (let the ladder re-place on our original side). Only runs
             # when we'd otherwise consider an inverse re-entry.
+            #
+            # 2026-05-09 (Fix G): LOSS-CUT added so the score gates
+            # loss-side flips too. Without scoring, a chop-noise LOSS-CUT
+            # would flip blindly and chop again. With scoring, only
+            # LOSS-CUTs that look like genuine reversals get inverted.
             _do_invert: bool = True
             _reversal_conf: float = 1.0
-            if reason in ("TRAIL", "BTC-TRAIL"):
+            if reason in ("TRAIL", "BTC-TRAIL", "LOSS-CUT"):
                 # 1. Time factor (weight 0.25)
                 _fill_age = time.time() - float(
                     self._scalp_fill_time or time.time(),
@@ -6108,7 +6128,16 @@ class PolymarketCopyEngine:
             self._scalp_exit_price_c = 0
             self._scalp_inv_bid_at_fill = 0
 
-            if reason in ("TRAIL", "BTC-TRAIL") and bool(
+            # 2026-05-09 (Fix G): LOSS-CUT now also triggers
+            # INVERSE_REENTRY consideration. Per user 2026-05-09 PT:
+            # "should be able to swap sides at loss too not just
+            # profit." The REVERSAL-SCORE still gates whether the
+            # flip actually fires (so a noise-driven LOSS-CUT in
+            # chop won't flip), but the path is now reachable.
+            # PRE-EXPIRY and NEAR-CERTAIN intentionally still skip
+            # — no time left to ride an inverse before settlement,
+            # and HOLD-CERTAIN is by definition "don't flip."
+            if reason in ("TRAIL", "BTC-TRAIL", "LOSS-CUT") and bool(
                 _uc("SCALP_INVERSE_REENTRY_ENABLED", True)
             ) and _do_invert:
                 inv_side = "no" if side == "yes" else "yes"
