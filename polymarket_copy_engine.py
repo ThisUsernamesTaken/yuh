@@ -6232,6 +6232,50 @@ class PolymarketCopyEngine:
                 inv_contracts = int(_uc("SCALP_CONTRACTS", 5))
                 inv_slip = int(_uc("SCALP_REENTRY_SLIP_C", 5))
 
+                # 2026-05-09 (Fix L): pre-INVERSE Kalshi truth check.
+                # If the original side is still on Kalshi (sell didn't
+                # actually execute — phantom-sell), DON'T fire the
+                # inverse. Otherwise we end up holding both sides (BOX),
+                # which is the pattern visible in tonight's settlement
+                # data: 'y=10 n=10 cost=$9.80 rev=$0.00' = full position
+                # loss because both legs settle worthless.
+                #
+                # The Fix K re-arm path will pick up the orphan and
+                # manage it; if a real reversal develops, the next
+                # trail/stale exit gets another shot at flipping.
+                #
+                # Costs: one extra get_positions roundtrip per inverse
+                # (~50-200ms). Worth it — every avoided BOX saves a
+                # full position cost (~$3).
+                try:
+                    _truth = await self._client.get_positions()
+                    _orig_count = 0
+                    for _p in _truth or []:
+                        if _p.get("ticker") == ticker:
+                            _pos_fp = int(float(_p.get("position_fp", "0") or 0))
+                            # Positive = YES held, negative = NO held
+                            if (side == "yes" and _pos_fp > 0) or (side == "no" and _pos_fp < 0):
+                                _orig_count = abs(_pos_fp)
+                            break
+                    if _orig_count > 0:
+                        logger.warning(
+                            "SCALP INVERSE ABORT (phantom-sell detected): "
+                            "Kalshi still has %dct %s on %s — NOT firing "
+                            "opposite-side IOC to avoid BOX position. "
+                            "Fix K re-arm will manage the orphan.",
+                            _orig_count, side.upper(), ticker[-15:],
+                        )
+                        return  # exit without firing inverse
+                except Exception as _truth_err:
+                    # If truth check fails, fall through to inverse
+                    # (legacy behavior — better than blocking trades on
+                    # transient API errors). The post-INVERSE BOX
+                    # detection (Fix M, below) provides a safety net.
+                    logger.warning(
+                        "SCALP INVERSE truth-check error (proceeding "
+                        "with inverse anyway): %s", _truth_err,
+                    )
+
                 # Read the inverse side's current ask for the IOC price
                 inv_ask = 0
                 try:
