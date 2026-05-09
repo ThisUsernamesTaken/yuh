@@ -5735,6 +5735,17 @@ class PolymarketCopyEngine:
         if self._scalp_exit_placed:
             return  # exit already fired this window
 
+        # 2026-05-09 (Fix Q): cooldown after a failed IOC exit. Without
+        # this, a nofill exit would re-fire on the very next tick (sub-
+        # second), spamming sells and likely getting throttled by Kalshi.
+        # 3-second cooldown gives the book time to update + lets the
+        # bid potentially move into a fillable range.
+        _last_exit_ts = float(getattr(self, "_scalp_exit_fire_ts", 0) or 0)
+        if _last_exit_ts > 0:
+            _cooldown_s = float(_uc("SCALP_EXIT_RETRY_COOLDOWN_S", 3.0))
+            if (time.time() - _last_exit_ts) < _cooldown_s:
+                return  # in cooldown, wait
+
         side = self._scalp_filled_side  # "yes" or "no"
         bid = self._scalp_get_side_bid(ticker, side)
         if bid <= 0:
@@ -5972,16 +5983,22 @@ class PolymarketCopyEngine:
         Tracks the returned order_id for orphan cancellation on window flip.
         """
         try:
+            # 2026-05-09 (Fix Q): SCALP exits use IOC — fill immediately
+            # at bid or cancel. Prevents stale resting orders when bid
+            # collapses faster than the engine repprices.
             order, count = await self._place_capped_side_sell(
                 ticker=ticker, side=side, price=bid,
                 requested_count=int(self._scalp_filled_count),
                 post_only=False,
                 reason=f"SCALP-{reason}",
+                tif="immediate_or_cancel",
             )
-            self._scalp_exit_placed = True
             self._scalp_exit_fire_ts = time.time()
             self._scalp_exit_price_c = bid
             if order is None:
+                # Truth=0 or oversell-guard. Treat as "exit done from
+                # engine's POV" — set exit_placed so we don't retry.
+                self._scalp_exit_placed = True
                 logger.warning(
                     "SCALP EXIT BLOCKED (%s): %s side=%s — sell helper "
                     "returned None (truth=0 or oversell-guard)",
@@ -5990,12 +6007,36 @@ class PolymarketCopyEngine:
                 return
             self._scalp_exit_order_id = getattr(order, "order_id", None)
             entry_c = self._scalp_entry_price
-            logger.info(
-                "SCALP EXIT (%s): sold %dx %s @ %dc (entry=%dc, "
-                "%+dc/contract) oid=%s",
-                reason, count, side.upper(), bid, entry_c, bid - entry_c,
-                (self._scalp_exit_order_id or "?")[:12],
-            )
+            # 2026-05-09 (Fix Q): IOC may return with 0 fills if no
+            # liquidity at bid. Read actual filled_count to know whether
+            # we really sold or the order auto-cancelled. If 0 fills,
+            # leave _scalp_exit_placed=False so trail can retry next
+            # tick at the new bid (cooldown via existing 5s gate).
+            _filled = int(getattr(order, "filled_count", 0) or 0)
+            if _filled > 0:
+                self._scalp_exit_placed = True
+                logger.info(
+                    "SCALP EXIT (%s): sold %dx %s @ %dc (entry=%dc, "
+                    "%+dc/contract) oid=%s",
+                    reason, _filled, side.upper(), bid, entry_c,
+                    bid - entry_c,
+                    (self._scalp_exit_order_id or "?")[:12],
+                )
+            else:
+                # IOC didn't match — book too thin at this bid. Don't
+                # lock exit_placed. The next manage tick (after a brief
+                # implicit cooldown via the SCALP cycle pacing) will
+                # re-evaluate and try again at whatever the new bid is.
+                logger.warning(
+                    "SCALP EXIT-NOFILL (%s): IOC %dx %s @ %dc returned "
+                    "0 fills (book too thin) — will retry at new bid. "
+                    "side=%s entry=%dc",
+                    reason, count, side.upper(), bid, side.upper(), entry_c,
+                )
+                # Set a short cooldown so we don't spam. Manage cycle
+                # checks _scalp_exit_fire_ts and skips if recent.
+                # exit_placed stays False so trail can re-fire after cooldown.
+                return
             if self._scalp_exit_order_id:
                 try:
                     self._engine_placed_order_ids[
@@ -20301,6 +20342,7 @@ class PolymarketCopyEngine:
         post_only: bool,
         reason: str,
         known_position_count: int | None = None,
+        tif: str | None = None,
     ):
         """Place a sell capped to verified inventory not already resting.
 
@@ -20399,6 +20441,17 @@ class PolymarketCopyEngine:
                 "%s SELL-CAP: capped %s %s %d -> %d (position=%d resting=%d)",
                 reason, ticker, side.upper(), requested_count, capped_count, position_count, resting_count,
             )
+        # 2026-05-09 (Fix Q): pass time_in_force when caller specifies it.
+        # SCALP exits use IOC so that a sell that can't fill immediately
+        # at the bid is cancelled rather than resting as a stale GTC.
+        # Witnessed live: sell at 65c rested while bid collapsed to 10c,
+        # never matched, position bled while engine "thought" it had an
+        # active exit order. With IOC, each exit attempt either fills
+        # immediately or cancels, and the next manage tick fires a fresh
+        # attempt at the new (lower) bid.
+        _po_kwargs = {}
+        if tif:
+            _po_kwargs["time_in_force"] = tif
         order = await self._client.place_order(
             ticker=ticker,
             side=side,
@@ -20406,6 +20459,7 @@ class PolymarketCopyEngine:
             count=capped_count,
             action="sell",
             post_only=post_only,
+            **_po_kwargs,
         )
         return order, capped_count
 
