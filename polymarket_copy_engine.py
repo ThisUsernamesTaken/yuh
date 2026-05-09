@@ -1537,46 +1537,112 @@ class PolymarketCopyEngine:
                     abs_count = abs(pos_count)
                     side = "yes" if pos_count > 0 else "no"
                     entry_cents = int(exposure / abs_count * 100) if abs_count > 0 else 50
-                    logger.warning(
-                        "CopyEngine STARTUP RECOVERY: found %s %dx (exposure=$%.2f, entry~%dc) — locked DCA, TPs will be set",
-                        side.upper(), abs_count, exposure, entry_cents,
+
+                    # 2026-05-09 (Fix A): tier-aware routing. If the ticker
+                    # was last managed as a DIRECTION/SCALP-tier position
+                    # (per the disk-persisted _direction_active set, loaded
+                    # at __init__), route the recovered position to
+                    # _direction_position so the trail-aware exit layer
+                    # owns it. The legacy _open_position path is the
+                    # cancel-replace cancel-loop landmine — routing SCALP
+                    # origins through it on every restart was what caused
+                    # the 00:17 paralysis.
+                    _is_direction_origin = ticker in (
+                        getattr(self, "_direction_active_tickers", None)
+                        or set()
                     )
-                    # Recovered positions: lock DCA entirely. We don't know the
-                    # original entry price or DCA tier state from before the restart,
-                    # so firing fresh DCA would mis-budget using stale averages.
-                    # Trail/TPs still work (they use current count × entry).
-                    self._open_position = {
-                        "order_id": "recovered",
-                        "side": side,
-                        "entry_cents": entry_cents,
-                        "original_entry_cents": entry_cents,
-                        "original_count": abs_count,
-                        "ticker": ticker,
-                        "balance_at_entry": 0,  # unknown — recovery path
-                        "tier": "RECOVERED",
-                        "count": abs_count,
-                        "fill_time": time.time(),
-                        "entry_conviction": 0.0,
-                        "entry_wallets": 0,
-                        "entry_wallet_count_at_last_scale": 0,
-                        "high_water_bid": entry_cents,
-                        "low_water_bid": entry_cents,
-                        "_dca_tiers_hit": 0,
-                        "_dca_maxed": True,  # LOCK DCA on recovered positions
-                        "had_flow_at_entry": False,
-                        "tiers_in": set(),
-                        "entry_elite_wallets": set(),
-                        "shallow_filled": abs_count,
-                        "shallow_price": entry_cents,
-                        "deep_filled": 0,
-                        "deep_price": entry_cents,
-                        "signal_wallet_names": [],
-                        "tp_order_id": None,
-                        "tp_order_ids": [],
-                        "tp_price": 0,
-                    }
-                    # Lock window immediately — recovered positions should NOT trigger re-entry
-                    self._window_locked = True
+                    if _is_direction_origin:
+                        logger.warning(
+                            "CopyEngine STARTUP RECOVERY: found %s %dx "
+                            "(exposure=$%.2f, entry~%dc) — routing to "
+                            "_direction_position (DIRECTION-active on disk)",
+                            side.upper(), abs_count, exposure, entry_cents,
+                        )
+                        _now_rec = time.time()
+                        self._direction_position = {
+                            "order_id": "recovered",
+                            "side": side,
+                            "entry_cents": entry_cents,
+                            "original_count": abs_count,
+                            "ticker": ticker,
+                            "tier": "SCALP",
+                            "strategy_name": "SCALP",
+                            "count": abs_count,
+                            "fill_time": _now_rec,
+                            "_hold_to_settle": False,
+                            "entry_time": _now_rec,
+                            "hwm_bid": entry_cents,
+                            "exit_attempted": False,
+                            "wall_streak_start": 0.0,
+                            "_recovered": True,
+                        }
+                        # Populate the SCALP state machine so BTC-TRAIL,
+                        # bid-trail, loss-cut, and pre-expiry all evaluate
+                        # this position. _scalp_evaluated=True suppresses a
+                        # fresh same-window initial entry.
+                        self._scalp_filled_side = side
+                        self._scalp_filled_count = abs_count
+                        self._scalp_fill_time = _now_rec
+                        self._scalp_entry_price = entry_cents
+                        self._scalp_hwm_bid = entry_cents
+                        self._scalp_ticker = ticker
+                        self._scalp_btc_hwm = float(
+                            getattr(self, "_btc_last_price", 0) or 0
+                        )
+                        self._scalp_btc_side = side
+                        self._scalp_evaluated = True
+                        self._scalp_exit_placed = False
+                        # Add to the per-window lock so SCALP MARKET's
+                        # collision check (Fix C) covers this even if the
+                        # _direction_position guard missed.
+                        try:
+                            self._add_session_lock(ticker)
+                        except Exception:
+                            pass
+                    else:
+                        logger.warning(
+                            "CopyEngine STARTUP RECOVERY: found %s %dx "
+                            "(exposure=$%.2f, entry~%dc) — locked DCA, "
+                            "TPs will be set",
+                            side.upper(), abs_count, exposure, entry_cents,
+                        )
+                        # Recovered positions: lock DCA entirely. We don't know the
+                        # original entry price or DCA tier state from before the restart,
+                        # so firing fresh DCA would mis-budget using stale averages.
+                        # Trail/TPs still work (they use current count × entry).
+                        self._open_position = {
+                            "order_id": "recovered",
+                            "side": side,
+                            "entry_cents": entry_cents,
+                            "original_entry_cents": entry_cents,
+                            "original_count": abs_count,
+                            "ticker": ticker,
+                            "balance_at_entry": 0,  # unknown — recovery path
+                            "tier": "RECOVERED",
+                            "count": abs_count,
+                            "fill_time": time.time(),
+                            "entry_conviction": 0.0,
+                            "entry_wallets": 0,
+                            "entry_wallet_count_at_last_scale": 0,
+                            "high_water_bid": entry_cents,
+                            "low_water_bid": entry_cents,
+                            "_dca_tiers_hit": 0,
+                            "_dca_maxed": True,  # LOCK DCA on recovered positions
+                            "had_flow_at_entry": False,
+                            "tiers_in": set(),
+                            "entry_elite_wallets": set(),
+                            "shallow_filled": abs_count,
+                            "shallow_price": entry_cents,
+                            "deep_filled": 0,
+                            "deep_price": entry_cents,
+                            "signal_wallet_names": [],
+                            "tp_order_id": None,
+                            "tp_order_ids": [],
+                            "tp_price": 0,
+                        }
+                        # Lock window immediately — recovered legacy positions
+                        # should NOT trigger re-entry
+                        self._window_locked = True
                     # NOTE (Claude 2026-05-08): do NOT add the recovered ticker
                     # to _closed_tickers. _closed_tickers semantically means
                     # "we sold here; any leftover ct on Kalshi is unintended
@@ -5197,6 +5263,43 @@ class PolymarketCopyEngine:
                         ticker[-15:],
                     )
                     return  # do NOT re-fire; do NOT increment count
+
+            # 2026-05-09 (Fix C): legacy _open_position collision check.
+            # STARTUP RECOVERY routes adopted positions into _open_position
+            # (legacy fixed-TP path). If that ticker matches the current
+            # window, SCALP MARKET would otherwise fire and create a
+            # second engine state object on the same Kalshi position →
+            # cancel-replace race + paralysis loop. Skip if we'd
+            # collide. Same check for _direction_position handles the
+            # SCALP self-collision case (already filled this window).
+            _legacy_op = getattr(self, "_open_position", None) or {}
+            if (
+                _legacy_op
+                and _legacy_op.get("ticker") == ticker
+                and int(_legacy_op.get("count", 0) or 0) > 0
+            ):
+                logger.info(
+                    "SCALP MARKET SKIP: %s already on _open_position "
+                    "(tier=%s count=%d) — won't double-stack",
+                    ticker[-15:],
+                    _legacy_op.get("tier", "?"),
+                    int(_legacy_op.get("count", 0) or 0),
+                )
+                return
+            _dp = getattr(self, "_direction_position", None) or {}
+            if (
+                _dp
+                and _dp.get("ticker") == ticker
+                and int(_dp.get("count", 0) or 0) > 0
+            ):
+                logger.info(
+                    "SCALP MARKET SKIP: %s already on _direction_position "
+                    "(tier=%s count=%d) — won't double-stack",
+                    ticker[-15:],
+                    _dp.get("tier", "?"),
+                    int(_dp.get("count", 0) or 0),
+                )
+                return
 
             self._window_entry_count = int(
                 getattr(self, "_window_entry_count", 0) or 0
@@ -10030,6 +10133,26 @@ class PolymarketCopyEngine:
                 self._trend_trades_this_window = 0
                 self._ta_trades_this_window = 0
                 self._entered_tickers_this_window = set()  # 2026-04-22 per-window lock
+                # 2026-05-09 (Fix B): preserve any ticker that has an
+                # active position. Without this re-add, an unconditional
+                # clear lets SCALP MARKET fire on the same ticker the
+                # legacy/direction state already owns — which is the
+                # paralysis loop we hit at 00:17:57 PT. Re-adding here
+                # ensures the per-ticker lock survives the window flip
+                # for as long as the position is live.
+                try:
+                    _op = getattr(self, "_open_position", None) or {}
+                    if _op:
+                        _t = str(_op.get("ticker", "") or "")
+                        if _t and int(_op.get("count", 0) or 0) > 0:
+                            self._entered_tickers_this_window.add(_t)
+                    _dp = getattr(self, "_direction_position", None) or {}
+                    if _dp:
+                        _t = str(_dp.get("ticker", "") or "")
+                        if _t and int(_dp.get("count", 0) or 0) > 0:
+                            self._entered_tickers_this_window.add(_t)
+                except Exception:
+                    pass
                 # 2026-05-02 Phase 0.1.2: persist the cleared state so a
                 # restart immediately after window flip starts fresh too.
                 self._persist_session_lock()
@@ -20983,12 +21106,30 @@ class PolymarketCopyEngine:
                 try:
                     _o = await self._client.get_order(cur_id)
                     _status = (getattr(_o, "status", "") or "").lower()
-                    if _status in ("filled", "canceled", "cancelled", "expired", "terminal"):
+                    # 2026-05-09 (Fix D): "executed" added to the terminal
+                    # status list. Kalshi reports filled-and-done orders as
+                    # status="executed", and cancel_order returns 404 for
+                    # them (nothing to cancel). Without "executed" here, the
+                    # engine spins in a tight loop logging the same error
+                    # every ~700ms forever — which is what paralyzed the
+                    # 3:15 ET window on 2026-05-09 00:22 PT.
+                    if _status in (
+                        "filled", "executed", "canceled",
+                        "cancelled", "expired", "terminal",
+                    ):
                         logger.info(
                             "PROTECTIVE cancel %s returned False but order "
-                            "is %s — proceeding with place",
+                            "is %s — clearing stale ID, proceeding with place",
                             cur_id[:12], _status,
                         )
+                        # Clear the stale ID so subsequent cycles don't keep
+                        # retrying a cancel on an already-terminal order.
+                        try:
+                            if isinstance(self._protective_state, dict):
+                                self._protective_state["order_id"] = None
+                        except Exception:
+                            pass
+                        cur_id = None
                     else:
                         logger.error(
                             "PROTECTIVE cancel %s returned False AND order "
