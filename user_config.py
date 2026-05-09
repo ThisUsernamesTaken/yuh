@@ -2618,6 +2618,24 @@ SCALP_INVERSE_REENTRY_ENABLED         = False  # 2026-05-08 PT (evening):
                                                 # has fired ZERO times today
                                                 # — its gating wasn't
                                                 # operational anyway.
+
+# ── 2026-05-08 PT (evening, round 2) — auto-TP machinery disable ──────────
+# After disabling detection-based exits, observed that small-margin
+# profit-takes were STILL firing (+5c per ct on a 19:15 PT trade despite
+# all trail/wall/etc disables). Root cause: TWO auto-TP code paths still
+# active:
+#   1. SYNC RECLAIM auto-TP — when SYNC RECLAIM grabs a SCALP fill into
+#      _open_position, it auto-places a tiered TP at +8c above entry.
+#      Source: engine.py:~25708 _place_tiered_tp call.
+#   2. SCALP→HOLD UPGRADE — fires on RSI≤25 (YES) or RSI≥75 (NO), cancels
+#      existing TP and places 5-tier staircase at 70/78/85/92/95c. Often
+#      collides with OVERSELL-GUARD which then cancels everything.
+#      Source: engine.py:~26889.
+# Both flags below disable these paths so positions truly hold to
+# settlement (or to TAKE-CEILING / LOSS-CUT / FORCE-FLATTEN if those
+# trigger via _direction_manage_exit on DIRECTION-class positions).
+SYNC_RECLAIM_AUTO_TP_ENABLED          = False  # was implicitly True
+SCALP_TO_HOLD_UPGRADE_ENABLED         = False  # was implicitly True
 SCALP_REENTRY_SLIP_C                  = 5     # IOC slippage above ask
 
 # Reversal-confidence scorer threshold (2026-05-08). On TRAIL / BTC-TRAIL

@@ -25666,7 +25666,13 @@ class PolymarketCopyEngine:
                                     "MRC reclaim attach failed: %s", _mrc_re_err,
                                 )
                             # Place TPs immediately on reclaimed position
-                            if resting == 0:
+                            # 2026-05-08 PT (evening): gated by config flag.
+                            # When SYNC_RECLAIM_AUTO_TP_ENABLED=False, the
+                            # reclaim still claims the position into
+                            # _open_position for tracking, but does NOT
+                            # auto-place a +8c tiered TP. Position rides
+                            # to settlement / legacy stop-loss only.
+                            if resting == 0 and bool(_uc("SYNC_RECLAIM_AUTO_TP_ENABLED", True)):
                                 try:
                                     if _is_bb_reclaim:
                                         # Use FVG-close target identical to preflight
@@ -26846,7 +26852,15 @@ class PolymarketCopyEngine:
             # 70/78/85/92/95. Those prices are unreachable for a 43c
             # entry — the BB_PURE thesis was lost.
             # Same gate as SCALP DCA + TRAIL: don't run on BB_PURE.
+            #
+            # 2026-05-08 PT (evening): added universal config gate.
+            # SCALP_TO_HOLD_UPGRADE_ENABLED=False disables this entire
+            # path. Reason: it cancels the original TP and places a
+            # 5-tier staircase that triggers OVERSELL-GUARD; the
+            # subsequent emergency-flatten chain produces uncontrolled
+            # exits at small margins.
             if (count > 0 and bid > 0
+                    and bool(_uc("SCALP_TO_HOLD_UPGRADE_ENABLED", True))
                     and pos.get("strategy_name") != "BB_PURE"
                     and pos.get("_exit_mode", "SCALP") == "SCALP"
                     and not pos.get("_upgraded_from_scalp", False)
