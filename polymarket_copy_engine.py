@@ -10350,6 +10350,14 @@ class PolymarketCopyEngine:
                 self._trend_trades_this_window = 0
                 self._ta_trades_this_window = 0
                 self._entered_tickers_this_window = set()  # 2026-04-22 per-window lock
+                # Fix P: reset per-ticker re-arm counters on window flip.
+                # Stuck-position tracking only matters within a window.
+                try:
+                    if hasattr(self, "_scalp_rearm_count"):
+                        self._scalp_rearm_count.clear()
+                    self._scalp_stuck_log_ts = 0.0
+                except Exception:
+                    pass
                 # 2026-05-09 (Fix B): preserve any ticker that has an
                 # active position. Without this re-add, an unconditional
                 # clear lets SCALP MARKET fire on the same ticker the
@@ -26145,9 +26153,55 @@ class PolymarketCopyEngine:
                                 # so the trail / loss-cut / stale-exit can
                                 # fire and either close the position cleanly
                                 # or flip via INVERSE.
+                                #
+                                # 2026-05-09 (Fix P): cap re-arm attempts per
+                                # ticker. The 13:08 PT 2026-05-09 incident
+                                # showed a tight 30-second loop where:
+                                #   1. Fix K re-arms YES 5x @ cost=60c bid=17c
+                                #   2. SCALP TRAIL fires immediately (way
+                                #      underwater)
+                                #   3. SCALP EXIT places sell at 17c, phantom
+                                #   4. SYNC RECLAIM 30s later: Kalshi still has
+                                #      5 YES → re-arm again
+                                #   ...repeats indefinitely until window expires
+                                #
+                                # Each iteration sends a sell to Kalshi that
+                                # can't fill (book is too thin at 17c) +
+                                # potential fees. Better: after N attempts,
+                                # accept the position is stuck and let it
+                                # ride to settlement. The user's stated rule:
+                                # "if it's going to hold a position that goes
+                                # negative then it should be trading once."
+                                _rearm_count_map = getattr(
+                                    self, "_scalp_rearm_count", None,
+                                )
+                                if _rearm_count_map is None:
+                                    self._scalp_rearm_count = {}
+                                    _rearm_count_map = self._scalp_rearm_count
+                                _max_rearms = int(_uc("SCALP_MAX_REARMS_PER_TICKER", 3))
+                                _curr_rearm = int(_rearm_count_map.get(ticker, 0))
                                 _scalp_count_now = int(
                                     getattr(self, "_scalp_filled_count", 0) or 0
                                 )
+                                if (
+                                    _scalp_count_now == 0
+                                    and kalshi_count > 0
+                                    and _curr_rearm >= _max_rearms
+                                ):
+                                    # Throttle the log so we don't spam every 30s
+                                    _last_stuck_log = float(
+                                        getattr(self, "_scalp_stuck_log_ts", 0) or 0
+                                    )
+                                    if time.time() - _last_stuck_log > 60.0:
+                                        logger.warning(
+                                            "SCALP RE-ARM CAPPED: %s already re-armed %d/%d "
+                                            "times — position appears stuck (sells phantom). "
+                                            "Letting it ride to settlement.",
+                                            ticker[-15:], _curr_rearm, _max_rearms,
+                                        )
+                                        self._scalp_stuck_log_ts = time.time()
+                                    _sync_handled_this_iter = True
+                                    continue  # skip Fix K re-arm + SKIP-DIRECTION log
                                 if _scalp_count_now == 0 and kalshi_count > 0:
                                     try:
                                         _ws_obj = getattr(self, "_kalshi_ws", None)
@@ -26222,10 +26276,13 @@ class PolymarketCopyEngine:
                                                     "wall_streak_start": 0.0,
                                                     "_phantom_rearm": True,
                                                 }
+                                            # Fix P: increment per-ticker re-arm counter
+                                            _rearm_count_map[ticker] = _curr_rearm + 1
                                             logger.warning(
-                                                "SCALP RE-ARM (phantom-sell): %s %s %dx "
+                                                "SCALP RE-ARM (phantom-sell) [%d/%d]: %s %s %dx "
                                                 "cost_basis=%dc bid=%dc hwm=%dc "
                                                 "(unrealized=%+dc/ct) — exit layer resumes",
+                                                _curr_rearm + 1, _max_rearms,
                                                 ticker[-15:], kalshi_side.upper(),
                                                 kalshi_count, _cost_basis_c,
                                                 _curr_bid, _hwm_c,

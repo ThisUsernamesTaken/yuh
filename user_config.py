@@ -2643,6 +2643,24 @@ SCALP_STALE_EXIT_S                    = 300
 #
 # Set to 0 to disable (legacy behavior — flip on every trail fire).
 SCALP_FLIP_STRIKE_BUFFER_DOLLARS      = 25.0
+
+# ── 2026-05-09 — RE-ARM CAP (Fix P) ───────────────────────────────────────
+# Cap how many times the SCALP path will re-arm a phantom-sell orphan on
+# the same ticker. After hitting the cap, accept the position is stuck
+# (Kalshi book too thin / order matcher rejecting our prices) and stop
+# firing more sell orders. Position rides to settlement.
+#
+# Witnessed live 13:08 PT 2026-05-09: YES 5x @ cost=60c bid=17c
+# (-$2.15 unrealized) entered a 30s loop where every cycle: Fix K
+# re-armed → SCALP TRAIL fired at -43c → SCALP EXIT placed sell at 17c
+# → phantom-failed → repeat. 5+ minutes of useless sell-spam.
+#
+# User: "if it's going to hold a position that goes negative then it
+# should be trading once."
+#
+# Default: 3. Per-ticker counter resets on window flip.
+# Set to 0 to disable cap (legacy infinite-retry behavior).
+SCALP_MAX_REARMS_PER_TICKER           = 3
 SCALP_BTC_TRAIL_DOLLARS               = 60.0  # 2026-05-08 PT (round 5 REVERT):
                                                 # restored from 99999 → 60
                                                 # Used as fallback when
