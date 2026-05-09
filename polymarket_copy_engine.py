@@ -5891,6 +5891,37 @@ class PolymarketCopyEngine:
             await self._scalp_fire_exit(ticker, side, bid, "LOSS-CUT")
             return
 
+        # ── STALE-EXIT (Fix H, 2026-05-09): time-based proactive flip ──
+        # The exit layer above only triggers on MOVEMENT (bid retrace,
+        # BTC retrace, or absolute loss). On flat tape, a losing position
+        # rides silently to settlement with 100% loss. This is what the
+        # user observed at 03:00-03:14 PT 2026-05-09 (YES 5x @ 65c on
+        # -26MAY090615-15 — entered, held flat, settled NO, -$3.38).
+        #
+        # Fire when ALL of:
+        #   1. Position is older than SCALP_STALE_EXIT_S (default 300s)
+        #   2. Currently NOT profitable (bid <= entry_c)
+        #   3. Not in PRE-EXPIRY window already (other rules handle that)
+        #
+        # Routes through _scalp_fire_exit with reason "STALE" — added to
+        # the inverse-eligible set so REVERSAL-SCORE evaluates the flip.
+        # If the score says INVERT, we IOC the opposite side; if not,
+        # we exit cleanly without re-entering. Either way we stop bleeding
+        # toward 0 on a flat trade.
+        stale_s = int(_uc("SCALP_STALE_EXIT_S", 300))
+        if (
+            stale_s > 0
+            and fill_age >= stale_s
+            and bid <= entry_c
+        ):
+            logger.info(
+                "SCALP STALE: side=%s bid=%dc entry=%dc fill_age=%.0fs "
+                "(>=%ds, no profit) → exit + INVERSE eval",
+                side.upper(), bid, entry_c, fill_age, stale_s,
+            )
+            await self._scalp_fire_exit(ticker, side, bid, "STALE")
+            return
+
     def _scalp_get_side_bid(self, ticker: str, side: str) -> int:
         """Best contract bid for SIDE (yes/no), in cents. Returns 0 if no
         usable quote. Reads from the WS local book (low-latency); the
@@ -5993,9 +6024,13 @@ class PolymarketCopyEngine:
             # loss-side flips too. Without scoring, a chop-noise LOSS-CUT
             # would flip blindly and chop again. With scoring, only
             # LOSS-CUTs that look like genuine reversals get inverted.
+            #
+            # 2026-05-09 (Fix H): STALE added — time-based exit on
+            # flat-but-losing positions. Same scoring gate prevents
+            # blind flip into chop.
             _do_invert: bool = True
             _reversal_conf: float = 1.0
-            if reason in ("TRAIL", "BTC-TRAIL", "LOSS-CUT"):
+            if reason in ("TRAIL", "BTC-TRAIL", "LOSS-CUT", "STALE"):
                 # 1. Time factor (weight 0.25)
                 _fill_age = time.time() - float(
                     self._scalp_fill_time or time.time(),
@@ -6137,7 +6172,11 @@ class PolymarketCopyEngine:
             # PRE-EXPIRY and NEAR-CERTAIN intentionally still skip
             # — no time left to ride an inverse before settlement,
             # and HOLD-CERTAIN is by definition "don't flip."
-            if reason in ("TRAIL", "BTC-TRAIL", "LOSS-CUT") and bool(
+            #
+            # 2026-05-09 (Fix H): STALE added for the time-based
+            # proactive flip. Reason fires on flat-but-losing tape
+            # to break out of "ride the loser to settlement."
+            if reason in ("TRAIL", "BTC-TRAIL", "LOSS-CUT", "STALE") and bool(
                 _uc("SCALP_INVERSE_REENTRY_ENABLED", True)
             ) and _do_invert:
                 inv_side = "no" if side == "yes" else "yes"

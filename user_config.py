@@ -2578,6 +2578,23 @@ SCALP_TRAIL_PHASE4_C                  = 3     # restored
 # tighter than PHASE1 (15c) and PHASE2 (10c), looser than PHASE3 (5c)
 # and PHASE4 (3c) since the late-window phases are already aggressive.
 SCALP_LOSS_TRAIL_C                    = 8
+
+# ── 2026-05-09 — TIME-BASED STALE EXIT (Fix H) ────────────────────────────
+# Force exit + INVERSE_REENTRY consideration when a position has been
+# held longer than SCALP_STALE_EXIT_S AND is currently not profitable
+# (bid <= entry). Catches the "flat tape, position bleeds toward $0"
+# scenario where movement-based exits never fire.
+#
+# Witnessed live 2026-05-09 03:00-03:14 PT — entered YES 5x @ 65c on
+# -26MAY090615-15, BTC chopped sideways, no trail / loss-cut fired,
+# rode to settlement = -$3.38 (full position cost).
+#
+# Default 300s (5 min into a 15-min window — gives the position
+# meaningful time to develop, then forces a re-evaluation if it
+# hasn't moved into profit).
+#
+# Set to 0 to disable.
+SCALP_STALE_EXIT_S                    = 300
 SCALP_BTC_TRAIL_DOLLARS               = 60.0  # 2026-05-08 PT (round 5 REVERT):
                                                 # restored from 99999 → 60
                                                 # Used as fallback when
