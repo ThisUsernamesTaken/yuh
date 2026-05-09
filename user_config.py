@@ -2661,6 +2661,23 @@ SCALP_FLIP_STRIKE_BUFFER_DOLLARS      = 25.0
 # Default: 3. Per-ticker counter resets on window flip.
 # Set to 0 to disable cap (legacy infinite-retry behavior).
 SCALP_MAX_REARMS_PER_TICKER           = 3
+
+# ── 2026-05-09 — IOC NOFILL CAP (Fix R) ───────────────────────────────────
+# Cap consecutive EXIT-NOFILL events on the same ticker. Fix Q (IOC exits)
+# correctly auto-cancels orders that can't match, but the trail manage
+# cycle would keep firing IOCs every 3s (per Fix Q cooldown) without an
+# upper bound. Live witness 13:51-13:53 PT 2026-05-09: 20+ IOC retries
+# against an empty NO bid at 63c, all returning 0 fills.
+#
+# Fix P caps SYNC RECLAIM re-arms but NOT in-cycle trail retries from
+# the manage path. This is the sister-counter for that path.
+#
+# After SCALP_MAX_NOFILL_RETRIES, accept the position is stuck (book
+# genuinely too thin), set _scalp_exit_placed=True for this window so
+# the trail stops firing, and let position ride to settlement.
+#
+# Default 3. Per-ticker counter resets on window flip (matches Fix P).
+SCALP_MAX_NOFILL_RETRIES              = 3
 SCALP_BTC_TRAIL_DOLLARS               = 60.0  # 2026-05-08 PT (round 5 REVERT):
                                                 # restored from 99999 → 60
                                                 # Used as fallback when

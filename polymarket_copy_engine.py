@@ -6027,15 +6027,51 @@ class PolymarketCopyEngine:
                 # lock exit_placed. The next manage tick (after a brief
                 # implicit cooldown via the SCALP cycle pacing) will
                 # re-evaluate and try again at whatever the new bid is.
-                logger.warning(
-                    "SCALP EXIT-NOFILL (%s): IOC %dx %s @ %dc returned "
-                    "0 fills (book too thin) — will retry at new bid. "
-                    "side=%s entry=%dc",
-                    reason, count, side.upper(), bid, side.upper(), entry_c,
+                #
+                # 2026-05-09 (Fix R): hard cap on consecutive nofills.
+                # Live witness 13:51-13:53 PT: 20+ IOC retries every 3s
+                # against an empty NO bid at 63c. Each one was a wasted
+                # Kalshi API call. Fix Q's cooldown is just the retry
+                # interval — there was no upper bound on how many times
+                # the trail could re-fire in a single window. Fix P only
+                # tracks SYNC RECLAIM re-arms, not in-cycle trail retries.
+                # Without this cap we'd send 200-300 useless IOCs per
+                # 15-min window when the book is genuinely too thin.
+                #
+                # After SCALP_MAX_NOFILL_RETRIES consecutive nofills,
+                # accept the position is stuck (no liquidity at our
+                # bid level), set exit_placed=True permanently for the
+                # window so the trail stops firing, and let the position
+                # ride to settlement / pre-expiry.
+                _nofill_count_map = getattr(
+                    self, "_scalp_nofill_count", None,
                 )
+                if _nofill_count_map is None:
+                    self._scalp_nofill_count = {}
+                    _nofill_count_map = self._scalp_nofill_count
+                _curr_nofill = int(_nofill_count_map.get(ticker, 0)) + 1
+                _nofill_count_map[ticker] = _curr_nofill
+                _max_nofills = int(_uc("SCALP_MAX_NOFILL_RETRIES", 3))
+                if _curr_nofill >= _max_nofills:
+                    self._scalp_exit_placed = True  # give up on this window
+                    logger.warning(
+                        "SCALP EXIT-NOFILL CAPPED (%s) [%d/%d]: IOC %dx %s "
+                        "@ %dc returned 0 fills — book too thin, GIVING UP "
+                        "on exits this window. Position rides to settlement "
+                        "/ pre-expiry. side=%s entry=%dc",
+                        reason, _curr_nofill, _max_nofills,
+                        count, side.upper(), bid, side.upper(), entry_c,
+                    )
+                else:
+                    logger.warning(
+                        "SCALP EXIT-NOFILL (%s) [%d/%d]: IOC %dx %s @ %dc "
+                        "returned 0 fills (book too thin) — will retry at "
+                        "new bid. side=%s entry=%dc",
+                        reason, _curr_nofill, _max_nofills,
+                        count, side.upper(), bid, side.upper(), entry_c,
+                    )
                 # Set a short cooldown so we don't spam. Manage cycle
                 # checks _scalp_exit_fire_ts and skips if recent.
-                # exit_placed stays False so trail can re-fire after cooldown.
                 return
             if self._scalp_exit_order_id:
                 try:
@@ -10393,9 +10429,12 @@ class PolymarketCopyEngine:
                 self._entered_tickers_this_window = set()  # 2026-04-22 per-window lock
                 # Fix P: reset per-ticker re-arm counters on window flip.
                 # Stuck-position tracking only matters within a window.
+                # Fix R: same for nofill counters.
                 try:
                     if hasattr(self, "_scalp_rearm_count"):
                         self._scalp_rearm_count.clear()
+                    if hasattr(self, "_scalp_nofill_count"):
+                        self._scalp_nofill_count.clear()
                     self._scalp_stuck_log_ts = 0.0
                 except Exception:
                     pass
