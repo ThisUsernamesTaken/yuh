@@ -2213,22 +2213,19 @@ DIRECTION_MAKER_OFFSET_C         = 1       # only used if maker mode resurrected
 # Disable by setting DIRECTION_EXIT_ENABLED = False (reverts to pure
 # hold-to-expiry).
 DIRECTION_EXIT_ENABLED          = True    # master switch for exit layer
-DIRECTION_TRAIL_PHASE1_C        = 99      # 2026-05-08 PT (evening):
-                                           # DISABLED. User directive: "if
-                                           # we can't trigger an inversion
-                                           # event then why exit?" — the
-                                           # detection-based trail has been
-                                           # selling at lows that recover
-                                           # later (today's TRAIL exits net
-                                           # -$1.85 vs PRE-EXPIRY exits
-                                           # +$0.95). 99c effectively
-                                           # disables the trail; positions
-                                           # ride to TAKE-CEILING (75c+),
-                                           # LOSS-CUT (-20c), FORCE-FLATTEN
-                                           # (≤60s left), or settlement.
-DIRECTION_TRAIL_PHASE2_C        = 99      # disabled (was 8)
-DIRECTION_TRAIL_PHASE3_C        = 99      # disabled (was 5)
-DIRECTION_TRAIL_PHASE4_C        = 99      # disabled (was 3)
+DIRECTION_TRAIL_PHASE1_C        = 10      # 2026-05-08 PT (evening,
+                                           # round 5 REVERT): restored
+                                           # from 99 (disabled) back to
+                                           # 10. The detection-disable
+                                           # experiment cost $5+ in 47
+                                           # minutes; user observed engine
+                                           # was previously "consistently
+                                           # profitable" via small-margin
+                                           # auto-TPs. Restoring the trail
+                                           # to its prior working value.
+DIRECTION_TRAIL_PHASE2_C        = 8       # restored (was 99 in failed experiment)
+DIRECTION_TRAIL_PHASE3_C        = 5       # restored
+DIRECTION_TRAIL_PHASE4_C        = 3       # restored
 DIRECTION_MAX_LOSS_C            = 20      # max unrealized loss per ct (cents)
 DIRECTION_NEAR_CERTAIN_C        = 75      # 2026-05-08 PT: 90 -> 75. SEMANTIC
                                            # CHANGE: rule was "hold to $1
@@ -2249,13 +2246,11 @@ DIRECTION_FORCE_FLATTEN_S       = 60      # 2026-05-08 PT: NEW. Force-sell
                                            # last-minute settlement coin-
                                            # flips on losers (was 90s but
                                            # only if profitable).
-DIRECTION_WALL_EXIT_ENABLED     = False   # 2026-05-08 PT (evening):
-                                           # DISABLED. Detection-based exit
-                                           # (opposing aggressor wall) — same
-                                           # philosophy as trail disable. If
-                                           # we can't reliably detect
-                                           # inversion, exiting on the
-                                           # detection is unreliable too.
+DIRECTION_WALL_EXIT_ENABLED     = True    # 2026-05-08 PT (round 5 REVERT):
+                                           # restored to True. The detection-
+                                           # disable experiment was net
+                                           # negative; restoring prior
+                                           # working behavior.
 DIRECTION_WALL_RATE_CTPS        = 30      # opposing aggression ct/s threshold
 DIRECTION_WALL_WINDOW_S         = 3.0     # rolling tape window for wall check
 DIRECTION_WALL_EXIT_ITM_SUPPRESS_C = 75   # suppress wall-exit when our side's
@@ -2270,26 +2265,17 @@ DIRECTION_WALL_EXIT_ITM_SUPPRESS_C = 75   # suppress wall-exit when our side's
 # Convergence-take: lock intermediate profit when bid moves favorably
 # without waiting for trail-stop drawdown. Mirrors the user's manual
 # 07:30-07:50 PT pattern (bought 55c, sold 70-86c within minutes).
-DIRECTION_CONVERGENCE_TAKE_ENABLED   = False  # 2026-05-08 PT (evening):
-                                                # DISABLED per user directive
-                                                # — convergence-take is a
-                                                # form of detection-based
-                                                # exit. Hold to TAKE-CEILING
-                                                # / LOSS-CUT / FORCE-FLATTEN
-                                                # / settlement.
+DIRECTION_CONVERGENCE_TAKE_ENABLED   = True   # 2026-05-08 PT (round 5 REVERT):
+                                                # restored. Auto-TP at +8c
+                                                # gain after 180s was part
+                                                # of the prior working set.
 DIRECTION_CONVERGENCE_TAKE_MIN_GAIN_C = 8     # bid >= entry + this → sell
 DIRECTION_CONVERGENCE_TAKE_MIN_AGE_S  = 180   # only after 3min hold (avoid
                                                 # premature exit on first-
                                                 # tick noise)
 # Anti-reversion: exit when underlying thesis is broken (BTC reverts past
 # strike). Detects BEFORE the bid fully reflects it.
-DIRECTION_REVERSION_EXIT_ENABLED  = False     # 2026-05-08 PT (evening):
-                                                # DISABLED per user directive
-                                                # — reversion exit detects
-                                                # "thesis broken" via dist
-                                                # shrinking. Same family as
-                                                # trail/wall — unreliable
-                                                # without inversion infra.
+DIRECTION_REVERSION_EXIT_ENABLED  = True      # 2026-05-08 PT (round 5 REVERT)
 DIRECTION_REVERSION_EXIT_DIST_FRAC = 0.5      # if current_dist < entry_dist
                                                 # × this, thesis broken; exit
 # Price-band skip: avoid 30-49c entries (weakest-WR bucket per realistic-
@@ -2574,24 +2560,14 @@ SCALP_CONTRACTS                       = 5     # contracts per IOC attempt
 # SAFETY CAPS (post-mortem 2026-05-08: 300ms retry loop drained $62)
 SCALP_IOC_COOLDOWN_S                  = 5.0   # minimum seconds between IOC attempts
 SCALP_MAX_CONTRACTS_WINDOW            = 10    # hard cap on total contracts per window
-SCALP_TRAIL_C                         = 99    # 2026-05-08 PT (evening):
-                                                # DISABLED. Legacy flat trail
-                                                # — same philosophy as
-                                                # DIRECTION trail disable.
-                                                # User directive: hold open
-                                                # to natural exits since
-                                                # inversion-detection isn't
-                                                # operational.
-# Phase-gated trail (DISABLED 2026-05-08 PT — set to 99c effective no-op)
-SCALP_TRAIL_PHASE1_C                  = 99    # disabled (was 15)
-SCALP_TRAIL_PHASE2_C                  = 99    # disabled (was 10)
-SCALP_TRAIL_PHASE3_C                  = 99    # disabled (was 5)
-SCALP_TRAIL_PHASE4_C                  = 99    # disabled (was 3)
-SCALP_BTC_TRAIL_DOLLARS               = 99999.0  # 2026-05-08 PT (evening):
-                                                  # DISABLED. BTC co-integrated
-                                                  # trail was firing on noise.
-                                                  # Set to 99999 (effectively
-                                                  # never triggers).
+SCALP_TRAIL_C                         = 5     # 2026-05-08 PT (round 5 REVERT):
+                                                # restored from 99 → 5
+SCALP_TRAIL_PHASE1_C                  = 15    # restored
+SCALP_TRAIL_PHASE2_C                  = 10    # restored
+SCALP_TRAIL_PHASE3_C                  = 5     # restored
+SCALP_TRAIL_PHASE4_C                  = 3     # restored
+SCALP_BTC_TRAIL_DOLLARS               = 60.0  # 2026-05-08 PT (round 5 REVERT):
+                                                # restored from 99999 → 60
 SCALP_MAX_LOSS_C                      = 15    # loss-cut: exit if bid drops 15c+ below entry
 SCALP_NEAR_CERTAIN_C                  = 90    # hold to settlement above this
 SCALP_PRE_EXPIRY_S                    = 60    # exit if profitable with < N s left
@@ -2605,19 +2581,7 @@ SCALP_PLACE_MAX_AGE_S                 = 900.0  # only place in the first N s of 
 # firing IS the confirmation that momentum shifted — no need for
 # resting limits on re-entry. Only the initial window-open entry
 # uses a 58c resting limit.
-SCALP_INVERSE_REENTRY_ENABLED         = False  # 2026-05-08 PT (evening):
-                                                # DISABLED. Inverse re-entry
-                                                # depends on a TRAIL/BTC-TRAIL
-                                                # exit firing as the
-                                                # "confirmation that
-                                                # momentum shifted." With
-                                                # those exits disabled, this
-                                                # mechanism has nothing to
-                                                # trigger on. Also: the
-                                                # reversal-confidence scorer
-                                                # has fired ZERO times today
-                                                # — its gating wasn't
-                                                # operational anyway.
+SCALP_INVERSE_REENTRY_ENABLED         = True   # 2026-05-08 PT (round 5 REVERT)
 
 # ── 2026-05-08 PT (evening, round 3) — INVERSE RE-ENTRY ON CLOSE ──────────
 # When a position closes (PROTECTIVE FLAT-CONFIRMED detected), place an
@@ -2628,9 +2592,14 @@ SCALP_INVERSE_REENTRY_ENABLED         = False  # 2026-05-08 PT (evening):
 # User directive (2026-05-08 PT): "when position closes set a +4c limit
 # entry from opposite side's value." Not every re-entry will be
 # profitable — observation-mode for now.
-INVERSE_REENTRY_ON_CLOSE_ENABLED      = True
-INVERSE_REENTRY_SLIP_C                = 4    # IOC at opposite_ask + this
-INVERSE_REENTRY_CONTRACTS             = 5    # contracts per re-entry
+INVERSE_REENTRY_ON_CLOSE_ENABLED      = False  # 2026-05-08 PT (round 5 REVERT):
+                                                # was True. The +4c IOC
+                                                # opposite-side trade on
+                                                # every close was net
+                                                # negative — doubled trade
+                                                # count without clear edge.
+INVERSE_REENTRY_SLIP_C                = 4
+INVERSE_REENTRY_CONTRACTS             = 5
 
 # ── 2026-05-08 PT (evening, round 2) — auto-TP machinery disable ──────────
 # After disabling detection-based exits, observed that small-margin
@@ -2647,8 +2616,17 @@ INVERSE_REENTRY_CONTRACTS             = 5    # contracts per re-entry
 # Both flags below disable these paths so positions truly hold to
 # settlement (or to TAKE-CEILING / LOSS-CUT / FORCE-FLATTEN if those
 # trigger via _direction_manage_exit on DIRECTION-class positions).
-SYNC_RECLAIM_AUTO_TP_ENABLED          = False  # was implicitly True
-SCALP_TO_HOLD_UPGRADE_ENABLED         = False  # was implicitly True
+SYNC_RECLAIM_AUTO_TP_ENABLED          = True   # 2026-05-08 PT (round 5 REVERT):
+                                                # restored. The +8c TP it
+                                                # placed was the source of
+                                                # most of today's "consistently
+                                                # profitable" small-margin
+                                                # wins. Disabling it killed
+                                                # the alpha.
+SCALP_TO_HOLD_UPGRADE_ENABLED         = False  # KEEP off. The 5-tier
+                                                # staircase placement
+                                                # collides with OVERSELL-GUARD
+                                                # — was a real bug.
 
 # 2026-05-08 PT (evening, round 4): mark SYNC RECLAIM'd positions as
 # _hold_to_settle so PROTECTIVE [TP] / PROTECTIVE [HOLD] auto-TP layer
@@ -2662,7 +2640,12 @@ SCALP_TO_HOLD_UPGRADE_ENABLED         = False  # was implicitly True
 # with no tier tag, default-tagged TA_FORCED_SIGNAL, then PROTECTIVE [TP]
 # auto-places sells at entry+5c on every cycle — exactly the small-margin
 # profit-take pattern we're trying to eliminate.
-SYNC_RECLAIM_HOLD_TO_SETTLE_ENABLED   = True
+SYNC_RECLAIM_HOLD_TO_SETTLE_ENABLED   = False  # 2026-05-08 PT (round 5 REVERT):
+                                                # was True. Disabling
+                                                # PROTECTIVE auto-TP killed
+                                                # the small-margin profit-take
+                                                # mechanism that had been
+                                                # working. Restoring.
 
 # 2026-05-08 PT (evening, round 4): pre-IOC ticker-lock check on SCALP
 # MARKET path. The 19:33:26 trade (BUY YES @ 67c, lost full -$3.43)

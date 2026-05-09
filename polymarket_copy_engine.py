@@ -2819,6 +2819,26 @@ class PolymarketCopyEngine:
         self._smart_trades.clear()
         self._smart_flow = SmartFlowState()
 
+        # 2026-05-08 PT (round 5): guarantee _window_locked clears on every
+        # window flip. The previous logic at line ~10115 was nested inside
+        # the regime-classifier update path which doesn't always run on
+        # window flip — engine got stuck in startup-skip mode for 60+ min
+        # after the 20:01 restart, blocking all SCALP entries on 4+
+        # consecutive windows. This guarantees cleanup regardless of
+        # whether the regime path fires.
+        try:
+            if getattr(self, '_startup_skip', False):
+                self._window_locked = True
+                self._startup_skip = False
+                logger.info(
+                    "CopyEngine: startup window skipped — trading "
+                    "starts next window (cleared via _on_new_poly_window)"
+                )
+            else:
+                self._window_locked = False
+        except Exception:
+            pass
+
         # Soft reset: keep EMA/RSI warm, only reset cycle tracking
         self._ta_scorer.soft_reset()
         # surfer removed
