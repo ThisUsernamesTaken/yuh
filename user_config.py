@@ -2568,6 +2568,33 @@ SCALP_TRAIL_PHASE3_C                  = 5     # restored
 SCALP_TRAIL_PHASE4_C                  = 3     # restored
 SCALP_BTC_TRAIL_DOLLARS               = 60.0  # 2026-05-08 PT (round 5 REVERT):
                                                 # restored from 99999 → 60
+                                                # Used as fallback when
+                                                # SCALP_BTC_TRAIL_DYNAMIC_ENABLED
+                                                # is False or strike unknown.
+
+# ── 2026-05-09 — DYNAMIC STRIKE-DISTANCE BTC TRAIL ─────────────────────────
+# A 15-min binary's price sensitivity to BTC peaks at the strike (delta is
+# highest ATM) and decays toward both tails. A flat $60 trail under-reacts
+# ATM (where every $30 BTC move = 15-20c contract move) and over-reacts
+# deep ITM (where $60 retraces are noise). Scaling with abs(btc - strike)
+# tracks delta with a linear approximation.
+#
+#   trail_dollars = clamp(MIN, MAX, K × abs(btc - strike))
+#
+# Defaults: K=0.4, MIN=$25, MAX=$100. Tuned so:
+#   - ATM (dist=0)        → $25 (tight, catches reversals fast)
+#   - $50  from strike    → $25 (still ATM-ish)
+#   - $100 from strike    → $40
+#   - $200 from strike    → $80
+#   - $300+ from strike   → $100 (capped, avoid whipsaw on noise)
+#
+# Combined with SCALP_INVERSE_REENTRY_ENABLED=True and
+# MAX_ENTRIES_PER_WINDOW=99, the engine can flip 5-6 times per window
+# (bounded by MAX_RISK_PER_WINDOW_DOLLARS=$15) before the risk cap fires.
+SCALP_BTC_TRAIL_DYNAMIC_ENABLED       = True
+SCALP_BTC_TRAIL_DYNAMIC_K             = 0.4
+SCALP_BTC_TRAIL_DYNAMIC_MIN           = 25.0
+SCALP_BTC_TRAIL_DYNAMIC_MAX           = 100.0
 SCALP_MAX_LOSS_C                      = 15    # loss-cut: exit if bid drops 15c+ below entry
 SCALP_NEAR_CERTAIN_C                  = 90    # hold to settlement above this
 SCALP_PRE_EXPIRY_S                    = 60    # exit if profitable with < N s left

@@ -5678,8 +5678,36 @@ class PolymarketCopyEngine:
         # absent (bid=0). If BTC retraces SCALP_BTC_TRAIL_DOLLARS from
         # its HWM in the adverse direction, exit regardless of contract
         # bid. This is the "market is going against us" safety net.
-        btc_trail_d = float(_uc("SCALP_BTC_TRAIL_DOLLARS", 30.0))
+        # 2026-05-09: dynamic BTC trail scaled by strike distance.
+        # A binary's price sensitivity to BTC peaks at the strike (delta is
+        # highest ATM) and decays toward both tails. A flat trail under-reacts
+        # ATM (where every $30 BTC move = 15-20c contract move) and over-
+        # reacts deep ITM (where $60 retraces are noise). Scaling the trail
+        # with abs(btc - strike) tracks delta with linear approximation:
+        # tight trail near strike, looser as we get deep ITM. Disabled by
+        # default — flag and tune live.
         btc_now = float(getattr(self, "_btc_last_price", 0) or 0)
+        _strike_dollars = 0.0
+        try:
+            _pf = getattr(self, "_price_feed", None)
+            if _pf is not None and hasattr(_pf, "prob_engine"):
+                _strike_dollars = float(
+                    getattr(_pf.prob_engine, "strike", 0) or 0
+                )
+        except Exception:
+            _strike_dollars = 0.0
+        if (
+            bool(_uc("SCALP_BTC_TRAIL_DYNAMIC_ENABLED", False))
+            and _strike_dollars > 0
+            and btc_now > 0
+        ):
+            _dist = abs(btc_now - _strike_dollars)
+            _k = float(_uc("SCALP_BTC_TRAIL_DYNAMIC_K", 0.4))
+            _min_trail = float(_uc("SCALP_BTC_TRAIL_DYNAMIC_MIN", 25.0))
+            _max_trail = float(_uc("SCALP_BTC_TRAIL_DYNAMIC_MAX", 100.0))
+            btc_trail_d = max(_min_trail, min(_max_trail, _k * _dist))
+        else:
+            btc_trail_d = float(_uc("SCALP_BTC_TRAIL_DOLLARS", 30.0))
         if btc_now > 0 and self._scalp_btc_hwm > 0:
             if self._scalp_btc_side == "yes":
                 # YES wins when BTC > strike. Track BTC rising.
