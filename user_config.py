@@ -251,6 +251,15 @@ TA_FORCED_ENTRY_ENABLED = False  # 2026-05-05 PT 21:55: RE-DISABLED.
 # expect skip-rate to drop from ~91% toward ~70-80%.
 DOMINANT_BTC_5M_THRESHOLD = 15.0
 
+# 2026-05-08 PT: master kill-switch for the entire DOMINANT-direction gate.
+# When False, the gate body in polymarket_copy_engine.py at the FVG entry
+# branch is skipped entirely and any FVG-class signal that reaches that
+# code path passes through. Live tiers (UNIFIED/DIRECTION/BB_PURE/PENNY)
+# do not traverse that branch, so this flag is currently a no-op for live
+# fill behavior — but keeping it False eliminates the April-15 profile
+# requirement for any future evaluator that does reach that branch.
+DOMINANT_GATE_ENABLED = False
+
 # ── Manual-fills capture (Claude 2026-04-28) ────────────────────────────────
 # Polls Kalshi /portfolio/fills periodically. Any fill whose order_id is NOT
 # in the engine's known engine_order_ids gets snapshotted into manual_fills
@@ -530,7 +539,7 @@ SESSION_STOP_PERSIST_BUCKETS_S   = [
 #
 # DEFAULT OFF. Session-1 ships only the math + method definition. Session 2
 # wires it into the cascade. Session 3 flips the flag for live testing.
-BB_PURE_MODE                     = True   # 2026-05-07 OVERHAUL: RE-ENABLED
+BB_PURE_MODE                     = False  # 2026-05-07 OVERHAUL: RE-ENABLED
                                           # as Tier-1 mispricing scalper.
                                           # Now subject to MAX_RISK_PER_WINDOW
                                           # cap, MAX_ENTRIES_PER_WINDOW=1,
@@ -705,11 +714,22 @@ BB_PURE_MAX_FIRES_PER_WINDOW         = 99    # 2026-05-01 PT: lifted from 2.
 # (auto-resets per ticker). The engine remains continuously active across all
 # windows. Lock is enforced at the BB_PURE preflight site via
 # _entered_tickers_this_window membership check.
-MAX_TRADES_PER_SESSION_TICKER        = 1     # Hard cap: one engine entry per
-                                              # 15-min ticker / window. Engine
-                                              # runs continuously; lock auto-
-                                              # resets on window flip. User
-                                              # manual trades are not affected.
+MAX_TRADES_PER_SESSION_TICKER        = 99    # 2026-05-08 USER OVERRIDE:
+                                              # uncapped from 1 to 99 to allow
+                                              # scalp re-entry on same ticker.
+                                              # Per-tier bypass also added for
+                                              # BB_PURE scalp via flag below.
+                                              # Safety net: $15/window risk cap
+                                              # (MAX_RISK_PER_WINDOW_DOLLARS).
+BB_PURE_PER_TICKER_LOCK_ENABLED      = False # 2026-05-08: when False, BB_PURE
+                                              # scalp tier bypasses the
+                                              # _entered_tickers_this_window
+                                              # check at preflight, allowing
+                                              # multiple scalp fires on the
+                                              # same ticker within a window.
+                                              # Other tiers (DIRECTION, UNIFIED,
+                                              # PENNY, TA_FORCED, oversell
+                                              # hardening) still honor the lock.
 BB_PURE_HARD_MIN_TIME_S              = 420.0 # 7 minutes (was 60s). After
                                               # this point in the window
                                               # there isn't enough runway
@@ -2109,7 +2129,7 @@ PAPER_FVG_LIVE_MODE              = False  # 2026-05-05 06:27 PT EMERGENCY DISABL
 # FVG-tier-aware path (PAPER_FVG_LIVE_MODE) which had structural bugs
 # (FLAT-CONFIRMED missing, SYNC RECLAIM orphan adoption) and inferior
 # economics (26% win rate vs 69-90% here).
-DIRECTION_STRATEGY_ENABLED       = True    # 2026-05-05 LIVE FLIP. Validated:
+DIRECTION_STRATEGY_ENABLED       = False   # 2026-05-05 LIVE FLIP. Validated:
                                            # 25/25 unit tests pass,
                                            # 615/617 full suite pass (2 pre-
                                            # existing fails unrelated).
@@ -2193,20 +2213,22 @@ DIRECTION_MAKER_OFFSET_C         = 1       # only used if maker mode resurrected
 # Disable by setting DIRECTION_EXIT_ENABLED = False (reverts to pure
 # hold-to-expiry).
 DIRECTION_EXIT_ENABLED          = True    # master switch for exit layer
-DIRECTION_TRAIL_PHASE1_C        = 10      # 2026-05-07 PT (evening):
-                                           # tightened 15 → 10. Trail-stop
-                                           # TP was the only winning
-                                           # mechanism on today's near-money
-                                           # entries (4/5 settled NO; 1/5
-                                           # TP'd at +19c via Rule B). 15c
-                                           # is too wide — gives back too
-                                           # much profit before triggering.
-                                           # 10c phase-1 captures trail
-                                           # exits earlier on profitable
-                                           # mid-window setups.
-DIRECTION_TRAIL_PHASE2_C        = 8       # minutes 5-10 since fill
-DIRECTION_TRAIL_PHASE3_C        = 5       # minutes 10-13 since fill
-DIRECTION_TRAIL_PHASE4_C        = 3       # last 2 min of session
+DIRECTION_TRAIL_PHASE1_C        = 99      # 2026-05-08 PT (evening):
+                                           # DISABLED. User directive: "if
+                                           # we can't trigger an inversion
+                                           # event then why exit?" — the
+                                           # detection-based trail has been
+                                           # selling at lows that recover
+                                           # later (today's TRAIL exits net
+                                           # -$1.85 vs PRE-EXPIRY exits
+                                           # +$0.95). 99c effectively
+                                           # disables the trail; positions
+                                           # ride to TAKE-CEILING (75c+),
+                                           # LOSS-CUT (-20c), FORCE-FLATTEN
+                                           # (≤60s left), or settlement.
+DIRECTION_TRAIL_PHASE2_C        = 99      # disabled (was 8)
+DIRECTION_TRAIL_PHASE3_C        = 99      # disabled (was 5)
+DIRECTION_TRAIL_PHASE4_C        = 99      # disabled (was 3)
 DIRECTION_MAX_LOSS_C            = 20      # max unrealized loss per ct (cents)
 DIRECTION_NEAR_CERTAIN_C        = 75      # 2026-05-08 PT: 90 -> 75. SEMANTIC
                                            # CHANGE: rule was "hold to $1
@@ -2227,20 +2249,47 @@ DIRECTION_FORCE_FLATTEN_S       = 60      # 2026-05-08 PT: NEW. Force-sell
                                            # last-minute settlement coin-
                                            # flips on losers (was 90s but
                                            # only if profitable).
-DIRECTION_WALL_EXIT_ENABLED     = True    # rule A toggle
+DIRECTION_WALL_EXIT_ENABLED     = False   # 2026-05-08 PT (evening):
+                                           # DISABLED. Detection-based exit
+                                           # (opposing aggressor wall) — same
+                                           # philosophy as trail disable. If
+                                           # we can't reliably detect
+                                           # inversion, exiting on the
+                                           # detection is unreliable too.
 DIRECTION_WALL_RATE_CTPS        = 30      # opposing aggression ct/s threshold
 DIRECTION_WALL_WINDOW_S         = 3.0     # rolling tape window for wall check
+DIRECTION_WALL_EXIT_ITM_SUPPRESS_C = 75   # suppress wall-exit when our side's
+                                          # bid >= this (deep ITM). At ≥75%
+                                          # implied prob, opposing aggression
+                                          # is noise on a near-certain win;
+                                          # let TAKE-CEILING / settlement
+                                          # capture full value instead of
+                                          # locking less. Applies to both
+                                          # DIRECTION rule A and BB_PURE
+                                          # wall consumption exits.
 # Convergence-take: lock intermediate profit when bid moves favorably
 # without waiting for trail-stop drawdown. Mirrors the user's manual
 # 07:30-07:50 PT pattern (bought 55c, sold 70-86c within minutes).
-DIRECTION_CONVERGENCE_TAKE_ENABLED   = True   # 2026-05-08 PT: NEW
+DIRECTION_CONVERGENCE_TAKE_ENABLED   = False  # 2026-05-08 PT (evening):
+                                                # DISABLED per user directive
+                                                # — convergence-take is a
+                                                # form of detection-based
+                                                # exit. Hold to TAKE-CEILING
+                                                # / LOSS-CUT / FORCE-FLATTEN
+                                                # / settlement.
 DIRECTION_CONVERGENCE_TAKE_MIN_GAIN_C = 8     # bid >= entry + this → sell
 DIRECTION_CONVERGENCE_TAKE_MIN_AGE_S  = 180   # only after 3min hold (avoid
                                                 # premature exit on first-
                                                 # tick noise)
 # Anti-reversion: exit when underlying thesis is broken (BTC reverts past
 # strike). Detects BEFORE the bid fully reflects it.
-DIRECTION_REVERSION_EXIT_ENABLED  = True      # 2026-05-08 PT: NEW
+DIRECTION_REVERSION_EXIT_ENABLED  = False     # 2026-05-08 PT (evening):
+                                                # DISABLED per user directive
+                                                # — reversion exit detects
+                                                # "thesis broken" via dist
+                                                # shrinking. Same family as
+                                                # trail/wall — unreliable
+                                                # without inversion infra.
 DIRECTION_REVERSION_EXIT_DIST_FRAC = 0.5      # if current_dist < entry_dist
                                                 # × this, thesis broken; exit
 # Price-band skip: avoid 30-49c entries (weakest-WR bucket per realistic-
@@ -2285,7 +2334,7 @@ DIRECTION_CHEAP_BOOST_CONTRACTS = 15   # override base when all gates hit
 # All orders use IOC taker (post_only=False) — same execution model as
 # the DIRECTION fix on 2026-05-06. Maker mode = adverse selection on
 # momentum strategies.
-UNIFIED_SCORER_ENABLED       = True
+UNIFIED_SCORER_ENABLED       = False
 UNIFIED_MIN_EV_C             = 3      # 2026-05-07 PT (afternoon): loosened
                                        # 5 → 3 (the backtest default).
                                        # The "strict" preset (5c/0.30) had
@@ -2353,17 +2402,19 @@ DIRECTION_DEPTH_CHECK_ENABLED        = True  # pre-IOC, scan opposite-side
 DIRECTION_ADAPTIVE_SLIP_ENABLED      = True  # compute slippage required to
                                               # consume contracts of depth,
                                               # capped at MAX_SLIP_C.
-DIRECTION_MAX_SLIP_C                 = 12    # 2026-05-07 PT (afternoon):
-                                              # raised 8 → 12. On thin Kalshi
-                                              # 15m books, +12c is still
-                                              # positive EV against $0.50
-                                              # binary upside (24% slippage
-                                              # cost vs 50c expected payoff
-                                              # on win). Adaptive walker
-                                              # picks the minimum slip
-                                              # required to consume depth,
-                                              # so we don't always pay 12c
-                                              # — only when depth is deep.
+DIRECTION_MAX_SLIP_C                 = 15    # 2026-05-08 PT: raised 12 → 15
+                                              # for aggressive fill mode.
+                                              # +15c slip on a 50c binary is
+                                              # 30% cost; still EV-positive
+                                              # if WR holds above 50%.
+                                              # Adaptive walker still picks
+                                              # the minimum slip required —
+                                              # only pays the full 15c when
+                                              # depth at +12c is empty.
+                                              # Prior history: 8 → 12 on
+                                              # 2026-05-07 PT to handle
+                                              # race-condition NOFILLs on
+                                              # thin 15m books.
 DIRECTION_HALT_LOG_THROTTLE_S        = 60.0  # rate-limit DAILY-LOSS-HALT log
                                               # (log once, then suppress for
                                               # this many seconds).
@@ -2377,7 +2428,10 @@ MAX_RISK_PER_WINDOW_DOLLARS  = 15.0  # all strategies combined per window
 # Hard 1-entry-per-window cap (cross-ticker, cross-strategy). After ANY
 # fill in a window, block all further entries until window flip. Belt-and-
 # suspenders alongside the per-ticker session lock.
-MAX_ENTRIES_PER_WINDOW       = 1
+# 2026-05-08: Uncapped to 99 per explicit user override for momentum scalp
+# (continuous trading). MAX_RISK_PER_WINDOW_DOLLARS=$15 and per-ticker
+# MAX_TRADES_PER_SESSION_TICKER=1 still gate entries.
+MAX_ENTRIES_PER_WINDOW       = 99
 
 # ── PHASE 3 (2026-05-07 OVERHAUL) — BB_PURE re-enable with fixes ─────────
 # Re-enabling BB_PURE_MODE (above): the exit infrastructure (TP taker-
@@ -2395,7 +2449,7 @@ BB_PURE_MAX_CONTRACTS            = 5       # absolute ceiling on Kelly-sized
 # Lightweight Tier-3 strategy. Activates ONLY when both BB_PURE and
 # DIRECTION decline the current window. Buys ≤ 8c contracts, holds to
 # expiry, no TP, no exit management. Max risk per fire is bounded.
-PENNY_MODE_ENABLED          = True
+PENNY_MODE_ENABLED          = False
 PENNY_MAX_PRICE_C           = 12    # 2026-05-07 PT (afternoon): raised
                                      # 8 → 12. Entries at 9-12c have nearly-
                                      # identical asymmetric payoff to 7-8c
@@ -2454,3 +2508,118 @@ FVG_DAILY_LOSS_HALT_FRAC         = 0.20
 # to allow Tier 1's 35% slot. This knob lets us flip both flags
 # atomically.
 FVG_LIVE_MAX_TICKER_EXPOSURE_FRAC = 0.40   # only used when LIVE_MODE=True
+
+# ═══════════════════════════════════════════════════════════════════════
+# ADMISSION FILTER (2026-05-08) — universal 5-gate rejection layer
+# ═══════════════════════════════════════════════════════════════════════
+# Wraps every entry path (UNIFIED, DIRECTION, BB_PURE, PENNY). Target:
+# reject ~87% of signals → ~1 trade per 2 hours / per 8 windows.
+# Build a bot that is mostly bored.
+#
+# Each gate is independently tunable. To loosen the filter, lower the
+# thresholds (more trades). To tighten, raise them (fewer trades).
+# Setting ADMISSION_FILTER_ENABLED=False disables the entire layer
+# (useful for A/B comparison vs pre-filter behaviour).
+ADMISSION_FILTER_ENABLED              = True
+
+# Gate 1 — Session structurally tradable
+ADMISSION_MIN_VELOCITY                = 0.50  # $/s magnitude over last 30s
+ADMISSION_MIN_VOLUME                  = 5     # contracts traded this window
+ADMISSION_MAX_SPREAD_C                = 5     # max yes-ask − yes-bid (cents)
+ADMISSION_BIG_EDGE_BYPASS_C           = 15.0  # |edge| ≥ this bypasses Gate 1
+
+# Gate 2 — Mispricing sufficient
+ADMISSION_MIN_MISPRICING_BUFFER_C     = 2.0   # |edge| > slip + fee + buffer
+ADMISSION_FEE_C                       = 1.0   # per-contract fee estimate
+
+# Gate 3 — Liquidity favorable
+ADMISSION_MIN_DEPTH                   = 3     # contracts within 2c of best ask
+
+# Gate 4 — Time window favorable
+ADMISSION_EARLY_REJECT_S              = 120   # first 2 min are noise
+ADMISSION_LATE_REJECT_S               = 60    # last 1 min: too late for entry
+ADMISSION_PREF_WINDOW_START_S         = 420   # min 7 — preferred zone start
+ADMISSION_PREF_WINDOW_END_S           = 720   # min 12 — preferred zone end
+
+# Gate 5 — Regime match
+# certainty signals must be in the last N seconds of the window
+ADMISSION_CERTAINTY_MIN_LEFT_S        = 120
+
+
+# ── MOMENTUM SCALP tier (2026-05-08) ──────────────────────────────────────
+# Dual-limit symmetric resting BUY pair at window open. The first side to
+# fill claims the window; the other side is cancelled. Filled side is
+# trailed by SCALP_TRAIL_C below the running HWM bid.
+#
+# Logic summary:
+#   t=0   place BUY YES @ SCALP_ENTRY_C, BUY NO @ SCALP_ENTRY_C (resting)
+#   ...   poll every tick → on first fill, cancel the other side
+#   ...   trail filled side: exit when bid drops SCALP_TRAIL_C below HWM
+#   bid≥SCALP_NEAR_CERTAIN_C → hold to settlement (no point exiting at 90c
+#         when settlement pays 100c)
+#   ≤SCALP_PRE_EXPIRY_S left and profitable → exit at bid
+#   window end → cancel any unfilled resting orders
+#
+# Tail risk: choppy windows can fill BOTH sides (price round-trips). Logged
+# as `SCALP BOTH-FILL`; both positions then hold to settlement (one wins +1$,
+# one loses cost — net = 1.00 - 2*entry on the contracts).
+#
+# Window-safety integration: scalp claims the window at PLACEMENT (not fill)
+# by incrementing _window_entry_count immediately, so other tiers see the
+# 1-per-window cap and stand down. This prevents the placement→fill gap
+# from being filled by DIRECTION/UNIFIED/PENNY.
+MOMENTUM_SCALP_ENABLED                = True
+SCALP_ENTRY_C                         = 58    # legacy (used for per-side cost sanity check)
+SCALP_CONTRACTS                       = 5     # contracts per IOC attempt
+# SAFETY CAPS (post-mortem 2026-05-08: 300ms retry loop drained $62)
+SCALP_IOC_COOLDOWN_S                  = 5.0   # minimum seconds between IOC attempts
+SCALP_MAX_CONTRACTS_WINDOW            = 10    # hard cap on total contracts per window
+SCALP_TRAIL_C                         = 99    # 2026-05-08 PT (evening):
+                                                # DISABLED. Legacy flat trail
+                                                # — same philosophy as
+                                                # DIRECTION trail disable.
+                                                # User directive: hold open
+                                                # to natural exits since
+                                                # inversion-detection isn't
+                                                # operational.
+# Phase-gated trail (DISABLED 2026-05-08 PT — set to 99c effective no-op)
+SCALP_TRAIL_PHASE1_C                  = 99    # disabled (was 15)
+SCALP_TRAIL_PHASE2_C                  = 99    # disabled (was 10)
+SCALP_TRAIL_PHASE3_C                  = 99    # disabled (was 5)
+SCALP_TRAIL_PHASE4_C                  = 99    # disabled (was 3)
+SCALP_BTC_TRAIL_DOLLARS               = 99999.0  # 2026-05-08 PT (evening):
+                                                  # DISABLED. BTC co-integrated
+                                                  # trail was firing on noise.
+                                                  # Set to 99999 (effectively
+                                                  # never triggers).
+SCALP_MAX_LOSS_C                      = 15    # loss-cut: exit if bid drops 15c+ below entry
+SCALP_NEAR_CERTAIN_C                  = 90    # hold to settlement above this
+SCALP_PRE_EXPIRY_S                    = 60    # exit if profitable with < N s left
+SCALP_MAX_RISK_DOLLARS                = 5.0   # per-side ceiling sanity check
+SCALP_PLACE_MAX_AGE_S                 = 900.0  # only place in the first N s of a window
+
+# Asymmetric dual-sided re-entry after a TRAIL exit (2026-05-08).
+# INVERSE MARKET RE-ENTRY (2026-05-08)
+# When a TRAIL or BTC-TRAIL exit fires, immediately market-buy the
+# opposite side via IOC at ask + SCALP_REENTRY_SLIP_C. The trail
+# firing IS the confirmation that momentum shifted — no need for
+# resting limits on re-entry. Only the initial window-open entry
+# uses a 58c resting limit.
+SCALP_INVERSE_REENTRY_ENABLED         = False  # 2026-05-08 PT (evening):
+                                                # DISABLED. Inverse re-entry
+                                                # depends on a TRAIL/BTC-TRAIL
+                                                # exit firing as the
+                                                # "confirmation that
+                                                # momentum shifted." With
+                                                # those exits disabled, this
+                                                # mechanism has nothing to
+                                                # trigger on. Also: the
+                                                # reversal-confidence scorer
+                                                # has fired ZERO times today
+                                                # — its gating wasn't
+                                                # operational anyway.
+SCALP_REENTRY_SLIP_C                  = 5     # IOC slippage above ask
+
+# Reversal-confidence scorer threshold (2026-05-08). On TRAIL / BTC-TRAIL
+# exit, _scalp_fire_exit() computes a 4-signal score in [0.0, 1.0]:
+#   time(0.25) + btc-vs-strike(0.30) + book-imbalance(0.25) + ve
