@@ -5855,24 +5855,47 @@ class PolymarketCopyEngine:
         # 2026-05-09 (Fix F): asymmetric loss-side trail. When the
         # position is underwater (bid < entry), use the tighter
         # SCALP_LOSS_TRAIL_C so we exit + flip earlier on losers
-        # rather than waiting for the full phase-trail give-back. The
-        # 02:10 PT YES leg sat in legacy state from -22c down to -43c
-        # because nothing in the SCALP path triggered until 15c
-        # absolute loss — by then the bid had already collapsed past
-        # the inverse-fill liquidity window. Tighter loss-trail =
-        # earlier flip = better chance the inverse fills.
+        # rather than waiting for the full phase-trail give-back.
+        #
+        # 2026-05-09 (Fix I): profit-locked trail. Once the position
+        # has built meaningful unrealized profit (hwm_bid >= entry +
+        # SCALP_PROFIT_LOCK_C), switch to the tight SCALP_PROFIT_TRAIL_C
+        # so we actually CAPTURE gains instead of giving back the full
+        # phase-trail (15c → 10c → 5c → 3c) before exiting. Witnessed
+        # 03:15-03:25 PT 2026-05-09: YES 5x @ 52c, bid ran to 60c (+8c
+        # profit), no exit because PHASE1=15c trail trigger was
+        # entry-7 (40 something) — bid would have to give back the
+        # entire 8c gain plus another 7c into loss territory before
+        # the trail fired.
+        #
+        # Decision tree:
+        #   bid < entry:                use SCALP_LOSS_TRAIL_C   (tight, flip on adverse)
+        #   hwm_bid >= entry + lock_c:  use SCALP_PROFIT_TRAIL_C (tight, capture gains)
+        #   otherwise (early/marginal): use phase-trail            (room to develop)
         effective_trail_c = trail_c
+        _trail_label = ""
+        _profit_lock_c = int(_uc("SCALP_PROFIT_LOCK_C", 5))
+        _profit_trail_c = int(_uc("SCALP_PROFIT_TRAIL_C", 5))
         if bid < entry_c:
             _loss_trail_c = int(_uc("SCALP_LOSS_TRAIL_C", 8))
             if _loss_trail_c > 0 and _loss_trail_c < trail_c:
                 effective_trail_c = _loss_trail_c
+                _trail_label = " (loss-tight)"
+        elif (
+            _profit_trail_c > 0
+            and _profit_lock_c > 0
+            and self._scalp_hwm_bid >= entry_c + _profit_lock_c
+            and _profit_trail_c < trail_c
+        ):
+            effective_trail_c = _profit_trail_c
+            _trail_label = " (profit-locked)"
         trail_trigger = self._scalp_hwm_bid - effective_trail_c
         if bid <= trail_trigger:
             logger.info(
                 "SCALP TRAIL: hwm=%dc bid=%dc trail=%dc%s → exit "
                 "side=%s entry=%dc (%+dc/contract)",
                 self._scalp_hwm_bid, bid, effective_trail_c,
-                " (loss-tight)" if effective_trail_c < trail_c else "",
+                _trail_label,
                 side.upper(), entry_c, bid - entry_c,
             )
             await self._scalp_fire_exit(ticker, side, bid, "TRAIL")

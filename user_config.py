@@ -2579,6 +2579,29 @@ SCALP_TRAIL_PHASE4_C                  = 3     # restored
 # and PHASE4 (3c) since the late-window phases are already aggressive.
 SCALP_LOSS_TRAIL_C                    = 8
 
+# ── 2026-05-09 — PROFIT-LOCKED TRAIL (Fix I) ──────────────────────────────
+# Once the position has built unrealized profit ≥ SCALP_PROFIT_LOCK_C
+# above entry, the cents-trail tightens to SCALP_PROFIT_TRAIL_C so we
+# actually capture gains instead of giving back the full phase-trail.
+#
+# Witnessed live 03:15-03:25 PT 2026-05-09: YES 5x @ 52c, bid ran to
+# 60c (+8c profit). Phase1 trail (15c) means the trigger was entry-7c
+# = 45c. Bid would have to drop the entire 8c gain plus another 7c
+# into loss before TRAIL fired — at which point we'd be selling for
+# a -$0.35 loss instead of locking in +$0.40 gain.
+#
+# Decision tree (bid >= entry):
+#   hwm_bid - entry >= SCALP_PROFIT_LOCK_C → trail = SCALP_PROFIT_TRAIL_C
+#   otherwise (still developing)            → trail = phase-trail (15/10/5/3)
+#
+# Defaults: lock at +5c profit, trail 5c on profitable positions.
+# So a YES 52c → 57c position locks: trigger = 52c (breakeven). If
+# bid retraces to 52c, exit at 0 → flip eligible. A YES 52c → 70c
+# position locks: trigger = 65c. We give back 5c from peak, capture
+# +13c of the run.
+SCALP_PROFIT_LOCK_C                   = 5
+SCALP_PROFIT_TRAIL_C                  = 5
+
 # ── 2026-05-09 — TIME-BASED STALE EXIT (Fix H) ────────────────────────────
 # Force exit + INVERSE_REENTRY consideration when a position has been
 # held longer than SCALP_STALE_EXIT_S AND is currently not profitable
