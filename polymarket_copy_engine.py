@@ -5212,6 +5212,36 @@ class PolymarketCopyEngine:
                 prob_engine.update(
                     btc_now, float(mid_for_prob), secs_left_for_prob,
                 )
+                # 2026-05-09 DEBUG: log inputs + result once per minute
+                # to verify the update is actually computing non-default
+                # probability. Throttled via _bored_last_prob_dbg_ts.
+                _last_dbg = float(
+                    getattr(self, "_bored_last_prob_dbg_ts", 0) or 0,
+                )
+                if (now - _last_dbg) > 60.0:
+                    self._bored_last_prob_dbg_ts = now
+                    logger.info(
+                        "BORED-PROB-DBG: btc=%.0f strike=%.0f mid=%dc "
+                        "secs=%.0f vol=%.3f → prob=%.4f fair=%.2fc",
+                        btc_now,
+                        float(getattr(prob_engine, "strike", 0) or 0),
+                        mid_for_prob, secs_left_for_prob,
+                        float(getattr(prob_engine, "volatility", 0) or 0),
+                        float(getattr(prob_engine, "probability", 0) or 0),
+                        float(getattr(prob_engine, "fair_value", 0) or 0),
+                    )
+            else:
+                # Inputs failed — log why
+                _last_skip_dbg = float(
+                    getattr(self, "_bored_last_skip_dbg_ts", 0) or 0,
+                )
+                if (now - _last_skip_dbg) > 60.0:
+                    self._bored_last_skip_dbg_ts = now
+                    logger.info(
+                        "BORED-PROB-SKIP: btc=%.0f secs=%.0f mid=%dc "
+                        "(one or more inputs invalid)",
+                        btc_now, secs_left_for_prob, mid_for_prob,
+                    )
         except Exception:
             # Don't let prob_engine errors kill the shadow tick.
             logger.exception(
