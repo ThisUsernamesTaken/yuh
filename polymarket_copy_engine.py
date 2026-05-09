@@ -6232,6 +6232,62 @@ class PolymarketCopyEngine:
                 inv_contracts = int(_uc("SCALP_CONTRACTS", 5))
                 inv_slip = int(_uc("SCALP_REENTRY_SLIP_C", 5))
 
+                # 2026-05-09 (Fix O): strict flip gate — require BTC has
+                # actually made a MEANINGFUL reversal before flipping.
+                # Per user 2026-05-09 PM:
+                #   "If it's going to hold a position that goes negative
+                #    then it should be trading once. The idea was that it
+                #    enters whichever side gets momentum first then has
+                #    the ability to re enter when BTC moves against it in
+                #    a meaningful enough way to impact contract pricing."
+                #
+                # "Meaningful enough to impact contract pricing" ≈ BTC has
+                # crossed the strike against our position by at least
+                # SCALP_FLIP_STRIKE_BUFFER_DOLLARS. Below that, the move is
+                # noise — flipping just pays spread + slippage on each
+                # leg without capturing real reversal value.
+                #
+                # Held YES: bet was BTC > strike. Flip only if BTC has
+                #           moved decisively below strike.
+                # Held NO:  bet was BTC < strike. Flip only if BTC has
+                #           moved decisively above strike.
+                #
+                # If the flip gate fails: exit cleanly without firing
+                # inverse. The original sell already ran — if real, we're
+                # now flat. If phantom, Fix K re-arm picks the orphan
+                # back up next sync cycle. Net result: "trade once" when
+                # we can't justify the flip, ride the position to
+                # settlement / pre-expiry.
+                _btc_now = float(getattr(self, "_btc_last_price", 0) or 0)
+                _strike = 0.0
+                try:
+                    _pf = getattr(self, "_price_feed", None)
+                    if _pf is not None and hasattr(_pf, "prob_engine"):
+                        _strike = float(
+                            getattr(_pf.prob_engine, "strike", 0) or 0
+                        )
+                except Exception:
+                    _strike = 0.0
+                _flip_buffer = float(
+                    _uc("SCALP_FLIP_STRIKE_BUFFER_DOLLARS", 25.0)
+                )
+                _meaningful_reversal = True
+                if _strike > 0 and _btc_now > 0 and _flip_buffer > 0:
+                    if side == "yes":
+                        _meaningful_reversal = _btc_now < (_strike - _flip_buffer)
+                    elif side == "no":
+                        _meaningful_reversal = _btc_now > (_strike + _flip_buffer)
+                if not _meaningful_reversal:
+                    _delta = _btc_now - _strike
+                    logger.info(
+                        "SCALP FLIP-SKIP (insufficient BTC reversal): %s "
+                        "exited %s, btc=$%.0f strike=$%.0f delta=%+.0f "
+                        "buffer=$%.0f — exit-only, not flipping",
+                        ticker[-15:], side.upper(), _btc_now, _strike,
+                        _delta, _flip_buffer,
+                    )
+                    return  # exit without firing inverse
+
                 # 2026-05-09 (Fix L): pre-INVERSE Kalshi truth check.
                 # If the original side is still on Kalshi (sell didn't
                 # actually execute — phantom-sell), DON'T fire the

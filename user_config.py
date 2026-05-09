@@ -2618,6 +2618,31 @@ SCALP_PROFIT_TRAIL_C                  = 5
 #
 # Set to 0 to disable.
 SCALP_STALE_EXIT_S                    = 300
+
+# ── 2026-05-09 — STRICT FLIP GATE (Fix O) ─────────────────────────────────
+# Only fire INVERSE_REENTRY (opposite-side flip) when BTC has made a
+# meaningful reversal — defined as crossing the strike against our
+# position by at least SCALP_FLIP_STRIKE_BUFFER_DOLLARS.
+#
+# Per user 2026-05-09 PM: "If it's going to hold a position that goes
+# negative then it should be trading once. The idea was that it enters
+# whichever side gets momentum first then has the ability to re enter
+# when BTC moves against it in a meaningful enough way to impact
+# contract pricing."
+#
+# Behavior:
+#   Held YES (bet BTC > strike): flip only if btc < strike - buffer
+#   Held NO  (bet BTC < strike): flip only if btc > strike + buffer
+#   Below threshold:             exit cleanly, no flip ("trade once")
+#
+# Default $25 — any cross within this band is treated as noise. For
+# 15-min Kalshi binaries, $25 BTC move ≈ 10-15c contract move ATM,
+# which is meaningful but still well within typical chop. A $25
+# buffer ensures we only flip on moves that have real probability
+# implications.
+#
+# Set to 0 to disable (legacy behavior — flip on every trail fire).
+SCALP_FLIP_STRIKE_BUFFER_DOLLARS      = 25.0
 SCALP_BTC_TRAIL_DOLLARS               = 60.0  # 2026-05-08 PT (round 5 REVERT):
                                                 # restored from 99999 → 60
                                                 # Used as fallback when
