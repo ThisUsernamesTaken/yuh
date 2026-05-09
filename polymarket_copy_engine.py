@@ -10188,8 +10188,23 @@ class PolymarketCopyEngine:
                 # contracts should not leave stale ghost-suppression state
                 # behind. _entered_tickers_this_window was already cleared
                 # at the top of this block.
+                #
+                # 2026-05-09 (Fix E): only clear if the prior SCALP ticker
+                # is genuinely from a *different* (settled) window. On
+                # engine boot, _on_new_poly_window fires for the current
+                # window — and STARTUP RECOVERY (Fix A) just routed the
+                # recovered position into _direction_position with
+                # _scalp_ticker = current_ticker. Without this guard, the
+                # ghost-desync clear nukes the recovered position
+                # immediately, then SYNC RECLAIM later re-adopts it into
+                # legacy _open_position with no INVERSE_REENTRY hook.
+                # Witnessed live 00:32:11 PT — sold the position via
+                # legacy fixed-TP path with no opposite-side flip.
                 _prev_scalp_ticker = getattr(self, "_scalp_ticker", "") or ""
-                if _prev_scalp_ticker:
+                if (
+                    _prev_scalp_ticker
+                    and _prev_scalp_ticker != contract.ticker
+                ):
                     try:
                         _dp = getattr(self, "_direction_position", None)
                         if (
