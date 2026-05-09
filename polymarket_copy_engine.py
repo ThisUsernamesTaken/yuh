@@ -5184,6 +5184,39 @@ class PolymarketCopyEngine:
         yes_ask = int(getattr(book, "best_yes_ask", 0) or 0) if book else 0
         no_bid = int(getattr(book, "best_no_bid", 0) or 0) if book else 0
         no_ask = int(getattr(book, "best_no_ask", 0) or 0) if book else 0
+
+        # 2026-05-09: prob_engine.update() is no longer called from any
+        # active tier (BB_PURE retired). Call it here so probability/
+        # fair_value/mispricing are current for the BORED snapshot.
+        # Inputs: BTC spot, contract YES mid (cents), seconds remaining.
+        try:
+            expiry_ms_for_prob = float(
+                getattr(self, "_kalshi_expiry_ms", 0) or 0,
+            )
+            secs_left_for_prob = (
+                max(0.0, (expiry_ms_for_prob - now * 1000.0) / 1000.0)
+                if expiry_ms_for_prob > 0 else 0.0
+            )
+            mid_for_prob = 0
+            if book and getattr(book, "is_ready", False):
+                mid_for_prob = int(book.mid_price_cents)
+            elif yes_bid > 0 and yes_ask > 0:
+                mid_for_prob = (yes_bid + yes_ask) // 2
+            else:
+                mid_for_prob = 50
+            if (
+                btc_now > 0
+                and secs_left_for_prob > 0
+                and mid_for_prob > 0
+            ):
+                prob_engine.update(
+                    btc_now, float(mid_for_prob), secs_left_for_prob,
+                )
+        except Exception:
+            # Don't let prob_engine errors kill the shadow tick.
+            logger.exception(
+                "BORED-SHADOW: prob_engine.update() raised",
+            )
         try:
             book_imbalance = float(book.imbalance_ratio(levels=5)) if book else 0.5
         except Exception:
