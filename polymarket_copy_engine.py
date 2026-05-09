@@ -2628,6 +2628,18 @@ class PolymarketCopyEngine:
             except Exception:
                 logger.exception("CopyEngine SCALP tick error")
 
+        # ── BORED signal shadow (2026-05-09, log-only) ────────────────
+        # Selectivity-first signal layer. Evaluates entry/exit verdicts
+        # without executing — used to validate the new signal model
+        # against actual SCALP fills before flipping live. See
+        # bored_signal.py for the design and tests/test_bored_signal.py
+        # for the rules.
+        if bool(_uc("BORED_SIGNAL_SHADOW_ENABLED", False)):
+            try:
+                self._bored_signal_shadow_tick()
+            except Exception:
+                logger.exception("CopyEngine BORED-SHADOW tick error")
+
         # ── Unified scorer (Phase 4 wiring, 2026-05-07) ────────────────
         # Single-EV decision module with momentum-heavy + strict-gates
         # weights. Runs BEFORE the existing DIRECTION/BB_PURE cascade so
@@ -5107,6 +5119,181 @@ class PolymarketCopyEngine:
     # OVERSELL-GUARD) so a stale or duplicated exit cannot drain the
     # account via Kalshi's sell-to-open inverse semantics.
     # ═══════════════════════════════════════════════════════════════════
+
+    def _bored_signal_shadow_tick(self) -> None:
+        """Shadow-mode evaluation of bored_signal (NO EXECUTION).
+
+        Builds a MarketSnapshot from current engine state, evaluates the
+        BORED signal layer, and logs the verdict. Used to validate the
+        new selectivity-first signal model against actual SCALP fills
+        before flipping the new tier live.
+
+        Logs are throttled to:
+          - State changes (action or side flips from previous tick)
+          - "enter" / "exit" verdicts (always log — these are the
+            decision points we're validating)
+          - Sample tick every 30s (regardless of state)
+
+        See bored_signal.py for the rules.
+        """
+        ticker = getattr(self, "_current_kalshi_ticker", "") or ""
+        if not ticker:
+            return
+
+        # Lazy-init the signal evaluator + per-tick state.
+        if not hasattr(self, "_bored_signal"):
+            try:
+                from bored_signal import BoredSignal
+                self._bored_signal = BoredSignal()
+                self._bored_btc_history: list = []
+                self._bored_last_log_state: dict = {}
+                self._bored_last_ticker: str = ""
+            except Exception:
+                logger.exception("BORED-SHADOW: failed to import bored_signal")
+                return
+
+        # Track BTC price history for velocity computation.
+        # Trim to the last 600s — anything older is unused.
+        now = time.time()
+        btc_now = float(getattr(self, "_btc_last_price", 0) or 0)
+        if btc_now > 0:
+            self._bored_btc_history.append((now, btc_now))
+            cutoff = now - 600.0
+            self._bored_btc_history = [
+                (t, p) for t, p in self._bored_btc_history if t >= cutoff
+            ]
+
+        # Reset stability tracker on ticker change (window flip).
+        last_ticker = getattr(self, "_bored_last_ticker", "") or ""
+        if last_ticker and last_ticker != ticker:
+            try:
+                self._bored_signal.reset_ticker(last_ticker)
+            except Exception:
+                pass
+        self._bored_last_ticker = ticker
+
+        # Build snapshot from engine state.
+        pf = getattr(self, "_price_feed", None)
+        prob_engine = getattr(pf, "prob_engine", None) if pf else None
+        if prob_engine is None:
+            return  # no prob engine yet (boot warmup)
+
+        ws = getattr(self, "_kalshi_ws", None)
+        book = ws.get_book(ticker) if (ws and hasattr(ws, "get_book")) else None
+        yes_bid = int(getattr(book, "best_yes_bid", 0) or 0) if book else 0
+        yes_ask = int(getattr(book, "best_yes_ask", 0) or 0) if book else 0
+        no_bid = int(getattr(book, "best_no_bid", 0) or 0) if book else 0
+        no_ask = int(getattr(book, "best_no_ask", 0) or 0) if book else 0
+        try:
+            book_imbalance = float(book.imbalance_ratio(levels=5)) if book else 0.5
+        except Exception:
+            book_imbalance = 0.5
+        book_is_ready = bool(book and getattr(book, "is_ready", False))
+
+        tape = getattr(self, "_kalshi_tape", None)
+        try:
+            flow = tape.flow(ticker, 30.0) if tape else None
+            tape_yes_share = float(flow.get("yes_share", 0.5)) if flow else 0.5
+            tape_total_volume = int(flow.get("total_volume", 0)) if flow else 0
+            tape_velocity_cps = float(tape.velocity_cps(ticker, 30.0)) if tape else 0.0
+        except Exception:
+            tape_yes_share, tape_total_volume, tape_velocity_cps = 0.5, 0, 0.0
+
+        # BTC velocity from local history buffer.
+        btc_velocity_60s = self._bored_compute_btc_velocity(now - 60.0, now)
+        btc_velocity_300s = self._bored_compute_btc_velocity(now - 300.0, now)
+
+        # Position context (read from _direction_position when SCALP-tier).
+        position_side = "none"
+        prob_at_entry = float(getattr(prob_engine, "probability", 0.5) or 0.5)
+        dp = getattr(self, "_direction_position", None)
+        if dp and dp.get("ticker") == ticker:
+            position_side = (dp.get("side") or "none").lower()
+            prob_at_entry = float(
+                dp.get("_bored_prob_at_entry", prob_at_entry) or prob_at_entry
+            )
+
+        # Time math.
+        expiry_ms = float(getattr(self, "_kalshi_expiry_ms", 0) or 0)
+        seconds_left = (
+            max(0.0, (expiry_ms - now * 1000.0) / 1000.0)
+            if expiry_ms > 0 else 0.0
+        )
+        session_age_s = max(
+            0.0,
+            now - float(getattr(self, "_poly_window_open_time", 0) or 0),
+        )
+
+        # Construct + evaluate.
+        try:
+            from bored_signal import MarketSnapshot
+            snap = MarketSnapshot(
+                bb_probability=float(getattr(prob_engine, "probability", 0.5) or 0.5),
+                bb_volatility=float(getattr(prob_engine, "volatility", 0.0) or 0.0),
+                bb_is_ready=bool(getattr(prob_engine, "is_ready", False)),
+                session_age_s=session_age_s,
+                seconds_left=seconds_left,
+                btc_price=btc_now,
+                strike=float(getattr(prob_engine, "strike", 0.0) or 0.0),
+                btc_velocity_60s=btc_velocity_60s,
+                btc_velocity_300s=btc_velocity_300s,
+                yes_bid=yes_bid, yes_ask=yes_ask,
+                no_bid=no_bid, no_ask=no_ask,
+                book_imbalance=book_imbalance,
+                book_is_ready=book_is_ready,
+                tape_yes_share_30s=tape_yes_share,
+                tape_velocity_cps_30s=tape_velocity_cps,
+                tape_total_volume_30s=tape_total_volume,
+                position_side=position_side,
+                prob_at_entry=prob_at_entry,
+            )
+            sig = self._bored_signal.evaluate(ticker, snap)
+        except Exception:
+            logger.exception("BORED-SHADOW: evaluate raised")
+            return
+
+        # Throttle logging.
+        last_action, last_side, last_log_ts = self._bored_last_log_state.get(
+            ticker, ("", "", 0.0),
+        )
+        state_changed = (last_action, last_side) != (sig.action, sig.side)
+        sample_due = (now - last_log_ts) > 30.0
+        is_decision = sig.action in ("enter", "exit")
+
+        if state_changed or sample_due or is_decision:
+            log_fn = (
+                logger.warning if is_decision
+                else logger.info
+            )
+            log_fn(
+                "BORED-SHADOW: %s action=%s side=%s conv=%.2f "
+                "bb_p=%.2f sources=[%s] reason=%s",
+                ticker[-15:], sig.action, sig.side, sig.conviction,
+                snap.bb_probability,
+                ",".join(sig.sources) if sig.sources else "",
+                sig.reason,
+            )
+            self._bored_last_log_state[ticker] = (sig.action, sig.side, now)
+
+    def _bored_compute_btc_velocity(
+        self, since_ts: float, until_ts: float,
+    ) -> float:
+        """Compute average BTC velocity ($/sec) over a window.
+
+        Uses the local _bored_btc_history buffer. Returns 0.0 if
+        insufficient data.
+        """
+        history = getattr(self, "_bored_btc_history", None) or []
+        relevant = [(t, p) for t, p in history if since_ts <= t <= until_ts]
+        if len(relevant) < 2:
+            return 0.0
+        first_t, first_p = relevant[0]
+        last_t, last_p = relevant[-1]
+        elapsed = last_t - first_t
+        if elapsed <= 0.0:
+            return 0.0
+        return (last_p - first_p) / elapsed
+
     async def _momentum_scalp_tick(self) -> None:
         """One iteration of the MOMENTUM SCALP tier. Idempotent across the
         full window lifecycle (place → poll → cancel-other → trail → exit).
@@ -5375,7 +5562,18 @@ class PolymarketCopyEngine:
                         ) + mkt_avg * mkt_filled
                     except Exception:
                         pass
-                    # Ghost-desync: register in direction position
+                    # Ghost-desync: register in direction position.
+                    # Stash BB probability at fill time for the BORED
+                    # signal's drift-based exit calculations (shadow mode).
+                    _prob_at_fill = 0.5
+                    try:
+                        _pf_at_fill = getattr(self, "_price_feed", None)
+                        if _pf_at_fill is not None and hasattr(_pf_at_fill, "prob_engine"):
+                            _prob_at_fill = float(
+                                getattr(_pf_at_fill.prob_engine, "probability", 0.5) or 0.5
+                            )
+                    except Exception:
+                        _prob_at_fill = 0.5
                     self._direction_position = {
                         "order_id": mkt_oid or "",
                         "side": pick_side,
@@ -5391,6 +5589,7 @@ class PolymarketCopyEngine:
                         "hwm_bid": mkt_avg,
                         "exit_attempted": False,
                         "wall_streak_start": 0.0,
+                        "_bored_prob_at_entry": _prob_at_fill,
                     }
                     try:
                         self._add_direction_active(ticker)

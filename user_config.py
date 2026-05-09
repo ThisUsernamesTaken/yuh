@@ -2678,6 +2678,18 @@ SCALP_MAX_REARMS_PER_TICKER           = 3
 #
 # Default 3. Per-ticker counter resets on window flip (matches Fix P).
 SCALP_MAX_NOFILL_RETRIES              = 3
+
+# ── 2026-05-09 — BORED signal shadow mode ─────────────────────────────────
+# When True, the engine evaluates the new bored_signal.py module on every
+# tick and LOGS the verdict (action / side / conviction / sources) without
+# executing trades. Used to validate the new selectivity-first signal
+# layer against actual SCALP fills before flipping it live as a tier.
+#
+# Logs are throttled: only state changes, decision points, and a sample
+# every 30 seconds.
+#
+# Set True to start collecting shadow data. Has no effect on trading.
+BORED_SIGNAL_SHADOW_ENABLED           = True
 SCALP_BTC_TRAIL_DOLLARS               = 60.0  # 2026-05-08 PT (round 5 REVERT):
                                                 # restored from 99999 → 60
                                                 # Used as fallback when
