@@ -6031,11 +6031,37 @@ class PolymarketCopyEngine:
                     self._direction_position = None
             except Exception:
                 pass
-            try:
-                self._direction_active_tickers.discard(ticker)
-                self._persist_direction_active()
-            except Exception:
-                pass
+            # 2026-05-09 (Fix J): DO NOT discard from _direction_active_tickers
+            # here. Previously this fired immediately on exit, causing a
+            # phantom-sell scenario:
+            #   1. SCALP exit places sell, logs "sold"
+            #   2. Engine clears _direction_active_tickers
+            #   3. Sell didn't actually execute (Kalshi cache lag / IOC race)
+            #   4. SYNC RECLAIM (~30s later) sees Kalshi has position +
+            #      ticker NOT in direction_active → adopts into legacy
+            #      _open_position
+            #   5. Legacy fixed-TP path takes over — Fix F/G/H/I never apply
+            #   6. Position rides to settlement
+            #
+            # Witnessed live 03:35 PT 2026-05-09 (entry NO 5x @ 59c, STALE
+            # exit, INVERSE NOFILL, hijacked into legacy).
+            #
+            # New behavior: keep ticker in _direction_active_tickers until
+            # PROTECTIVE FLAT-CONFIRMED or RESIDUAL-CLEAN explicitly
+            # confirms Kalshi truth=0. SYNC RECLAIM SKIP-DIRECTION will
+            # keep firing (correct) — refusing to adopt the position into
+            # legacy state. If the sell was a phantom and the position
+            # lingers, the SCALP path's _scalp_exit_placed flag prevents
+            # re-firing the trail logic; the orphan-confirm cycle
+            # (PROTECTIVE FLAT-CONFIRMED, 30s zero-streak) will eventually
+            # clear state cleanly when Kalshi truth confirms zero.
+            #
+            # Trade-off: in the no-phantom case, the ticker stays
+            # direction-active for an extra ~30s before getting cleared
+            # by the truth-confirmation cycle. This is harmless — SCALP
+            # already fires only in the first 30s of a window, so a
+            # ticker hanging around past then doesn't gate any new
+            # entries.
             # ── REVERSAL CONFIDENCE SCORER (2026-05-08) ──────────────
             # Trail firing tells us our side stopped trending UP. It does
             # NOT tell us the inverse side is now winning. Score 4 signals
@@ -26010,6 +26036,72 @@ class PolymarketCopyEngine:
                             # exit logic on it is exactly what caused the
                             # 2026-05-05 21:22 -$7.53 catastrophe.
                             if ticker in getattr(self, "_direction_active_tickers", set()):
+                                # 2026-05-09 (Fix K): phantom-sell SCALP re-arm.
+                                # If SCALP state was cleared by a sell that
+                                # didn't actually execute (phantom — Kalshi
+                                # cache lag / IOC race), the position lingers
+                                # unmanaged. Re-arm the SCALP state machine
+                                # with current Kalshi truth as the new anchor
+                                # so the trail / loss-cut / stale-exit can
+                                # fire and either close the position cleanly
+                                # or flip via INVERSE.
+                                _scalp_count_now = int(
+                                    getattr(self, "_scalp_filled_count", 0) or 0
+                                )
+                                if _scalp_count_now == 0 and kalshi_count > 0:
+                                    try:
+                                        _ws_obj = getattr(self, "_kalshi_ws", None)
+                                        _bk = _ws_obj.get_book(ticker) if _ws_obj else None
+                                        _curr_bid = 0
+                                        if _bk and getattr(_bk, "is_ready", False):
+                                            _curr_bid = int(
+                                                _bk.best_yes_bid if kalshi_side == "yes"
+                                                else _bk.best_no_bid
+                                            ) or 0
+                                        if _curr_bid > 0:
+                                            _now_rearm = time.time()
+                                            self._scalp_filled_side = kalshi_side
+                                            self._scalp_filled_count = kalshi_count
+                                            self._scalp_fill_time = _now_rearm
+                                            self._scalp_entry_price = _curr_bid
+                                            self._scalp_hwm_bid = _curr_bid
+                                            self._scalp_ticker = ticker
+                                            self._scalp_btc_hwm = float(
+                                                getattr(self, "_btc_last_price", 0)
+                                                or 0
+                                            )
+                                            self._scalp_btc_side = kalshi_side
+                                            self._scalp_exit_placed = False
+                                            self._scalp_evaluated = True
+                                            if not getattr(self, "_direction_position", None):
+                                                self._direction_position = {
+                                                    "order_id": "phantom_rearm",
+                                                    "side": kalshi_side,
+                                                    "entry_cents": _curr_bid,
+                                                    "original_count": kalshi_count,
+                                                    "ticker": ticker,
+                                                    "tier": "SCALP",
+                                                    "strategy_name": "SCALP",
+                                                    "count": kalshi_count,
+                                                    "fill_time": _now_rearm,
+                                                    "_hold_to_settle": False,
+                                                    "entry_time": _now_rearm,
+                                                    "hwm_bid": _curr_bid,
+                                                    "exit_attempted": False,
+                                                    "wall_streak_start": 0.0,
+                                                    "_phantom_rearm": True,
+                                                }
+                                            logger.warning(
+                                                "SCALP RE-ARM (phantom-sell): %s %s %dx "
+                                                "anchored @ current_bid=%dc — exit layer "
+                                                "resumes management",
+                                                ticker[-15:], kalshi_side.upper(),
+                                                kalshi_count, _curr_bid,
+                                            )
+                                    except Exception:
+                                        logger.exception(
+                                            "SCALP RE-ARM error (continuing as SKIP-DIRECTION)"
+                                        )
                                 logger.info(
                                     "CopyEngine SYNC RECLAIM SKIP-DIRECTION: %s "
                                     "is a DIRECTION-tier ticker — holds to settlement, "
