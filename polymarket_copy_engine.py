@@ -5220,12 +5220,26 @@ class PolymarketCopyEngine:
                     time_in_force="immediate_or_cancel",
                 )
                 mkt_oid = getattr(mkt_order, "order_id", None)
+                # 2026-05-08: KalshiOrder dataclass exposes `filled_count`,
+                # not `count_filled`. The wrong attribute name made
+                # mkt_filled always 0 → false SCALP MARKET NOFILL log →
+                # orphaned fill later grabbed by SYNC RECLAIM into legacy
+                # _open_position (fixed-price TPs) instead of
+                # _direction_position (trail-aware exit layer). That's
+                # the source of the "took profit on small margin"
+                # symptom. See kalshi_client.py:74.
                 mkt_filled = int(
-                    getattr(mkt_order, "count_filled", 0) or 0,
+                    getattr(mkt_order, "filled_count", 0) or 0,
                 )
-                mkt_avg = int(
-                    getattr(mkt_order, "average_price", 0) or 0,
-                )
+                # average_price is Optional[float]; if the IOC response
+                # came back without cost fields populated yet (rare
+                # race), fall back to the limit price we sent so we
+                # don't write entry_cents=0 into _direction_position.
+                _avg = getattr(mkt_order, "average_price", None)
+                if _avg is None or _avg <= 0:
+                    mkt_avg = int(ioc_price)
+                else:
+                    mkt_avg = int(_avg)
 
                 if mkt_filled > 0:
                     self._scalp_contracts_placed_window = int(
@@ -6011,14 +6025,20 @@ class PolymarketCopyEngine:
                             inv_oid = getattr(
                                 inv_order, "order_id", None,
                             )
-                            inv_avg = int(
-                                getattr(inv_order, "average_price", 0)
-                                or 0,
-                            )
+                            # 2026-05-08: same `filled_count` fix as the
+                            # main SCALP MARKET path (KalshiOrder uses
+                            # filled_count, not count_filled).
                             inv_filled = int(
-                                getattr(inv_order, "count_filled", 0)
+                                getattr(inv_order, "filled_count", 0)
                                 or 0,
                             )
+                            _inv_avg_raw = getattr(
+                                inv_order, "average_price", None,
+                            )
+                            if _inv_avg_raw is None or _inv_avg_raw <= 0:
+                                inv_avg = int(ioc_price)
+                            else:
+                                inv_avg = int(_inv_avg_raw)
                             if inv_filled > 0:
                                 # Register the new position
                                 _now_inv = time.time()
