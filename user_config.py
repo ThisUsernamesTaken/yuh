@@ -2619,6 +2619,19 @@ SCALP_INVERSE_REENTRY_ENABLED         = False  # 2026-05-08 PT (evening):
                                                 # — its gating wasn't
                                                 # operational anyway.
 
+# ── 2026-05-08 PT (evening, round 3) — INVERSE RE-ENTRY ON CLOSE ──────────
+# When a position closes (PROTECTIVE FLAT-CONFIRMED detected), place an
+# IOC limit BUY on the OPPOSITE side at opp_ask + INVERSE_REENTRY_SLIP_C.
+# One-shot per window (resets on window flip). Subject to existing safety
+# (MAX_RISK_PER_WINDOW_DOLLARS, ADMISSION_FILTER, balance).
+#
+# User directive (2026-05-08 PT): "when position closes set a +4c limit
+# entry from opposite side's value." Not every re-entry will be
+# profitable — observation-mode for now.
+INVERSE_REENTRY_ON_CLOSE_ENABLED      = True
+INVERSE_REENTRY_SLIP_C                = 4    # IOC at opposite_ask + this
+INVERSE_REENTRY_CONTRACTS             = 5    # contracts per re-entry
+
 # ── 2026-05-08 PT (evening, round 2) — auto-TP machinery disable ──────────
 # After disabling detection-based exits, observed that small-margin
 # profit-takes were STILL firing (+5c per ct on a 19:15 PT trade despite

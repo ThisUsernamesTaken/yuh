@@ -984,6 +984,12 @@ class PolymarketCopyEngine:
         # side's best bid at fill time, used by _scalp_fire_exit() to
         # compute the velocity component of the reversal score.
         self._scalp_inv_bid_at_fill: int = 0
+        # 2026-05-08 (evening) — INVERSE_REENTRY_ON_CLOSE: one-shot per
+        # window. When a position closes (PROTECTIVE FLAT-CONFIRMED), if
+        # this flag is False we place a +Nc IOC limit BUY on the opposite
+        # side and set this flag to True so we don't fire repeatedly on
+        # the multi-poll FLAT-CONFIRMED detection. Reset on window flip.
+        self._inverse_reentry_done_this_window: bool = False
 
         # Daily loss tracking (circuit breaker)
         self._daily_pnl: float = 0.0           # Running P&L for current UTC day
@@ -7376,6 +7382,126 @@ class PolymarketCopyEngine:
                     ticker[-15:] if ticker else "?",
                 )
 
+    async def _inverse_reentry_on_close(
+        self, *, ticker: str, closed_side: str,
+    ) -> None:
+        """Post-close inverse re-entry (2026-05-08 PT evening).
+
+        On any position close, place an IOC limit BUY on the OPPOSITE
+        side at opp_ask + INVERSE_REENTRY_SLIP_C (default 4c). One-shot
+        per window — the _inverse_reentry_done_this_window flag prevents
+        re-firing on the multi-poll FLAT-CONFIRMED detection.
+
+        Subject to existing safety:
+        - INVERSE_REENTRY_ON_CLOSE_ENABLED config flag (master switch)
+        - _check_window_safety (universal $15 / 99-entry caps)
+        - balance × MIN_BANKROLL_X_COST gate
+        - Order routes through standard place_order (no special path)
+
+        Failures are logged but never raise — caller wraps in try/except.
+        """
+        if not bool(_uc("INVERSE_REENTRY_ON_CLOSE_ENABLED", False)):
+            return
+        if getattr(self, "_inverse_reentry_done_this_window", False):
+            return
+        # Mark done IMMEDIATELY to prevent re-fire from multi-poll FLAT-
+        # CONFIRMED detection (12+ polls in our 19:15 trade observation).
+        self._inverse_reentry_done_this_window = True
+
+        # Determine opposite side
+        opp_side = "no" if closed_side == "yes" else "yes"
+
+        # Read current opposite-side ask from the local book
+        ws = getattr(self, "_kalshi_ws", None)
+        book = None
+        if ws is not None and hasattr(ws, "get_book"):
+            try:
+                book = ws.get_book(ticker)
+            except Exception:
+                book = None
+        if book is None:
+            logger.info(
+                "INVERSE-REENTRY SKIP: no book for %s (closed_side=%s)",
+                ticker[-15:], closed_side,
+            )
+            return
+        if opp_side == "yes":
+            opp_ask = int(getattr(book, "best_yes_ask", 0) or 0)
+        else:
+            opp_ask = int(getattr(book, "best_no_ask", 0) or 0)
+        if opp_ask <= 0 or opp_ask >= 100:
+            logger.info(
+                "INVERSE-REENTRY SKIP: opp_ask=%dc out of range on %s",
+                opp_ask, ticker[-15:],
+            )
+            return
+
+        slip_c = int(_uc("INVERSE_REENTRY_SLIP_C", 4))
+        contracts = int(_uc("INVERSE_REENTRY_CONTRACTS", 5))
+        entry_px = min(99, max(1, opp_ask + slip_c))
+        cost_c = contracts * entry_px
+
+        # Phase-1 universal safety
+        try:
+            ok, why = self._check_window_safety(cost_c, "INVERSE_REENTRY")
+            if not ok:
+                logger.info("INVERSE-REENTRY SKIP: %s", why)
+                return
+        except Exception:
+            pass
+
+        # Bankroll gate
+        try:
+            _bal = await self._client.get_balance()
+            balance_cents = int(_bal.balance)
+        except Exception as e:
+            logger.warning("INVERSE-REENTRY: balance fetch failed: %s", e)
+            return
+        min_bx = float(_uc("DIRECTION_MIN_BANKROLL_X_COST", 1.5))
+        if balance_cents <= 0 or balance_cents < int(cost_c * min_bx):
+            logger.info(
+                "INVERSE-REENTRY SKIP: bankroll $%.2f < %.1fx cost $%.2f",
+                balance_cents / 100, min_bx, cost_c / 100,
+            )
+            return
+
+        logger.warning(
+            "INVERSE-REENTRY FIRE: %s %dx @ %dc IOC (opp_ask=%dc, slip=%dc) "
+            "($%.2f) — closed_side=%s on %s",
+            opp_side.upper(), contracts, entry_px, opp_ask, slip_c,
+            cost_c / 100, closed_side.upper(), ticker[-15:],
+        )
+        try:
+            order = await self._client.place_order(
+                ticker=ticker, side=opp_side, price=entry_px,
+                count=contracts, post_only=False,
+                time_in_force="immediate_or_cancel",
+            )
+        except Exception as e:
+            logger.error(
+                "INVERSE-REENTRY place_order failed: %s on %s",
+                e, ticker[-15:],
+            )
+            return
+        filled = int(getattr(order, "filled_count", 0) or 0)
+        oid = getattr(order, "order_id", "") or ""
+        if filled <= 0:
+            logger.info(
+                "INVERSE-REENTRY IOC NOFILL: order=%s @ %dc on %s",
+                oid[:12], entry_px, ticker[-15:],
+            )
+            return
+        # Record window fill for cap accounting
+        try:
+            self._record_window_fill(filled, entry_px, "INVERSE_REENTRY")
+        except Exception:
+            pass
+        logger.warning(
+            "INVERSE-REENTRY FILL: %s %dx @ %dc oid=%s on %s — "
+            "holds (no auto-TP, no detection-exit)",
+            opp_side.upper(), filled, entry_px, oid[:12], ticker[-15:],
+        )
+
     async def _direction_manage_exit(self, now: float) -> None:
         """Active exit-management layer for an open DIRECTION position
         (Option B, 2026-05-07). No-op when DIRECTION_EXIT_ENABLED=False.
@@ -9884,6 +10010,8 @@ class PolymarketCopyEngine:
                 self._scalp_contracts_placed_window = 0
                 self._scalp_cap_logged = False
                 self._scalp_filled_side = None
+                # 2026-05-08 (evening): reset inverse-reentry one-shot flag
+                self._inverse_reentry_done_this_window = False
                 self._scalp_ticker = ""
                 self._scalp_entry_price = 0
                 self._scalp_filled_count = 0
@@ -20072,6 +20200,17 @@ class PolymarketCopyEngine:
                 ticker, side, truth_ct, fill_age_s,
                 zero_n, flat_required_count, zero_span, flat_confirm_window,
             )
+            # 2026-05-08 PT (evening): post-close inverse re-entry.
+            # On position close, place IOC limit BUY on opposite side at
+            # opp_ask + INVERSE_REENTRY_SLIP_C. One-shot per window.
+            try:
+                await self._inverse_reentry_on_close(
+                    ticker=ticker, closed_side=side,
+                )
+            except Exception as _ire:
+                logger.warning(
+                    "INVERSE-REENTRY error on FLAT-CONFIRMED: %s", _ire,
+                )
             # Snapshot fields needed by the post-clear recheck BEFORE
             # _clear_position wipes _open_position.
             _recheck_entry_c = int(pos.get("original_entry_cents")
