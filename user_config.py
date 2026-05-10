@@ -2679,6 +2679,33 @@ SCALP_MAX_REARMS_PER_TICKER           = 3
 # Default 3. Per-ticker counter resets on window flip (matches Fix P).
 SCALP_MAX_NOFILL_RETRIES              = 3
 
+# ── 2026-05-09 — ENTRY PRICE-BAND GATE (Fix S) ────────────────────────────
+# Skip SCALP MARKET entries outside [SCALP_ENTRY_PX_LOW, SCALP_ENTRY_PX_HIGH].
+#
+# Backtested on 82 SCALP MARKET FILL events from engine_history.log
+# (2026-05-08 22:37 → 2026-05-09 19:30). Findings:
+#
+#   Baseline (no filter):     n=82  WR=61%  total=+$14.75  avg=+$0.18
+#   With entry 55-65c gate:   n=44  WR=70%  total=+$26.70  avg=+$0.61
+#                                           ↑ +$11.95 vs baseline
+#
+# Mechanism: payoff asymmetry. A binary at 55-65c has roughly symmetric
+# upside/downside (~$0.40 win vs ~$0.55 loss with fees). Outside the
+# band, payoff geometry breaks down:
+#   - Cheap entries (<55c): often resolve worthless (long-tail bets)
+#   - Expensive entries (>65c): $0.30 upside vs $0.70 downside —
+#     even at 80% WR, expected value ≈ 0
+#
+# Adding a min-skew filter on top of the price gate REDUCED backtest
+# P&L (some low-skew but mid-priced entries also won). Price band
+# alone is the cleanest, highest-impact single gate.
+#
+# Set SCALP_PRICE_GATE_ENABLED = False to disable.
+# Widen with LOW=0 HIGH=100 to functionally disable while keeping flag.
+SCALP_PRICE_GATE_ENABLED              = True
+SCALP_ENTRY_PX_LOW                    = 55
+SCALP_ENTRY_PX_HIGH                   = 65
+
 # ── 2026-05-09 — BORED signal shadow mode ─────────────────────────────────
 # When True, the engine evaluates the new bored_signal.py module on every
 # tick and LOGS the verdict (action / side / conviction / sources) without

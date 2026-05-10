@@ -5489,6 +5489,42 @@ class PolymarketCopyEngine:
                 pick_side = "no"
                 pick_ask = no_ask
 
+            # 2026-05-09 (Fix S): entry-price band gate.
+            #
+            # 82-trade backtest (engine_history.log 2026-05-08 22:37 →
+            # 2026-05-09 19:30, all SCALP MARKET FILL events) found that
+            # SCALP entries in the 55-65c price range had 70% WR and
+            # +$0.61/trade vs baseline 61% WR / +$0.18/trade. Trades
+            # outside the band collectively LOST $11.95.
+            #
+            # Mechanism: payoff asymmetry. A binary at 55-65c has
+            # roughly symmetric upside/downside ($0.40 win vs $0.55
+            # loss). Outside this band:
+            #   - Cheap entries (<55c) often resolve worthless
+            #   - Expensive entries (>65c) have $0.30 upside vs $0.70
+            #     downside — even at 80% WR, EV ≈ 0
+            #
+            # Adding a skew filter on top of this price filter REDUCED
+            # backtest P&L (low-skew but mid-priced entries also won).
+            # Price band alone is the cleanest, highest-impact single
+            # gate. See scripts/score_scalp_filters.py for the analysis.
+            #
+            # Defaults: 55-65c. Set ENTRY_PX_LOW=0 ENTRY_PX_HIGH=100 to
+            # disable. Disable the whole gate via SCALP_PRICE_GATE_ENABLED.
+            if bool(_uc("SCALP_PRICE_GATE_ENABLED", False)):
+                _px_low = int(_uc("SCALP_ENTRY_PX_LOW", 55))
+                _px_high = int(_uc("SCALP_ENTRY_PX_HIGH", 65))
+                if pick_ask < _px_low or pick_ask > _px_high:
+                    logger.info(
+                        "SCALP PRICE-GATE SKIP: %s pick_ask=%dc outside "
+                        "[%d-%d] (yes_ask=%dc no_ask=%dc skew=%dc) — "
+                        "payoff asymmetry off-edge",
+                        pick_side.upper(), pick_ask, _px_low, _px_high,
+                        yes_ask, no_ask, abs(yes_ask - no_ask),
+                    )
+                    self._scalp_evaluated = True  # don't retry this window
+                    return
+
             ioc_price = min(pick_ask + slip_c, 95)
             ioc_cost_c = ioc_price * contracts
 
