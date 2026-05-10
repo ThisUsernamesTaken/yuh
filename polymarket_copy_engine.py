@@ -6284,15 +6284,41 @@ class PolymarketCopyEngine:
             # 2026-05-09 (Fix Q): SCALP exits use IOC — fill immediately
             # at bid or cancel. Prevents stale resting orders when bid
             # collapses faster than the engine repprices.
+            # 2026-05-09 (Fix T): aggressive cross-the-spread sell.
+            #
+            # Pre-Fix-T: sold AT current bid via IOC. But by the time the
+            # IOC arrives at Kalshi (~50-100ms after book read), the bid
+            # has often moved 1-3c lower. Our IOC at the OLD bid is now
+            # AT or ABOVE the new bid → no match → EXIT-NOFILL → cap at
+            # [3/3] → position rides → settlement variance dominates.
+            # Witnessed 12+ times tonight on legitimate trail signals.
+            #
+            # Fix T: place the sell at (bid - SCALP_EXIT_AGGRESSION_C).
+            # Pays a small slippage cost (default 2c) but dramatically
+            # improves fill rate by giving the book room to drop without
+            # invalidating our IOC.
+            #
+            # Math: if alternative is 60% chance of riding to a -$2.70
+            # loss, paying 2c × 5ct = $0.10 slippage to GUARANTEE the
+            # exit captures most of the +$1.00 paper profit is a clear
+            # EV win. Over 12 capped trades tonight, paying $1.20 of
+            # extra slippage to convert ~7 of those into actual fills
+            # would have saved ~$15+ in settlement losses.
+            #
+            # User: "still couldn't exit in time and realign with the
+            # actual BTC movement" — Fix T is the execution-side answer
+            # to that problem.
+            _exit_aggression = int(_uc("SCALP_EXIT_AGGRESSION_C", 2))
+            _exit_price = max(1, int(bid) - max(0, _exit_aggression))
             order, count = await self._place_capped_side_sell(
-                ticker=ticker, side=side, price=bid,
+                ticker=ticker, side=side, price=_exit_price,
                 requested_count=int(self._scalp_filled_count),
                 post_only=False,
                 reason=f"SCALP-{reason}",
                 tif="immediate_or_cancel",
             )
             self._scalp_exit_fire_ts = time.time()
-            self._scalp_exit_price_c = bid
+            self._scalp_exit_price_c = _exit_price
             if order is None:
                 # Truth=0 or oversell-guard. Treat as "exit done from
                 # engine's POV" — set exit_placed so we don't retry.

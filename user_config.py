@@ -2706,6 +2706,24 @@ SCALP_PRICE_GATE_ENABLED              = True
 SCALP_ENTRY_PX_LOW                    = 55
 SCALP_ENTRY_PX_HIGH                   = 65
 
+# ── 2026-05-09 — AGGRESSIVE EXIT PRICING (Fix T) ──────────────────────────
+# When a SCALP exit (TRAIL/BTC-TRAIL/STALE/LOSS-CUT) fires, place the
+# IOC sell at (bid - SCALP_EXIT_AGGRESSION_C) instead of at bid.
+#
+# The 50-100ms latency between our book snapshot and the IOC arriving
+# at Kalshi means the bid often moves 1-3c lower in that window. An
+# IOC at the OLD bid then has no match → EXIT-NOFILL → Fix R cap →
+# position rides → settlement variance.
+#
+# Tonight (2026-05-09) 12 EXIT-NOFILL CAPPED events. Paying 2c slippage
+# per contract (= $0.10 per 5ct trade) would have converted most of
+# them to actual exits, saving ~$15+ in settlement losses on
+# trail-correctly-identified reversals.
+#
+# Default 2c. Set to 0 to disable (place exactly at bid, legacy
+# behavior). Increase to 3-4c if 2c proves insufficient on fast tape.
+SCALP_EXIT_AGGRESSION_C               = 2
+
 # ── 2026-05-09 — BORED signal shadow mode ─────────────────────────────────
 # When True, the engine evaluates the new bored_signal.py module on every
 # tick and LOGS the verdict (action / side / conviction / sources) without
